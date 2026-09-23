@@ -54,6 +54,14 @@ static void emit(tdeck_input_source_t src, int code, bool pressed)
 
 i2c_master_bus_handle_t tdeck_i2c_bus(void) { return s_bus; }
 
+// 注入一个输入事件,走和真实硬件【完全相同】的分发路径。
+// 调试接口用它模拟按键和轨迹球 —— 绕过分发直接给 app 发事件的话,
+// 测出来的行为不等于真实行为,那种"测试"没有价值。
+void tdeck_input_inject(tdeck_input_source_t src, int code)
+{
+    emit(src, code, true);
+}
+
 void tdeck_input_subscribe(tdeck_input_cb_t cb, void* user)
 {
     for (int i = 0; i < MAX_SUBS; i++) {

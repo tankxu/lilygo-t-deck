@@ -6,13 +6,14 @@ idf_component_register(
         "launcher/avatar.cc"
         "launcher/wx_icon.cc"
         "net/net.cc"
+        "debug/debug_server.cc"
         "apps/palette/palette_app.cc"
     INCLUDE_DIRS
         "." "app_framework"
     REQUIRES
         tdeck_bsp
         esp_wifi esp_netif esp_event nvs_flash
-        esp_http_client esp-tls json esp_timer
+        esp_http_client esp_http_server esp-tls json esp_timer
     # ⚠️ 必须 WHOLE_ARCHIVE。
     # app 靠文件末尾的 TDECK_REGISTER_APP 静态对象自注册,没有任何代码显式引用它。
     # 组件被编成静态库,链接器默认只拉取「被引用到」的 .o —— app 的 .o 会被整个丢掉,

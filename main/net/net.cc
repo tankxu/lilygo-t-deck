@@ -8,6 +8,7 @@
 
 #include "net.h"
 #include "app.h"
+#include "debug/debug_server.h"
 #include "secrets.h"
 
 #include <cJSON.h>
@@ -165,6 +166,8 @@ void net_task(void*)
     }
     setenv("TZ", TZ_STRING, 1);
     tzset();
+
+    debug_server_start();   // 开发期调试接口,要等拿到 IP
 
     fetch_weather();
     int64_t last_wx = esp_timer_get_time();

@@ -77,6 +77,9 @@ typedef void (*tdeck_input_cb_t)(const tdeck_input_event_t* ev, void* user);
 void tdeck_input_subscribe(tdeck_input_cb_t cb, void* user);
 void tdeck_input_unsubscribe(tdeck_input_cb_t cb);
 
+// 注入输入事件(调试接口用),走与真实硬件相同的分发路径
+void tdeck_input_inject(tdeck_input_source_t src, int code);
+
 // 轨迹球中键长按 —— 全局语音键(ADR-004)。无论当前哪个 app 在前台都会触发。
 typedef void (*tdeck_voice_key_cb_t)(void* user);
 void tdeck_set_voice_key_handler(tdeck_voice_key_cb_t cb, void* user);
