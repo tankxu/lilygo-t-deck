@@ -74,8 +74,8 @@ public:
             lv_obj_set_style_radius(bar, 0, LV_PART_MAIN);
             lv_obj_set_style_border_width(bar, 0, LV_PART_MAIN);
             lv_obj_set_style_pad_all(bar, 0, LV_PART_MAIN);
-            lv_obj_set_scrollable(bar, false);
-            lv_obj_set_clickable(bar, false);
+            lv_obj_remove_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_remove_flag(bar, LV_OBJ_FLAG_CLICKABLE);
         }
 
         // 底部压一条半透明深色带,白字才在任何色相上都读得出来 ——
@@ -88,8 +88,8 @@ public:
         lv_obj_set_style_radius(scrim, 0, LV_PART_MAIN);
         lv_obj_set_style_border_width(scrim, 0, LV_PART_MAIN);
         lv_obj_set_style_pad_all(scrim, 0, LV_PART_MAIN);
-        lv_obj_set_scrollable(scrim, false);
-        lv_obj_set_clickable(scrim, false);
+        lv_obj_remove_flag(scrim, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_remove_flag(scrim, LV_OBJ_FLAG_CLICKABLE);
 
         lv_obj_t* nm = lv_label_create(scrim);
         lv_obj_set_style_text_font(nm, &lv_font_montserrat_16, LV_PART_MAIN);
@@ -103,7 +103,7 @@ public:
         build_colors();
 
         lv_obj_set_style_bg_color(root, lv_color_hex(C_BG), LV_PART_MAIN);
-        lv_obj_set_scrollable(root, false);
+        lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
 
         // ── 信息区:hex(大)+ RGB565(小)+ 色块预览 ──
         hex_ = lv_label_create(root);
@@ -132,7 +132,7 @@ public:
             lv_obj_set_style_radius(sw, 0, LV_PART_MAIN);
             lv_obj_set_style_border_width(sw, 0, LV_PART_MAIN);
             lv_obj_set_style_pad_all(sw, 0, LV_PART_MAIN);
-            lv_obj_set_scrollable(sw, false);
+            lv_obj_remove_flag(sw, LV_OBJ_FLAG_SCROLLABLE);
         }
 
         // ── 光标 ──

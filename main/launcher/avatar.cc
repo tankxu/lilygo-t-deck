@@ -1,11 +1,16 @@
-// avatar.cc — 小智头像的眨眼与视线
+// avatar.cc — 眨眼、视线、眯眼
 //
-// 两条各自独立的定时线:
-//   眨眼  每 2.6~5.4 秒一次,眼高 22 → 2 → 22,来回共 260ms
-//   视线  每 1.8~4.2 秒挪一次,水平 ±5px,用 ease_out 缓动
+// 三条各自独立的定时线,周期取互质数且带随机抖动:
 //
-// 两条线周期互质且带随机抖动,所以不会同步成机械的节拍 —— 这正是"活"和
-// "循环播放的动画"的区别所在。人对规律的重复极其敏感,一旦对齐就立刻显假。
+//   眨眼  2.6~5.4 秒   眼高 → 2 → 复原     闭 90ms / 睁 170ms
+//   视线  1.8~4.2 秒   水平 ±(直径的 8%)   ease_out
+//   眯眼  6~13 秒      变成竖长条,停 1.2~2.4 秒再复原
+//
+// 三条不同步是刻意的。人对规律重复极其敏感,一旦对齐就立刻从"活的"
+// 塌成"循环播放的动画"。
+//
+// 睁开比闭上慢(90ms vs 170ms)也是同样的道理 —— 真实的眨眼就是不对称的,
+// 做成对称的一眼假。
 
 #include "avatar.h"
 
@@ -15,12 +20,10 @@
 namespace tdeck {
 namespace {
 
-constexpr uint32_t C_HEAD_TOP = 0x30363d;   // 头部渐变:上浅下深,做出球面感
-constexpr uint32_t C_HEAD_BOT = 0x14171a;
-// 亮绿。军绿外壳 + 深色头像的组合下,这个色相既跳得出来又不脱离色系 ——
-// 原来的青色是从蓝色主题带过来的,和橄榄绿放一起发冷、打架。
-constexpr uint32_t C_EYE      = 0xA8E063;   // 亮黄绿
-constexpr uint32_t C_RING     = 0x7E9A5B;   // 苔藓绿描边
+constexpr uint32_t C_HEAD_TOP = 0x2E3A22;   // 头部渐变:上浅下深,做出球面感
+constexpr uint32_t C_HEAD_BOT = 0x101509;
+constexpr uint32_t C_EYE      = 0xA8E063;   // 亮黄绿,和军绿外壳同色族
+constexpr uint32_t C_RING     = 0x7E9A5B;
 
 int rnd(int lo, int hi) { return lo + (int)(esp_random() % (uint32_t)(hi - lo + 1)); }
 
@@ -28,10 +31,15 @@ int rnd(int lo, int hi) { return lo + (int)(esp_random() % (uint32_t)(hi - lo + 
 
 void Avatar::create(lv_obj_t* parent, int cx, int cy, int d)
 {
-    eye_w_  = d * 11 / 72;
-    eye_h_  = d * 22 / 72;
-    eye_dx_ = d * 13 / 72;
-    eye_cy_ = d / 2 - d * 2 / 72;   // 略高于几何中心,视觉上才是居中
+    d_      = d;
+    base_w_ = d * 15 / 100;
+    base_h_ = d * 30 / 100;
+    bar_w_  = d * 7  / 100;      // 竖条:更窄更高
+    bar_h_  = d * 40 / 100;
+    eye_w_  = base_w_;
+    eye_h_  = base_h_;
+    eye_dx_ = d * 18 / 100;
+    eye_cy_ = d / 2 - d / 40;    // 略高于几何中心,视觉上才居中
 
     head_ = lv_obj_create(parent);
     lv_obj_set_size(head_, d, d);
@@ -40,116 +48,144 @@ void Avatar::create(lv_obj_t* parent, int cx, int cy, int d)
     lv_obj_set_style_bg_color(head_, lv_color_hex(C_HEAD_TOP), LV_PART_MAIN);
     lv_obj_set_style_bg_grad_color(head_, lv_color_hex(C_HEAD_BOT), LV_PART_MAIN);
     lv_obj_set_style_bg_grad_dir(head_, LV_GRAD_DIR_VER, LV_PART_MAIN);
-    lv_obj_set_style_border_width(head_, 2, LV_PART_MAIN);
+    lv_obj_set_style_border_width(head_, d > 100 ? 3 : 2, LV_PART_MAIN);
     lv_obj_set_style_border_color(head_, lv_color_hex(C_RING), LV_PART_MAIN);
     lv_obj_set_style_border_opa(head_, LV_OPA_40, LV_PART_MAIN);
-    lv_obj_set_style_shadow_width(head_, 12, LV_PART_MAIN);
-    lv_obj_set_style_shadow_offset_y(head_, 3, LV_PART_MAIN);
+    lv_obj_set_style_shadow_width(head_, d / 5, LV_PART_MAIN);
+    lv_obj_set_style_shadow_offset_y(head_, d / 20, LV_PART_MAIN);
     lv_obj_set_style_shadow_opa(head_, LV_OPA_20, LV_PART_MAIN);
     lv_obj_set_style_pad_all(head_, 0, LV_PART_MAIN);
-    lv_obj_set_scrollable(head_, false);
+    lv_obj_remove_flag(head_, LV_OBJ_FLAG_SCROLLABLE);
 
     auto mk_eye = [&](int dx) {
         lv_obj_t* e = lv_obj_create(head_);
-        lv_obj_set_size(e, eye_w_, eye_h_);
-        lv_obj_set_pos(e, d / 2 + dx - eye_w_ / 2, eye_cy_ - eye_h_ / 2);
-        lv_obj_set_style_radius(e, eye_w_ / 2, LV_PART_MAIN);
         lv_obj_set_style_bg_color(e, lv_color_hex(C_EYE), LV_PART_MAIN);
         lv_obj_set_style_border_width(e, 0, LV_PART_MAIN);
         lv_obj_set_style_shadow_color(e, lv_color_hex(C_EYE), LV_PART_MAIN);
-        lv_obj_set_style_shadow_width(e, 8, LV_PART_MAIN);   // 轻微辉光
+        lv_obj_set_style_shadow_width(e, d / 8, LV_PART_MAIN);   // 轻微辉光
         lv_obj_set_style_shadow_opa(e, LV_OPA_50, LV_PART_MAIN);
         lv_obj_set_style_pad_all(e, 0, LV_PART_MAIN);
-        lv_obj_set_scrollable(e, false);
+        lv_obj_remove_flag(e, LV_OBJ_FLAG_SCROLLABLE);
+        (void)dx;
         return e;
     };
     eye_l_ = mk_eye(-eye_dx_);
     eye_r_ = mk_eye(+eye_dx_);
+    apply_eye_geom();
 
-    schedule_blink();
-    schedule_gaze();
+    schedule_all();
+}
+
+// 眼睛的位置由尺寸反算,不单独存 —— 否则宽高一动位置就要跟着改三处
+void Avatar::apply_eye_geom()
+{
+    if (!eye_l_) return;
+    int r = eye_w_ / 2;
+    for (auto e : { eye_l_, eye_r_ }) {
+        lv_obj_set_size(e, eye_w_, eye_h_);
+        lv_obj_set_style_radius(e, r, LV_PART_MAIN);
+    }
+    lv_obj_set_pos(eye_l_, d_ / 2 - eye_dx_ - eye_w_ / 2 + gaze_, eye_cy_ - eye_h_ / 2);
+    lv_obj_set_pos(eye_r_, d_ / 2 + eye_dx_ - eye_w_ / 2 + gaze_, eye_cy_ - eye_h_ / 2);
 }
 
 void Avatar::destroy()
 {
-    if (blink_t_) { lv_timer_delete(blink_t_); blink_t_ = nullptr; }
-    if (gaze_t_)  { lv_timer_delete(gaze_t_);  gaze_t_  = nullptr; }
-    if (head_)    { lv_obj_delete(head_);      head_ = eye_l_ = eye_r_ = nullptr; }
+    for (auto** t : { &t_blink_, &t_gaze_, &t_squint_ }) {
+        if (*t) { lv_timer_delete(*t); *t = nullptr; }
+    }
+    if (head_) { lv_obj_delete(head_); head_ = eye_l_ = eye_r_ = nullptr; }
 }
 
-// 眼高动画。缩放时同步下移一半差值,眼睛才是"闭合"而不是"从上边缘缩上去"。
-void Avatar::eye_height_cb(void* var, int32_t v)
+void Avatar::eye_h_cb(void* var, int32_t v)
 {
-    auto* self = static_cast<Avatar*>(var);
-    if (!self->eye_l_) return;
-    int y = self->eye_cy_ - (int)v / 2;
-    lv_obj_set_height(self->eye_l_, v);
-    lv_obj_set_height(self->eye_r_, v);
-    lv_obj_set_y(self->eye_l_, y);
-    lv_obj_set_y(self->eye_r_, y);
+    auto* s = static_cast<Avatar*>(var);
+    s->eye_h_ = v; s->apply_eye_geom();
 }
-
+void Avatar::eye_w_cb(void* var, int32_t v)
+{
+    auto* s = static_cast<Avatar*>(var);
+    s->eye_w_ = v; s->apply_eye_geom();
+}
 void Avatar::eye_shift_cb(void* var, int32_t v)
 {
-    auto* self = static_cast<Avatar*>(var);
-    if (!self->eye_l_) return;
-    lv_obj_t* head = self->head_;
-    int d = lv_obj_get_width(head);
-    lv_obj_set_x(self->eye_l_, d / 2 - self->eye_dx_ - self->eye_w_ / 2 + v);
-    lv_obj_set_x(self->eye_r_, d / 2 + self->eye_dx_ - self->eye_w_ / 2 + v);
+    auto* s = static_cast<Avatar*>(var);
+    s->gaze_ = v; s->apply_eye_geom();
 }
 
-void Avatar::on_blink_timer(lv_timer_t* t)
+void Avatar::on_blink(lv_timer_t* t)
 {
-    auto* self = static_cast<Avatar*>(lv_timer_get_user_data(t));
-
+    auto* s = static_cast<Avatar*>(lv_timer_get_user_data(t));
     lv_anim_t a;
     lv_anim_init(&a);
-    lv_anim_set_var(&a, self);
-    lv_anim_set_exec_cb(&a, Avatar::eye_height_cb);
-    lv_anim_set_values(&a, self->eye_h_, 2);
+    lv_anim_set_var(&a, s);
+    lv_anim_set_exec_cb(&a, Avatar::eye_h_cb);
+    lv_anim_set_values(&a, s->eye_h_, 2);
     lv_anim_set_duration(&a, 90);
-    lv_anim_set_reverse_duration(&a, 170);   // 睁开比闭上慢,才像真的眨眼
+    lv_anim_set_reverse_duration(&a, 170);
     lv_anim_start(&a);
-
-    // 下一次的间隔重新随机 —— 固定周期一眼就假
     lv_timer_set_period(t, rnd(2600, 5400));
 }
 
-void Avatar::on_gaze_timer(lv_timer_t* t)
+void Avatar::on_gaze(lv_timer_t* t)
 {
-    auto* self = static_cast<Avatar*>(lv_timer_get_user_data(t));
-
-    int target = rnd(-5, 5);
+    auto* s = static_cast<Avatar*>(lv_timer_get_user_data(t));
+    int amp = s->d_ * 8 / 100;
     lv_anim_t a;
     lv_anim_init(&a);
-    lv_anim_set_var(&a, self);
+    lv_anim_set_var(&a, s);
     lv_anim_set_exec_cb(&a, Avatar::eye_shift_cb);
-    lv_anim_set_values(&a, self->gaze_, target);
+    lv_anim_set_values(&a, s->gaze_, rnd(-amp, amp));
     lv_anim_set_duration(&a, 260);
     lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
     lv_anim_start(&a);
-    self->gaze_ = target;
-
     lv_timer_set_period(t, rnd(1800, 4200));
 }
 
-void Avatar::schedule_blink()
+// 眯眼:两只眼同时收窄拉长,变成竖直的细条,停一会儿再复原。
+// 这是整张脸最有"性格"的动作 —— 眨眼所有机器人都有,竖条是 Grok 那种
+// 略带审视的神情,一眼就能认出来。
+void Avatar::on_squint(lv_timer_t* t)
 {
-    blink_t_ = lv_timer_create(&Avatar::on_blink_timer, rnd(2600, 5400), this);
+    auto* s = static_cast<Avatar*>(lv_timer_get_user_data(t));
+    s->in_bar_ = !s->in_bar_;
+
+    int tw = s->in_bar_ ? s->bar_w_ : s->base_w_;
+    int th = s->in_bar_ ? s->bar_h_ : s->base_h_;
+
+    lv_anim_t aw, ah;
+    lv_anim_init(&aw);
+    lv_anim_set_var(&aw, s);
+    lv_anim_set_exec_cb(&aw, Avatar::eye_w_cb);
+    lv_anim_set_values(&aw, s->eye_w_, tw);
+    lv_anim_set_duration(&aw, 200);
+    lv_anim_set_path_cb(&aw, lv_anim_path_ease_in_out);
+    lv_anim_start(&aw);
+
+    lv_anim_init(&ah);
+    lv_anim_set_var(&ah, s);
+    lv_anim_set_exec_cb(&ah, Avatar::eye_h_cb);
+    lv_anim_set_values(&ah, s->eye_h_, th);
+    lv_anim_set_duration(&ah, 200);
+    lv_anim_set_path_cb(&ah, lv_anim_path_ease_in_out);
+    lv_anim_start(&ah);
+
+    // 竖条只保持一两秒就复原;常态还是圆眼,否则"眯眼"就不是个动作了
+    lv_timer_set_period(t, s->in_bar_ ? rnd(1200, 2400) : rnd(6000, 13000));
 }
 
-void Avatar::schedule_gaze()
+void Avatar::schedule_all()
 {
-    gaze_t_ = lv_timer_create(&Avatar::on_gaze_timer, rnd(1800, 4200), this);
+    t_blink_  = lv_timer_create(&Avatar::on_blink,  rnd(2600, 5400),  this);
+    t_gaze_   = lv_timer_create(&Avatar::on_gaze,   rnd(1800, 4200),  this);
+    t_squint_ = lv_timer_create(&Avatar::on_squint, rnd(6000, 13000), this);
 }
 
 void Avatar::set_state(State s)
 {
     state_ = s;
     if (!eye_l_) return;
-    // 状态切换目前只改眼睛颜色和辉光强度;唤醒词、说话口型等留到小智接进来再做
-    uint32_t col = (s == State::Listening) ? 0xffffff     // 听:瞳孔发白,像"睁大眼"
+    uint32_t col = (s == State::Listening) ? 0xFFFFFF     // 听:瞳孔发白,像睁大眼
                  : (s == State::Speaking)  ? 0xC6F08A     // 说:更亮的绿
                                            : C_EYE;
     lv_opa_t glow = (s == State::Idle) ? LV_OPA_50 : LV_OPA_COVER;
@@ -157,6 +193,8 @@ void Avatar::set_state(State s)
         lv_obj_set_style_bg_color(e, lv_color_hex(col), LV_PART_MAIN);
         lv_obj_set_style_shadow_opa(e, glow, LV_PART_MAIN);
     }
+    // 听的时候不眯眼 —— 那是走神的表情,和"正在认真听"矛盾
+    if (t_squint_) lv_timer_set_period(t_squint_, s == State::Idle ? rnd(6000, 13000) : 30000);
 }
 
 }  // namespace tdeck

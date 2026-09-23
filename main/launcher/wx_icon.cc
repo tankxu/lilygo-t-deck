@@ -33,7 +33,7 @@ lv_obj_t* blob(lv_obj_t* p, int x, int y, int w, int h, int r, uint32_t c, lv_op
     lv_obj_set_style_bg_opa(o, opa, LV_PART_MAIN);
     lv_obj_set_style_border_width(o, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(o, 0, LV_PART_MAIN);
-    lv_obj_set_scrollable(o, false);
+    lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE);
     return o;
 }
 

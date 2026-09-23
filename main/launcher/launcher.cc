@@ -88,7 +88,7 @@ lv_obj_t* mk_plain(lv_obj_t* p, int x, int y, int w, int h)
     lv_obj_set_style_bg_opa(o, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_style_border_width(o, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(o, 0, LV_PART_MAIN);
-    lv_obj_set_scrollable(o, false);
+    lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE);
     return o;
 }
 
@@ -98,8 +98,16 @@ public:
 
     void begin()
     {
-        auto& apps = AppRegistry::instance().apps();
-        n_apps_ = (int)apps.size(); if (n_apps_ > MAX_APPS) n_apps_ = MAX_APPS;
+        // 网格只放没被标记隐藏的 app;小智走首屏头像和数字键 0
+        auto& all = AppRegistry::instance().apps();
+        n_apps_ = 0;
+        for (int i = 0; i < (int)all.size() && n_apps_ < MAX_APPS; i++) {
+            if (all[i]->hidden_from_grid()) { 
+                if (!strcmp(all[i]->name(), "XIAOZHI")) xiaozhi_idx_ = i;
+                continue;
+            }
+            grid_idx_[n_apps_++] = i;
+        }
         build();
         lv_screen_load(scr_);
         tdeck_input_subscribe(&Host::bsp_cb, this);
@@ -145,7 +153,7 @@ private:
         scr_ = lv_obj_create(nullptr);
         lv_obj_set_style_bg_image_src(scr_, &kWallpaper, LV_PART_MAIN);
         lv_obj_set_style_pad_all(scr_, 0, LV_PART_MAIN);
-        lv_obj_set_scrollable(scr_, false);
+        lv_obj_remove_flag(scr_, LV_OBJ_FLAG_SCROLLABLE);
 
         // 两屏并排放进一个宽 640 的容器,切屏就是把这个容器整体平移
         // 柔光色块已移除:LVGL 的径向渐变是逐像素算距离 + 插值,三个大圆叠加,
@@ -174,7 +182,7 @@ private:
             lv_obj_set_style_bg_opa(pg, LV_OPA_TRANSP, LV_PART_MAIN);
             lv_obj_set_style_border_width(pg, 0, LV_PART_MAIN);
             lv_obj_set_style_pad_all(pg, 0, LV_PART_MAIN);
-            lv_obj_set_scrollable(pg, false);
+            lv_obj_remove_flag(pg, LV_OBJ_FLAG_SCROLLABLE);
             return pg;
         };
         build_home(mk_page());
@@ -211,7 +219,7 @@ private:
         int idx = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target_obj(e));
         self->sel_ = idx;
         self->paint_selection();
-        self->open(idx);
+        self->open(self->grid_idx_[idx]);
     }
 
     void build_home(lv_obj_t* p)
@@ -219,6 +227,19 @@ private:
         // 小智常驻左上。深色块只能放这个角 —— 背光漏光集中在另外三个角
         // (见 docs/hardware.md),压上去会把已经解决的问题重新暴露出来。
         avatar_.create(p, 42, 40, 56);
+        // 首屏头像就是小智的入口。做成一块透明的可点区域盖在头像上,
+        // 而不是让 Avatar 自己处理点击 —— 那会把"画一张脸"和"当按钮"
+        // 两件事耦合在一起。
+        lv_obj_t* hit = lv_obj_create(p);
+        lv_obj_set_size(hit, 64, 64);
+        lv_obj_set_pos(hit, 10, 8);
+        lv_obj_set_style_bg_opa(hit, LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_set_style_border_width(hit, 0, LV_PART_MAIN);
+        lv_obj_add_flag(hit, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(hit, [](lv_event_t* e) {
+            auto* self = static_cast<Host*>(lv_event_get_user_data(e));
+            if (self->xiaozhi_idx_ >= 0) self->open(self->xiaozhi_idx_);
+        }, LV_EVENT_CLICKED, this);
 
         // 时间/日期/天气各自独立,不套卡片。这是手机锁屏的排布:
         // 信息本身就是画面,加一圈卡片边框反而显得廉价。
@@ -262,7 +283,7 @@ private:
         lv_obj_set_style_pad_column(sb, 5, LV_PART_MAIN);
         lv_obj_set_flex_flow(sb, LV_FLEX_FLOW_ROW);
         lv_obj_set_flex_align(sb, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-        lv_obj_set_scrollable(sb, false);
+        lv_obj_remove_flag(sb, LV_OBJ_FLAG_SCROLLABLE);
 
         wifi_ = mk_label(sb, &lv_font_montserrat_14, C_STATUS, LV_SYMBOL_WIFI);
         lv_obj_set_style_text_opa(wifi_, LV_OPA_COVER, LV_PART_MAIN);
@@ -273,7 +294,7 @@ private:
         lv_obj_set_style_bg_opa(batw, LV_OPA_TRANSP, LV_PART_MAIN);
         lv_obj_set_style_border_width(batw, 0, LV_PART_MAIN);
         lv_obj_set_style_pad_all(batw, 0, LV_PART_MAIN);
-        lv_obj_set_scrollable(batw, false);
+        lv_obj_remove_flag(batw, LV_OBJ_FLAG_SCROLLABLE);
 
         bat_body_ = lv_obj_create(batw);
         lv_obj_set_size(bat_body_, 26, 13);
@@ -283,7 +304,7 @@ private:
         lv_obj_set_style_border_width(bat_body_, 1, LV_PART_MAIN);
         lv_obj_set_style_border_color(bat_body_, lv_color_hex(C_STATUS), LV_PART_MAIN);
         lv_obj_set_style_pad_all(bat_body_, 0, LV_PART_MAIN);
-        lv_obj_set_scrollable(bat_body_, false);
+        lv_obj_remove_flag(bat_body_, LV_OBJ_FLAG_SCROLLABLE);
 
         bat_fill_ = lv_obj_create(bat_body_);
         lv_obj_set_pos(bat_fill_, 2, 2);
@@ -292,7 +313,7 @@ private:
         lv_obj_set_style_bg_color(bat_fill_, lv_color_hex(C_STATUS), LV_PART_MAIN);
         lv_obj_set_style_border_width(bat_fill_, 0, LV_PART_MAIN);
         lv_obj_set_style_pad_all(bat_fill_, 0, LV_PART_MAIN);
-        lv_obj_set_scrollable(bat_fill_, false);
+        lv_obj_remove_flag(bat_fill_, LV_OBJ_FLAG_SCROLLABLE);
 
         lv_obj_t* cap = lv_obj_create(batw);
         lv_obj_set_size(cap, 3, 6);
@@ -305,7 +326,7 @@ private:
         // 闪电紧跟电池,靠 flex 的 5px 间距,不会被推到天边
         bat_bolt_ = mk_label(sb, &lv_font_montserrat_14, C_STATUS, LV_SYMBOL_CHARGE);
         lv_obj_set_style_text_opa(bat_bolt_, LV_OPA_COVER, LV_PART_MAIN);
-        lv_obj_set_hidden(bat_bolt_, true);
+        lv_obj_add_flag(bat_bolt_, LV_OBJ_FLAG_HIDDEN);
 
         bat_ = mk_label(sb, &lv_font_montserrat_14, C_STATUS, "--");
     }
@@ -322,11 +343,11 @@ private:
             lv_obj_set_pos(c, x, y);
             lv_obj_set_style_radius(c, 16, LV_PART_MAIN);
             lv_obj_set_style_pad_all(c, 0, LV_PART_MAIN);
-            lv_obj_set_scrollable(c, false);
+            lv_obj_remove_flag(c, LV_OBJ_FLAG_SCROLLABLE);
             cards_[i] = c;
 
             if (i < n_apps_) {
-                App* a = apps[i];
+                App* a = apps[grid_idx_[i]];
                 lv_obj_set_style_bg_color(c, lv_color_hex(C_CARD), LV_PART_MAIN);
                 lv_obj_set_style_bg_opa(c, LV_OPA_COVER, LV_PART_MAIN);
                 lv_obj_set_style_border_width(c, 1, LV_PART_MAIN);
@@ -362,7 +383,7 @@ private:
         for (int i = 0; i < MAX_APPS; i++) {
             if (!cards_[i] || i >= n_apps_) continue;
             bool on = (i == sel_ && page_ == 1);
-            auto* a = AppRegistry::instance().apps()[i];
+            auto* a = AppRegistry::instance().apps()[grid_idx_[i]];
             lv_obj_set_style_border_width(cards_[i], on ? 2 : 1, LV_PART_MAIN);
             lv_obj_set_style_border_color(cards_[i],
                 lv_color_hex(on ? a->accent() : C_LINE), LV_PART_MAIN);
@@ -379,35 +400,18 @@ private:
         }
     }
 
-    // 卡片是活的:设置卡要显示当前网络,音乐卡要显示正在播放什么。
-    // 开机画一次就不动的话,第一张卡永远停在"Offline"(WiFi 是几秒后才连上的)。
-    // 整块重绘而不是增量更新 —— 一张卡也就十来个对象,10 秒一次的开销可以忽略,
-    // 换来的是 app 那边不用维护任何"哪些控件要更新"的状态。
-    void refresh_cards()
-    {
-        if (current_) return;                 // app 打开着的时候没人看得到卡片
-        auto& apps = AppRegistry::instance().apps();
-        for (int i = 0; i < n_apps_; i++) {
-            if (!cards_[i]) continue;
-            lv_obj_clean(cards_[i]);
-            apps[i]->render_card(cards_[i]);
-        }
-        paint_selection();
-    }
-
     void refresh_status()
     {
-        refresh_cards();
         if (!bat_) return;
         if (tdeck_on_external_power()) {
-            lv_obj_set_hidden(bat_bolt_, false);
-            lv_obj_set_hidden(bat_, true);   // 空串仍占位,必须真隐藏
+            lv_obj_remove_flag(bat_bolt_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(bat_, LV_OBJ_FLAG_HIDDEN);   // 空串仍占位,必须真隐藏
             lv_obj_set_width(bat_fill_, 20);
             lv_obj_set_style_bg_color(bat_fill_, lv_color_hex(C_STATUS), LV_PART_MAIN);
             return;
         }
-        lv_obj_set_hidden(bat_bolt_, true);
-        lv_obj_set_hidden(bat_, false);
+        lv_obj_add_flag(bat_bolt_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(bat_, LV_OBJ_FLAG_HIDDEN);
         int pct = tdeck_battery_percent();
         if (pct < 0) { lv_label_set_text(bat_, "--"); return; }
         lv_label_set_text_fmt(bat_, "%d", pct);
@@ -449,7 +453,7 @@ private:
         lv_obj_set_style_bg_opa(sc_, LV_OPA_60, LV_PART_MAIN);
         lv_obj_set_style_border_width(sc_, 0, LV_PART_MAIN);
         lv_obj_set_style_pad_all(sc_, 0, LV_PART_MAIN);
-        lv_obj_set_scrollable(sc_, false);
+        lv_obj_remove_flag(sc_, LV_OBJ_FLAG_SCROLLABLE);
 
         lv_obj_t* box = lv_obj_create(sc_);
         lv_obj_set_size(box, 268, 192);
@@ -460,7 +464,7 @@ private:
         lv_obj_set_style_shadow_width(box, 28, LV_PART_MAIN);
         lv_obj_set_style_shadow_opa(box, LV_OPA_40, LV_PART_MAIN);
         lv_obj_set_style_pad_all(box, 0, LV_PART_MAIN);
-        lv_obj_set_scrollable(box, false);
+        lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
 
         lv_obj_t* h = mk_label(box, &lv_font_montserrat_20, C_TEXT, "Shortcuts");
         lv_obj_set_pos(h, 18, 14);
@@ -526,7 +530,26 @@ private:
             default: break;
             }
         } else if (ev.source == TDECK_INPUT_KEYBOARD) {
+            // app 正在做文字输入时,字母全部原样下发,只保留 ESC 作为退路。
+            // 轨迹球不受影响(它不是键盘),所以中键和长按永远能用 ——
+            // 这就是"声明了 raw keys 也不会把人困住"的保证。
+            if (current_ && current_->wants_raw_keys()) {
+                if (ev.code == 27) ie.key = Key::Back;
+                else { ie.key = Key::Char; ie.ch = (char)ev.code; }
+                if (ie.key == Key::Char && (ev.code == 13 || ev.code == 10))
+                    ie.key = Key::Enter;
+                current_->on_input(ie);
+                lvgl_port_unlock();
+                return;
+            }
             switch (ev.code) {   // OS 级键位约定,见 ADR-006
+            case '0':   // 全局:任何界面下按 0 都进小智
+                if (xiaozhi_idx_ >= 0 && (!current_ ||
+                        strcmp(current_->name(), "XIAOZHI"))) {
+                    if (current_) back();
+                    open(xiaozhi_idx_);
+                }
+                lvgl_port_unlock(); return;
             case 's': case 'S': toggle_shortcuts(); lvgl_port_unlock(); return;
             case 'q': case 'Q':
                 if (sc_)      { toggle_shortcuts(); lvgl_port_unlock(); return; }
@@ -577,7 +600,7 @@ private:
             if (page_ == 1 && sel_ + 2 < n_apps_ && move_ok) { sel_ += 2; moved(); }
             break;
         case Key::Enter:
-            if (page_ == 1) open(sel_); else goto_page(1);
+            if (page_ == 1) open(grid_idx_[sel_]); else goto_page(1);
             break;
         default: break;
         }
@@ -596,6 +619,8 @@ private:
     Avatar      avatar_;
     static constexpr uint32_t MOVE_COOLDOWN_MS = 120;
     uint32_t    last_page_ms_ = 0, last_move_ms_ = 0;
+    int         grid_idx_[MAX_APPS] = {};   // 网格位置 → 注册表下标
+    int         xiaozhi_idx_ = -1;
     int         page_ = 0, sel_ = 0, n_apps_ = 0;
 };
 

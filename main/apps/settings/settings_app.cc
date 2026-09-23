@@ -36,44 +36,49 @@ public:
     const char* name() const override   { return "Settings"; }
     const char* icon() const override   { return LV_SYMBOL_SETTINGS; }
     uint32_t    accent() const override { return 0x4F6B3E; }
+    // 密码框里要能打全部字符(ADR-006 的后路)
+    bool wants_raw_keys() const override { return view_ == View::Password; }
 
-    // 卡片显示【当前连着哪个网、什么信号】—— 这是打开设置最常想知道的事。
-    // 放一个齿轮图标加 "Settings" 字样的话,这张卡片就只是个按钮。
+    // 卡片是【入口】不是挂件:不显示当前网络状态。
+    // 三道同心弧 —— 既像设置里的滑块刻度,又和音乐的直条、色板的色带
+    // 在形状上彻底区分开。三张卡片放一起靠形状就能认,不用读字。
     void render_card(lv_obj_t* card) override
     {
-        auto st = tdeck::net_status();
+        const int W = 143, H = 94;
+        lv_obj_set_style_bg_color(card, lv_color_hex(0xEFF3E9), LV_PART_MAIN);
 
-        lv_obj_t* t1 = mk(card, &lv_font_montserrat_14, C_MUTE, 12, 12,
-                          st.online ? LV_SYMBOL_WIFI "  Connected" : LV_SYMBOL_WARNING "  Offline");
+        struct { int r, w, start, len; uint32_t c; } arcs[] = {
+            { 62, 7, 140, 200, 0x55853A },
+            { 48, 6, 170, 150, 0x8FAE60 },
+            { 34, 5, 200, 110, 0xC3D6A8 },
+        };
+        for (auto& a : arcs) {
+            lv_obj_t* arc = lv_arc_create(card);
+            lv_obj_set_size(arc, a.r * 2, a.r * 2);
+            lv_obj_set_pos(arc, W / 2 - a.r, H - 18 - a.r);
+            lv_arc_set_bg_angles(arc, a.start, a.start + a.len);
+            lv_arc_set_value(arc, 100);
+            lv_obj_remove_style(arc, nullptr, LV_PART_KNOB);
+            lv_obj_set_style_arc_width(arc, a.w, LV_PART_MAIN);
+            lv_obj_set_style_arc_width(arc, a.w, LV_PART_INDICATOR);
+            lv_obj_set_style_arc_color(arc, lv_color_hex(a.c), LV_PART_MAIN);
+            lv_obj_set_style_arc_color(arc, lv_color_hex(a.c), LV_PART_INDICATOR);
+            lv_obj_set_style_arc_opa(arc, LV_OPA_COVER, LV_PART_MAIN);
+            lv_obj_remove_flag(arc, LV_OBJ_FLAG_CLICKABLE);
+        }
 
-        lv_obj_t* ssid = mk(card, &lv_font_montserrat_16, C_TEXT, 12, 32,
-                            st.ssid[0] ? st.ssid : "no network");
-        lv_label_set_long_mode(ssid, LV_LABEL_LONG_DOT);
-        lv_obj_set_width(ssid, 119);
-
-        char line[48];
-        if (st.online) snprintf(line, sizeof(line), "%s   %d dBm", st.ip, st.rssi);
-        else           snprintf(line, sizeof(line), "tap to configure");
-        mk(card, &lv_font_montserrat_14, C_MUTE, 12, 56, line);
-
-        // 底部一条主题色细线,和其它卡片区分开
-        lv_obj_t* bar = lv_obj_create(card);
-        lv_obj_set_size(bar, 143, 4);
-        lv_obj_set_pos(bar, 0, 90);
-        lv_obj_set_style_bg_color(bar, lv_color_hex(C_ACCENT), LV_PART_MAIN);
-        lv_obj_set_style_radius(bar, 0, LV_PART_MAIN);
-        lv_obj_set_style_border_width(bar, 0, LV_PART_MAIN);
-        lv_obj_set_style_pad_all(bar, 0, LV_PART_MAIN);
-        lv_obj_set_scrollable(bar, false);
-        lv_obj_set_clickable(bar, false);
-        (void)t1;
+        lv_obj_t* nm = lv_label_create(card);
+        lv_obj_set_style_text_font(nm, &lv_font_montserrat_16, LV_PART_MAIN);
+        lv_obj_set_style_text_color(nm, lv_color_hex(C_TEXT), LV_PART_MAIN);
+        lv_label_set_text(nm, "Settings");
+        lv_obj_set_pos(nm, 12, 10);
     }
 
     void on_enter(lv_obj_t* root) override
     {
         root_ = root;
         lv_obj_set_style_bg_color(root, lv_color_hex(0xF2F5EE), LV_PART_MAIN);
-        lv_obj_set_scrollable(root, false);
+        lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
         show_menu();
     }
 
@@ -111,7 +116,7 @@ private:
         lv_obj_set_style_border_width(r, 1, LV_PART_MAIN);
         lv_obj_set_style_border_color(r, lv_color_hex(C_LINE), LV_PART_MAIN);
         lv_obj_set_style_pad_all(r, 0, LV_PART_MAIN);
-        lv_obj_set_scrollable(r, false);
+        lv_obj_remove_flag(r, LV_OBJ_FLAG_SCROLLABLE);
         return r;
     }
 
@@ -233,7 +238,7 @@ private:
             lv_obj_set_style_radius(r, 8, LV_PART_MAIN);
             lv_obj_set_style_border_width(r, 1, LV_PART_MAIN);
             lv_obj_set_style_pad_all(r, 0, LV_PART_MAIN);
-            lv_obj_set_scrollable(r, false);
+            lv_obj_remove_flag(r, LV_OBJ_FLAG_SCROLLABLE);
 
             char b[64];
             snprintf(b, sizeof(b), "%s%s", aps_[i].ssid, aps_[i].secure ? "  " LV_SYMBOL_CLOSE : "");
@@ -285,7 +290,7 @@ private:
 
         mk(root_, &lv_font_montserrat_14, C_MUTE, 14, 132,
            "type on the keyboard, then press Enter");
-        hint("y/Enter: connect   n/b: back");
+        hint("Enter: connect   ESC: back");
     }
 
     bool pass_input(const tdeck::InputEvent& ev)

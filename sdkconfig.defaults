@@ -50,6 +50,11 @@ CONFIG_LV_USE_DRAW_SW_COMPLEX_GRADIENTS=y
 # 截图接口要用(默认关)
 CONFIG_LV_USE_SNAPSHOT=y
 
+# 78/xiaozhi-fonts 把 LV_LVGL_H_INCLUDE_SIMPLE 设成 PUBLIC,连带让 LVGL 的
+# lv_conf_internal.h 走到 #include LV_ASSERT_HANDLER_INCLUDE 这一行,
+# 而这个配置默认是空字符串 → "empty filename in #include"。给它一个真实头文件。
+CONFIG_LV_ASSERT_HANDLER_INCLUDE="assert.h"
+
 # LVGL 的分配器换成 C 标准库 malloc,而不是它自带的 64KB 静态池。
 # 两个理由:
 #   1. 一张 320x240 截图就要 150KB,自带池根本放不下

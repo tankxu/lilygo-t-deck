@@ -10,6 +10,7 @@ idf_component_register(
         "apps/palette/palette_app.cc"
         "apps/settings/settings_app.cc"
         "apps/music/music_app.cc"
+        "apps/xiaozhi/xiaozhi_app.cc"
     INCLUDE_DIRS
         "." "app_framework"
     REQUIRES

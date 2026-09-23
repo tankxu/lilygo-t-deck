@@ -38,6 +38,18 @@ public:
     // 卡片的主题色,用于选中态描边
     virtual uint32_t    accent() const { return 0x55853A; }
 
+    // 不出现在应用页的网格里。小智是常驻角色(ADR-004),入口是首屏头像和
+    // 数字键 0,把它也塞进卡片网格会让"常驻"这件事在概念上自相矛盾。
+    virtual bool hidden_from_grid() const { return false; }
+
+    // 正在做文字输入,请把【原始按键】全都给我。
+    //
+    // 默认情况下 y/n/b/q/s/0 被 OS 全局占用(ADR-006),六个字母打不出来 ——
+    // 搜索框里输不了 "yesterday"、"boy",WiFi 密码里也少六个字符,不能接受。
+    // 声明了这个的 app 拿到全部按键,代价是【自己负责提供退路】:
+    // ESC 和轨迹球中键仍然由 OS 保留,永远能退出去。
+    virtual bool wants_raw_keys() const { return false; }
+
     // ── 卡片 ──
     // 桌面上的卡片是一个【内容整体】,不是"图标 + 标题 + 描述"的容器:
     // 音乐卡片就该是封面和正在播放什么,色板卡片就该是一片真实的色带,
