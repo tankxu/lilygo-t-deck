@@ -1,0 +1,7 @@
+# T-Deck 16MB 分区表 —— 不做 OTA,空间最大化(ADR-005)
+# Name,     Type, SubType,  Offset,    Size,      Flags
+nvs,        data, nvs,      0x9000,    0x6000,
+phy_init,   data, phy,      0xf000,    0x1000,
+factory,    app,  factory,  0x10000,   0x800000,
+storage,    data, fat,      0x810000,  0x7E0000,
+coredump,   data, coredump, 0xFF0000,  0x10000,

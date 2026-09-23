@@ -1,0 +1,12 @@
+dependencies:
+  idf:
+    version: ">=5.4"
+  # LVGL 9 + Espressif 的移植层(负责 flush 回调、indev、LVGL 任务)
+  espressif/esp_lvgl_port:
+    version: "^2.9.0"
+  # 触摸 GT911
+  espressif/esp_lcd_touch_gt911:
+    version: "^1.2.1"
+  # 音频 codec 抽象,ES7210 驱动在这里(小智同款)
+  espressif/esp_codec_dev:
+    version: "^1.6.2"
