@@ -36,6 +36,12 @@ namespace {
 const char* TAG = "net";
 
 constexpr int BIT_CONNECTED = BIT0;
+char s_ip[16] = "";
+
+// 凭据存 NVS,secrets.h 里的值只作为【首次启动的兜底】。
+// 否则改个 WiFi 就要重新编译烧录 —— 在别人家里连个网都得开电脑,不能这么设计。
+constexpr const char* NVS_NS = "tdecknet";
+char s_ssid[33], s_pass[65];
 EventGroupHandle_t s_events;
 int s_retry = 0;
 
@@ -55,15 +61,38 @@ void on_wifi_event(void*, esp_event_base_t base, int32_t id, void* data)
         esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         auto* ev = (ip_event_got_ip_t*)data;
-        ESP_LOGI(TAG, "已连上 " WIFI_SSID ",IP " IPSTR, IP2STR(&ev->ip_info.ip));
+        snprintf(s_ip, sizeof(s_ip), IPSTR, IP2STR(&ev->ip_info.ip));
+        ESP_LOGI(TAG, "已连上 %s,IP %s", s_ssid, s_ip);
         s_retry = 0;
         xEventGroupSetBits(s_events, BIT_CONNECTED);
         lvgl_port_lock(0); launcher_set_online(true); lvgl_port_unlock();
     }
 }
 
+void load_credentials()
+{
+    nvs_handle_t h;
+    size_t n;
+    bool got = false;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        n = sizeof(s_ssid);
+        if (nvs_get_str(h, "ssid", s_ssid, &n) == ESP_OK && s_ssid[0]) {
+            n = sizeof(s_pass);
+            nvs_get_str(h, "pass", s_pass, &n);
+            got = true;
+        }
+        nvs_close(h);
+    }
+    if (!got) {
+        strncpy(s_ssid, WIFI_SSID, sizeof(s_ssid) - 1);
+        strncpy(s_pass, WIFI_PASSWORD, sizeof(s_pass) - 1);
+        ESP_LOGI(TAG, "NVS 里没有凭据,用 secrets.h 的兜底值");
+    }
+}
+
 void wifi_start()
 {
+    load_credentials();
     s_events = xEventGroupCreate();
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -77,8 +106,8 @@ void wifi_start()
                                                         &on_wifi_event, nullptr, nullptr));
 
     wifi_config_t wc = {};
-    strncpy((char*)wc.sta.ssid, WIFI_SSID, sizeof(wc.sta.ssid) - 1);
-    strncpy((char*)wc.sta.password, WIFI_PASSWORD, sizeof(wc.sta.password) - 1);
+    strncpy((char*)wc.sta.ssid, s_ssid, sizeof(wc.sta.ssid) - 1);
+    strncpy((char*)wc.sta.password, s_pass, sizeof(wc.sta.password) - 1);
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
     ESP_ERROR_CHECK(esp_wifi_start());
@@ -202,6 +231,73 @@ void net_task(void*)
 }
 
 }  // namespace
+
+NetStatus net_status()
+{
+    NetStatus st{};
+    st.online = s_events && (xEventGroupGetBits(s_events) & BIT_CONNECTED);
+    strncpy(st.ssid, s_ssid, sizeof(st.ssid) - 1);
+    strncpy(st.ip, st.online ? s_ip : "", sizeof(st.ip) - 1);
+    wifi_ap_record_t ap;
+    st.rssi = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) ? ap.rssi : 0;
+    return st;
+}
+
+int net_scan(ApInfo* out, int max_n)
+{
+    // 同步扫描。调用方是设置界面里的一次用户操作,阻塞一两秒可以接受,
+    // 换成异步反而要给 UI 加一套回调和状态机。
+    wifi_scan_config_t sc = {};
+    sc.show_hidden = false;
+    if (esp_wifi_scan_start(&sc, true) != ESP_OK) return 0;
+
+    uint16_t n = 0;
+    esp_wifi_scan_get_ap_num(&n);
+    if (n == 0) return 0;
+    if (n > 40) n = 40;
+
+    auto* recs = (wifi_ap_record_t*)calloc(n, sizeof(wifi_ap_record_t));
+    if (!recs) return 0;
+    esp_wifi_scan_get_ap_records(&n, recs);
+
+    // esp_wifi 已按信号降序给,这里只做同名去重(mesh / 多频段会重复出现)
+    int cnt = 0;
+    for (int i = 0; i < n && cnt < max_n; i++) {
+        if (!recs[i].ssid[0]) continue;
+        bool dup = false;
+        for (int j = 0; j < cnt; j++)
+            if (!strcmp(out[j].ssid, (char*)recs[i].ssid)) { dup = true; break; }
+        if (dup) continue;
+        strncpy(out[cnt].ssid, (char*)recs[i].ssid, sizeof(out[cnt].ssid) - 1);
+        out[cnt].rssi   = recs[i].rssi;
+        out[cnt].secure = recs[i].authmode != WIFI_AUTH_OPEN;
+        cnt++;
+    }
+    free(recs);
+    return cnt;
+}
+
+void net_set_credentials(const char* ssid, const char* password)
+{
+    if (ssid && ssid[0]) {
+        strncpy(s_ssid, ssid, sizeof(s_ssid) - 1);
+        strncpy(s_pass, password ? password : "", sizeof(s_pass) - 1);
+        nvs_handle_t h;
+        if (nvs_open(NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+            nvs_set_str(h, "ssid", s_ssid);
+            nvs_set_str(h, "pass", s_pass);
+            nvs_commit(h);
+            nvs_close(h);
+        }
+        ESP_LOGI(TAG, "凭据已更新:%s", s_ssid);
+    }
+    wifi_config_t wc = {};
+    strncpy((char*)wc.sta.ssid, s_ssid, sizeof(wc.sta.ssid) - 1);
+    strncpy((char*)wc.sta.password, s_pass, sizeof(wc.sta.password) - 1);
+    esp_wifi_disconnect();
+    esp_wifi_set_config(WIFI_IF_STA, &wc);
+    esp_wifi_connect();
+}
 
 void net_start()
 {

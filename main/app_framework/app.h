@@ -35,10 +35,18 @@ public:
     virtual const char* name() const = 0;
     virtual const char* icon() const = 0;   // LVGL symbol 或 storage 里的图标路径
 
-    // 卡片上的第二行说明。桌面是卡片而不是纯图标,靠这一行区分同类应用。
-    virtual const char* subtitle() const { return ""; }
-    // 卡片的主题色,用于图标底衬和选中态。每个应用一个色,扫一眼就能认出来。
-    virtual uint32_t    accent() const { return 0x0969da; }
+    // 卡片的主题色,用于选中态描边
+    virtual uint32_t    accent() const { return 0x55853A; }
+
+    // ── 卡片 ──
+    // 桌面上的卡片是一个【内容整体】,不是"图标 + 标题 + 描述"的容器:
+    // 音乐卡片就该是封面和正在播放什么,色板卡片就该是一片真实的色带,
+    // 设置卡片就该是当前连着哪个 WiFi。卡片之间的区别来自内容本身,
+    // 而不是来自图标的颜色 —— 后者只是把同一个模板换了个色。
+    //
+    // card 是一块 143x94、已经设好圆角和阴影的容器,app 往里画什么都行。
+    // 默认实现是退化形式(图标 + 名称),只给还没做卡片的 app 兜底。
+    virtual void render_card(lv_obj_t* card);
 
     // ── 生命周期 ──
     // launcher 递一块干净的 screen 过来,app 在上面建自己的控件树。

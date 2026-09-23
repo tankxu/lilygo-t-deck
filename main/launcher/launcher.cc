@@ -334,26 +334,10 @@ private:
                 lv_obj_set_style_shadow_width(c, 14, LV_PART_MAIN);
                 lv_obj_set_style_shadow_offset_y(c, 3, LV_PART_MAIN);
                 lv_obj_set_style_shadow_opa(c, LV_OPA_20, LV_PART_MAIN);
+                lv_obj_set_style_clip_corner(c, true, LV_PART_MAIN);  // 内容不许溢出圆角
 
-                // 图标底衬:主题色的淡色方块,比纯图标有份量
-                lv_obj_t* chip = lv_obj_create(c);
-                lv_obj_set_size(chip, 38, 38);
-                lv_obj_set_pos(chip, 14, 12);
-                lv_obj_set_style_radius(chip, 11, LV_PART_MAIN);
-                lv_obj_set_style_bg_color(chip, lv_color_hex(a->accent()), LV_PART_MAIN);
-                lv_obj_set_style_bg_opa(chip, LV_OPA_20, LV_PART_MAIN);
-                lv_obj_set_style_border_width(chip, 0, LV_PART_MAIN);
-                lv_obj_set_style_pad_all(chip, 0, LV_PART_MAIN);
-                lv_obj_set_scrollable(chip, false);
-
-                lv_obj_t* ic = mk_label(chip, &lv_font_montserrat_20, a->accent(), a->icon());
-                lv_obj_center(ic);
-
-                lv_obj_t* nm = mk_label(c, &lv_font_montserrat_16, C_TEXT, a->name());
-                lv_obj_set_pos(nm, 14, 56);
-
-                lv_obj_t* st = mk_label(c, &lv_font_montserrat_14, C_MUTE, a->subtitle());
-                lv_obj_set_pos(st, 14, 74);
+                // 卡片内容由 app 自己画(见 App::render_card 的注释)
+                a->render_card(c);
 
                 lv_obj_set_user_data(c, (void*)(intptr_t)i);
                 lv_obj_add_flag(c, LV_OBJ_FLAG_CLICKABLE);
@@ -395,8 +379,25 @@ private:
         }
     }
 
+    // 卡片是活的:设置卡要显示当前网络,音乐卡要显示正在播放什么。
+    // 开机画一次就不动的话,第一张卡永远停在"Offline"(WiFi 是几秒后才连上的)。
+    // 整块重绘而不是增量更新 —— 一张卡也就十来个对象,10 秒一次的开销可以忽略,
+    // 换来的是 app 那边不用维护任何"哪些控件要更新"的状态。
+    void refresh_cards()
+    {
+        if (current_) return;                 // app 打开着的时候没人看得到卡片
+        auto& apps = AppRegistry::instance().apps();
+        for (int i = 0; i < n_apps_; i++) {
+            if (!cards_[i]) continue;
+            lv_obj_clean(cards_[i]);
+            apps[i]->render_card(cards_[i]);
+        }
+        paint_selection();
+    }
+
     void refresh_status()
     {
+        refresh_cards();
         if (!bat_) return;
         if (tdeck_on_external_power()) {
             lv_obj_set_hidden(bat_bolt_, false);

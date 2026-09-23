@@ -54,10 +54,49 @@ inline uint16_t to565(Rgb c)
 
 class PaletteApp : public tdeck::App {
 public:
-    const char* name() const override     { return "Palette"; }
-    const char* icon() const override     { return LV_SYMBOL_IMAGE; }
-    const char* subtitle() const override { return "256 colors"; }
-    uint32_t    accent() const override   { return 0x8250df; }
+    const char* name() const override   { return "Palette"; }
+    const char* icon() const override   { return LV_SYMBOL_IMAGE; }
+    uint32_t    accent() const override { return 0x55853A; }
+
+    // 卡片就是一片真实的色带 —— 不是"一个调色板图标 + Palette 字样"。
+    // 看一眼就知道这个 app 是干什么的,不需要读文字。
+    void render_card(lv_obj_t* card) override
+    {
+        build_colors();
+        const int W = 143, H = 94, BARS = 16;
+
+        // 每列一个色相,取该列中段的饱和色(rows 6~9 是最鲜艳的一段)
+        for (int i = 0; i < BARS; i++) {
+            lv_obj_t* bar = lv_obj_create(card);
+            lv_obj_set_size(bar, (W + BARS - 1) / BARS, H);
+            lv_obj_set_pos(bar, i * W / BARS, 0);
+            lv_obj_set_style_bg_color(bar, lv_color_hex(rgb_[7 * COLS + i]), LV_PART_MAIN);
+            lv_obj_set_style_radius(bar, 0, LV_PART_MAIN);
+            lv_obj_set_style_border_width(bar, 0, LV_PART_MAIN);
+            lv_obj_set_style_pad_all(bar, 0, LV_PART_MAIN);
+            lv_obj_set_scrollable(bar, false);
+            lv_obj_set_clickable(bar, false);
+        }
+
+        // 底部压一条半透明深色带,白字才在任何色相上都读得出来 ——
+        // 直接把文字放在彩色条上,遇到黄色那几列就看不见了
+        lv_obj_t* scrim = lv_obj_create(card);
+        lv_obj_set_size(scrim, W, 30);
+        lv_obj_set_pos(scrim, 0, H - 30);
+        lv_obj_set_style_bg_color(scrim, lv_color_hex(0x101410), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(scrim, LV_OPA_70, LV_PART_MAIN);
+        lv_obj_set_style_radius(scrim, 0, LV_PART_MAIN);
+        lv_obj_set_style_border_width(scrim, 0, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(scrim, 0, LV_PART_MAIN);
+        lv_obj_set_scrollable(scrim, false);
+        lv_obj_set_clickable(scrim, false);
+
+        lv_obj_t* nm = lv_label_create(scrim);
+        lv_obj_set_style_text_font(nm, &lv_font_montserrat_16, LV_PART_MAIN);
+        lv_obj_set_style_text_color(nm, lv_color_white(), LV_PART_MAIN);
+        lv_label_set_text(nm, "Palette");
+        lv_obj_align(nm, LV_ALIGN_LEFT_MID, 10, 0);
+    }
 
     void on_enter(lv_obj_t* root) override
     {

@@ -10,3 +10,6 @@ dependencies:
   # 音频 codec 抽象,ES7210 驱动在这里(小智同款)
   espressif/esp_codec_dev:
     version: "^1.6.2"
+  # Opus/MP3 解码(小智同款,音乐播放器和将来的小智共用)
+  espressif/esp_audio_codec:
+    version: "^2.4.0"

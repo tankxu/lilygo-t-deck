@@ -8,6 +8,8 @@ idf_component_register(
         "net/net.cc"
         "debug/debug_server.cc"
         "apps/palette/palette_app.cc"
+        "apps/settings/settings_app.cc"
+        "apps/music/music_app.cc"
     INCLUDE_DIRS
         "." "app_framework"
     REQUIRES
