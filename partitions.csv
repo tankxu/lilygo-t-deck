@@ -1,7 +1,14 @@
 # T-Deck 16MB 分区表 —— 不做 OTA,空间最大化(ADR-005)
+#
+# assets 是【小智必须的】:字体、表情、提示音、唤醒词模型都放这里,而且名字必须叫
+# assets —— 小智的 main/CMakeLists.txt 里
+#     partition_table_get_partition_info(--partition-name assets ...)
+# 找不到就【静默跳过】整段资源生成,编译照样通过,运行时满屏豆腐块。
+#
 # Name,     Type, SubType,  Offset,    Size,      Flags
 nvs,        data, nvs,      0x9000,    0x6000,
 phy_init,   data, phy,      0xf000,    0x1000,
-factory,    app,  factory,  0x10000,   0x800000,
+factory,    app,  factory,  0x10000,   0x600000,
+assets,     data, spiffs,   0x610000,  0x200000,
 storage,    data, fat,      0x810000,  0x7E0000,
 coredump,   data, coredump, 0xFF0000,  0x10000,

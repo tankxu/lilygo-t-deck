@@ -102,3 +102,37 @@ int tdeck_battery_mv(void)
     }
     return mv * TDECK_BAT_DIVIDER;
 }
+
+// 单节锂电的电压-电量曲线。锂电放电平台很平(3.7~3.9V 占了大半容量),
+// 按电压线性换算会得出"用一会儿就掉一半"的假百分比,必须查表。
+int tdeck_battery_percent(void)
+{
+    int mv = tdeck_battery_mv();
+    if (mv <= 0) return -1;
+
+    static const struct { int mv, pct; } CURVE[] = {
+        { 4200, 100 }, { 4100, 90 }, { 4000, 80 }, { 3930, 70 }, { 3870, 60 },
+        { 3820, 50  }, { 3790, 40 }, { 3770, 30 }, { 3740, 20 }, { 3680, 10 },
+        { 3450, 5   }, { 3000, 0  },
+    };
+    const int N = sizeof(CURVE) / sizeof(CURVE[0]);
+
+    if (mv >= CURVE[0].mv)     return 100;
+    if (mv <= CURVE[N - 1].mv) return 0;
+    for (int i = 0; i < N - 1; i++) {
+        if (mv <= CURVE[i].mv && mv > CURVE[i + 1].mv) {
+            int dv = CURVE[i].mv - CURVE[i + 1].mv;
+            int dp = CURVE[i].pct - CURVE[i + 1].pct;
+            return CURVE[i + 1].pct + (mv - CURVE[i + 1].mv) * dp / dv;
+        }
+    }
+    return -1;
+}
+
+// 读数明显高于单节锂电的充满电压 → 不是在读电池,是 USB 供电轨(或没装电池)。
+// 这种情况下报百分比是撒谎,UI 应该显示"外接供电"。
+bool tdeck_on_external_power(void)
+{
+    int mv = tdeck_battery_mv();
+    return mv > 4350;
+}

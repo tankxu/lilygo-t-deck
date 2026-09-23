@@ -8,7 +8,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <esp_err.h>
+#include <driver/i2c_master.h>
 #include <esp_lcd_panel_io.h>
+#include <esp_lcd_touch.h>
 #include <esp_lcd_panel_ops.h>
 
 #ifdef __cplusplus
@@ -23,7 +25,9 @@ esp_err_t tdeck_bsp_init(void);
 // ── 电源 ──────────────────────────────────────────────────
 esp_err_t tdeck_power_on(void);       // 拉高 GPIO10
 esp_err_t tdeck_power_off(void);
-int       tdeck_battery_mv(void);     // 电池电压,GPIO4 ADC,读不到返回 -1
+int       tdeck_battery_mv(void);       // 电池电压,GPIO4 ADC,读不到返回 -1
+int       tdeck_battery_percent(void);  // 0..100,查锂电放电曲线;读不到返回 -1
+bool      tdeck_on_external_power(void); // 读数高于锂电上限 → 判定为外接供电
 
 // ── 显示 ──────────────────────────────────────────────────
 // 初始化 SPI 总线 + ST7789 + 背光。句柄交出去给 esp_lvgl_port 接管。
@@ -62,6 +66,12 @@ typedef struct {
 } tdeck_input_event_t;
 
 esp_err_t tdeck_input_init(void);
+
+// 键盘、触摸、ES7210 共用同一条 I2C 总线,句柄在这里取
+i2c_master_bus_handle_t tdeck_i2c_bus(void);
+
+// 触摸 GT911。返回 esp_lcd_touch 句柄交给 esp_lvgl_port 接管;没有触摸屏时返回 NULL。
+esp_lcd_touch_handle_t tdeck_touch_init(void);
 
 typedef void (*tdeck_input_cb_t)(const tdeck_input_event_t* ev, void* user);
 void tdeck_input_subscribe(tdeck_input_cb_t cb, void* user);

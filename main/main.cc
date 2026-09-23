@@ -4,6 +4,7 @@
 // 等 launcher 到位,这段换成「加载 launcher screen」,其余不用动。
 
 #include "app.h"
+#include "net/net.h"
 #include "tdeck_bsp.h"
 #include "tdeck_pins.h"
 
@@ -53,6 +54,16 @@ extern "C" void app_main(void)
     lv_display_t* disp = lvgl_port_add_disp(&disp_cfg);
     assert(disp);
 
+    // 触摸接给 LVGL —— 有了它卡片才能点、屏幕才能滑
+    esp_lcd_touch_handle_t tp = tdeck_touch_init();
+    if (tp) {
+        lvgl_port_touch_cfg_t tcfg = { .disp = disp, .handle = tp };
+        lvgl_port_add_touch(&tcfg);
+        ESP_LOGI(TAG, "触摸已接入 LVGL");
+    } else {
+        ESP_LOGW(TAG, "触摸不可用,只能用键盘和轨迹球");
+    }
+
     auto& apps = tdeck::AppRegistry::instance().apps();
     ESP_LOGI(TAG, "已注册 %d 个 app", (int)apps.size());
     for (auto* a : apps) ESP_LOGI(TAG, "    - %s", a->name());
@@ -66,4 +77,7 @@ extern "C" void app_main(void)
 
     // 白底把背光漏光盖住了,不必为此压低亮度
     tdeck_backlight_set(70);
+
+    // 联网放最后:桌面先出来,时间天气等联上了自己填进去,不让开机卡在连 WiFi 上
+    tdeck::net_start();
 }

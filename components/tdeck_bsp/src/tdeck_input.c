@@ -52,6 +52,8 @@ static void emit(tdeck_input_source_t src, int code, bool pressed)
     }
 }
 
+i2c_master_bus_handle_t tdeck_i2c_bus(void) { return s_bus; }
+
 void tdeck_input_subscribe(tdeck_input_cb_t cb, void* user)
 {
     for (int i = 0; i < MAX_SUBS; i++) {

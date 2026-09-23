@@ -54,15 +54,17 @@ inline uint16_t to565(Rgb c)
 
 class PaletteApp : public tdeck::App {
 public:
-    const char* name() const override { return "Palette"; }
-    const char* icon() const override { return LV_SYMBOL_IMAGE; }
+    const char* name() const override     { return "Palette"; }
+    const char* icon() const override     { return LV_SYMBOL_IMAGE; }
+    const char* subtitle() const override { return "256 colors"; }
+    uint32_t    accent() const override   { return 0x8250df; }
 
     void on_enter(lv_obj_t* root) override
     {
         build_colors();
 
         lv_obj_set_style_bg_color(root, lv_color_hex(C_BG), LV_PART_MAIN);
-        lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_scrollable(root, false);
 
         // ── 信息区:hex(大)+ RGB565(小)+ 色块预览 ──
         hex_ = lv_label_create(root);
@@ -91,7 +93,7 @@ public:
             lv_obj_set_style_radius(sw, 0, LV_PART_MAIN);
             lv_obj_set_style_border_width(sw, 0, LV_PART_MAIN);
             lv_obj_set_style_pad_all(sw, 0, LV_PART_MAIN);
-            lv_obj_remove_flag(sw, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_set_scrollable(sw, false);
         }
 
         // ── 光标 ──

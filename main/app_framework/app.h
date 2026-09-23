@@ -35,6 +35,11 @@ public:
     virtual const char* name() const = 0;
     virtual const char* icon() const = 0;   // LVGL symbol 或 storage 里的图标路径
 
+    // 卡片上的第二行说明。桌面是卡片而不是纯图标,靠这一行区分同类应用。
+    virtual const char* subtitle() const { return ""; }
+    // 卡片的主题色,用于图标底衬和选中态。每个应用一个色,扫一眼就能认出来。
+    virtual uint32_t    accent() const { return 0x0969da; }
+
     // ── 生命周期 ──
     // launcher 递一块干净的 screen 过来,app 在上面建自己的控件树。
     virtual void on_enter(lv_obj_t* root) = 0;
@@ -69,6 +74,11 @@ private:
 
 // 启动桌面:订阅输入、显示应用列表。由 app_main 调用。
 void launcher_begin();
+
+// 桌面数据注入。联网子系统拿到数据后调这两个,桌面不关心数据从哪来。
+void launcher_set_time(const char* hhmm, const char* sub_line);
+void launcher_set_weather(int wmo_code, float temp_c, float tmin_c, float tmax_c);
+void launcher_set_online(bool online);
 
 }  // namespace tdeck
 
