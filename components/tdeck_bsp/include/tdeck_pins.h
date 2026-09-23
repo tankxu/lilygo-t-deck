@@ -38,11 +38,15 @@
 #define TDECK_PIN_ES7210_DIN     14
 
 // ── 输入设备 ──────────────────────────────────────────────
-// 轨迹球四方向(官方命名 TBOX_G01..G04)
+// 轨迹球四方向。映射以 LilyGO UnitTest.ino 的 mouse_read() 为准 ——
+// 官方命名 TBOX_G01..G04 的编号和方向对不上,凭名字猜必错:
+//   G01(GPIO3)  → 上    G02(GPIO2)  → 右
+//   G03(GPIO15) → 下    G04(GPIO1)  → 左
+// 滚动时对应引脚【电平翻转】,上升沿下降沿都算一格,不是脉冲计数。
 #define TDECK_PIN_TRACKBALL_UP    3
-#define TDECK_PIN_TRACKBALL_DOWN  2
-#define TDECK_PIN_TRACKBALL_LEFT  15
-#define TDECK_PIN_TRACKBALL_RIGHT 1
+#define TDECK_PIN_TRACKBALL_DOWN  15
+#define TDECK_PIN_TRACKBALL_LEFT  1
+#define TDECK_PIN_TRACKBALL_RIGHT 2
 // 轨迹球中键 = BOOT。启动后就是普通带上拉 GPIO,运行期复用作全局语音键(ADR-004)。
 #define TDECK_PIN_TRACKBALL_CLICK 0
 

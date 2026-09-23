@@ -19,7 +19,10 @@
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_vendor.h>
+#include <esp_heap_caps.h>
 #include <esp_log.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 static const char* TAG = "tdeck_display";
 
@@ -91,8 +94,55 @@ void tdeck_backlight_set(uint8_t percent)
 
 uint8_t tdeck_backlight_get(void) { return s_backlight_percent; }
 
+// 诊断用:绕开 LVGL 直接往面板写,把「面板配置」和「LVGL 配置」两个嫌疑分开。
+//
+//   纯色铺不满 / 出条纹  → 面板这一侧的问题(行宽、字节序、色深)
+//   纯色干净、方块位置错 → 面板没问题,方向参数要调
+//   纯色干净、方块也对   → 面板完全正常,问题在 esp_lvgl_port
+//
+// 注意这里手工按【大端 RGB565】拼字节 —— ST7789 就是这么收的。
+// 如果直写能出正确颜色,说明字节序判断没错。
 esp_lcd_panel_handle_t    tdeck_get_panel(void)    { return s_panel; }
 esp_lcd_panel_io_handle_t tdeck_get_panel_io(void) { return s_panel_io; }
+
+
+// T-Deck 专用的电压与 gamma 调校。
+//
+// IDF 通用的 ST7789 驱动只发 SLPOUT / MADCTL / COLMOD / RAMCTRL,不碰电压和 gamma,
+// 用出厂默认值。T-Deck 这块屏用默认值的表现是:饱和色正常,但接近黑的区域
+// 压不到真黑,泛红并带渐变。
+//
+// 这组值来自 LilyGO 官方 TFT_eSPI 配置 Setup210_LilyGo_T_Deck.h 选中的
+// INIT_SEQUENCE_2(注释就写着 "Different gamma values")。
+// 其中 VCOMS(0xBB)=0x1A 是关键 —— VCOM 电压直接决定黑电平。
+//
+// 这里只发电压和 gamma 寄存器,不碰 MADCTL / COLMOD:那两个由 IDF 的 init
+// 和后面的 swap_xy/mirror 负责,重复设置会打架。
+static esp_err_t apply_tdeck_panel_tuning(esp_lcd_panel_io_handle_t io)
+{
+    struct { uint8_t cmd; uint8_t len; uint8_t data[14]; } seq[] = {
+        { 0xB2, 5,  { 0x0C, 0x0C, 0x00, 0x33, 0x33 } },            // PORCTRL  前后廊
+        { 0xB7, 1,  { 0x75 } },                                     // GCTRL    VGH/VGL
+        { 0xBB, 1,  { 0x1A } },                                     // VCOMS    ← 黑电平
+        { 0xC0, 1,  { 0x2C } },                                     // LCMCTRL
+        { 0xC2, 1,  { 0x01 } },                                     // VDVVRHEN
+        { 0xC3, 1,  { 0x13 } },                                     // VRHS
+        { 0xC4, 1,  { 0x20 } },                                     // VDVSET
+        { 0xC6, 1,  { 0x0F } },                                     // FRCTR2   帧率
+        { 0xD0, 2,  { 0xA4, 0xA1 } },                               // PWCTRL1
+        { 0xE0, 14, { 0xD0, 0x0D, 0x14, 0x0D, 0x0D, 0x09, 0x38,     // PVGAMCTRL 正极性 gamma
+                      0x44, 0x4E, 0x3A, 0x17, 0x18, 0x2F, 0x30 } },
+        { 0xE1, 14, { 0xD0, 0x09, 0x0F, 0x08, 0x07, 0x14, 0x37,     // NVGAMCTRL 负极性 gamma
+                      0x44, 0x4D, 0x38, 0x15, 0x16, 0x2C, 0x3E } },
+    };
+
+    for (size_t i = 0; i < sizeof(seq) / sizeof(seq[0]); i++) {
+        ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(io, seq[i].cmd, seq[i].data, seq[i].len),
+                            TAG, "发送 0x%02X 失败", seq[i].cmd);
+    }
+    ESP_LOGI(TAG, "已应用 T-Deck 电压/gamma 调校(%d 条)", (int)(sizeof(seq) / sizeof(seq[0])));
+    return ESP_OK;
+}
 
 esp_err_t tdeck_display_init(esp_lcd_panel_handle_t* out_panel,
                              esp_lcd_panel_io_handle_t* out_io)
@@ -134,6 +184,7 @@ esp_err_t tdeck_display_init(esp_lcd_panel_handle_t* out_panel,
 
     ESP_RETURN_ON_ERROR(esp_lcd_panel_reset(s_panel), TAG, "面板复位失败");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_init(s_panel),  TAG, "面板初始化失败");
+    ESP_RETURN_ON_ERROR(apply_tdeck_panel_tuning(s_panel_io), TAG, "面板调校失败");
 
     // ST7789 原生是 240x320 竖屏，T-Deck 横着用，所以交换 XY 再镜像。
     // ⚠️ swap/mirror 的组合要在真机上确认：镜像方向错了表现为画面左右翻转，
@@ -144,6 +195,7 @@ esp_err_t tdeck_display_init(esp_lcd_panel_handle_t* out_panel,
     ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(s_panel, true),    TAG, "开显示失败");
 
     ESP_RETURN_ON_ERROR(backlight_init(), TAG, "背光初始化失败");
+
 
     ESP_LOGI(TAG, "ST7789 就绪 %dx%d @ %d MHz",
              TDECK_LCD_H_RES, TDECK_LCD_V_RES, TDECK_LCD_PIXEL_CLOCK / 1000000);

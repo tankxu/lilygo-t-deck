@@ -1,9 +1,9 @@
-// main.cc — M1 第一个里程碑:上电 → 点亮屏幕 → LVGL 出画面
+// main.cc — 启动:BSP → LVGL → 进入第一个注册的 app
 //
-// 这一版只验证最底层的链路:GPIO10 上电、SPI/ST7789 初始化、LVGL 能画东西。
-// 触摸、键盘、轨迹球、音频在后续提交里加,每加一个,自检应用里多亮一站
-// (见 docs/apps/selftest.md)。
+// launcher 还没写(M2),所以这里暂时直接进注册表里的第一个 app。
+// 等 launcher 到位,这段换成「加载 launcher screen」,其余不用动。
 
+#include "app.h"
 #include "tdeck_bsp.h"
 #include "tdeck_pins.h"
 
@@ -15,52 +15,10 @@
 
 static const char* TAG = "main";
 
-static lv_display_t* s_disp;
-
-static void ui_bringup_screen()
-{
-    lvgl_port_lock(0);
-
-    lv_obj_t* scr = lv_screen_active();
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x0d1117), LV_PART_MAIN);
-
-    lv_obj_t* title = lv_label_create(scr);
-    lv_label_set_text(title, "T-Deck OS");
-    lv_obj_set_style_text_color(title, lv_color_hex(0x58a6ff), LV_PART_MAIN);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_28, LV_PART_MAIN);
-    lv_obj_align(title, LV_ALIGN_CENTER, 0, -30);
-
-    lv_obj_t* sub = lv_label_create(scr);
-    lv_label_set_text(sub, "BSP bring-up");
-    lv_obj_set_style_text_color(sub, lv_color_hex(0x8b949e), LV_PART_MAIN);
-    lv_obj_align(sub, LV_ALIGN_CENTER, 0, 5);
-
-    // 电池电压 —— 顺便验证 ADC 通了
-    int mv = tdeck_battery_mv();
-    lv_obj_t* bat = lv_label_create(scr);
-    if (mv > 0) lv_label_set_text_fmt(bat, "battery  %d.%02d V", mv / 1000, (mv % 1000) / 10);
-    else        lv_label_set_text(bat, "battery  n/a");
-    lv_obj_set_style_text_color(bat, lv_color_hex(0x3fb950), LV_PART_MAIN);
-    lv_obj_align(bat, LV_ALIGN_CENTER, 0, 35);
-
-    // 非对称标记:用来确认 swap_xy / mirror 的组合对不对。
-    // 这个小方块必须出现在【左上角】。跑到右上角说明水平镜像反了,
-    // 跑到左下角说明垂直镜像反了 —— 光看代码看不出来,必须上真机。
-    lv_obj_t* corner = lv_obj_create(scr);
-    lv_obj_set_size(corner, 16, 16);
-    lv_obj_set_style_bg_color(corner, lv_color_hex(0xf85149), LV_PART_MAIN);
-    lv_obj_set_style_border_width(corner, 0, LV_PART_MAIN);
-    lv_obj_set_style_radius(corner, 0, LV_PART_MAIN);
-    lv_obj_align(corner, LV_ALIGN_TOP_LEFT, 0, 0);
-
-    lvgl_port_unlock();
-}
-
 extern "C" void app_main(void)
 {
     ESP_ERROR_CHECK(tdeck_bsp_init());
 
-    // LVGL 接到面板上。缓冲走 PSRAM(8MB 很宽裕),双缓冲让刷新不撕裂。
     lvgl_port_cfg_t port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
     ESP_ERROR_CHECK(lvgl_port_init(&port_cfg));
 
@@ -72,26 +30,40 @@ extern "C" void app_main(void)
         .hres          = TDECK_LCD_H_RES,
         .vres          = TDECK_LCD_V_RES,
         .monochrome    = false,
+        // ⚠️ 这三个值必须跟 tdeck_display_init() 里设的一致。
+        // lvgl_port_add_disp() 结尾会调 lvgl_port_disp_rotation_update(),
+        // 无条件用这里的值去 esp_lcd_panel_swap_xy/mirror 覆盖面板设置 ——
+        // 留 false 的话面板会被打回 240x320 竖屏,而 LVGL 仍按 320 宽喂数据,
+        // 每行错位累积,画面就成了竖条纹。
         .rotation = {
-            .swap_xy  = false,   // 已经在 panel 层做了,这里不要重复
-            .mirror_x = false,
+            .swap_xy  = true,
+            .mirror_x = true,
             .mirror_y = false,
         },
         .flags = {
-            .buff_dma   = false,
-            .buff_spiram = true,
+            // 缓冲必须放内部 RAM 且具备 DMA 能力。放 PSRAM 会花屏:
+            // esp_lcd 的 SPI 通道要对缓冲做 DMA,而 ESP32-S3 的 SPI DMA 读 PSRAM
+            // 有对齐和 cache 同步的约束。双缓冲共 50KB,内部 RAM 放得下。
+            .buff_dma    = true,
+            .buff_spiram = false,
+            // SPI 屏收的是大端 RGB565,LVGL 渲染出来是小端,必须翻字节序。
+            .swap_bytes  = true,
         },
     };
-    s_disp = lvgl_port_add_disp(&disp_cfg);
-    assert(s_disp);
+    lv_display_t* disp = lvgl_port_add_disp(&disp_cfg);
+    assert(disp);
 
-    ui_bringup_screen();
-
-    // 背光渐亮 —— 直接全亮会有一瞬间的白闪
-    for (int p = 0; p <= 80; p += 4) {
-        tdeck_backlight_set(p);
-        vTaskDelay(pdMS_TO_TICKS(15));
+    auto& apps = tdeck::AppRegistry::instance().apps();
+    ESP_LOGI(TAG, "已注册 %d 个 app", (int)apps.size());
+    for (auto* a : apps) ESP_LOGI(TAG, "    - %s", a->name());
+    if (apps.empty()) {
+        ESP_LOGE(TAG, "注册表是空的 —— 检查 main/CMakeLists.txt 有没有 WHOLE_ARCHIVE");
     }
 
-    ESP_LOGI(TAG, "bring-up 完成");
+    lvgl_port_lock(0);
+    tdeck::launcher_begin();
+    lvgl_port_unlock();
+
+    // 白底把背光漏光盖住了,不必为此压低亮度
+    tdeck_backlight_set(70);
 }

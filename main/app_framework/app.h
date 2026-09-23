@@ -67,6 +67,9 @@ private:
     std::vector<App*> apps_;
 };
 
+// 启动桌面:订阅输入、显示应用列表。由 app_main 调用。
+void launcher_begin();
+
 }  // namespace tdeck
 
 // 用法:文件末尾写 TDECK_REGISTER_APP(SelfTestApp);

@@ -3,6 +3,7 @@ idf_component_register(
         "src/tdeck_bsp.c"
         "src/tdeck_power.c"
         "src/tdeck_display.c"
+        "src/tdeck_input.c"
     INCLUDE_DIRS
         "include"
     REQUIRES

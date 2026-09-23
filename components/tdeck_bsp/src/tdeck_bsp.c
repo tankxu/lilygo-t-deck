@@ -24,6 +24,8 @@ esp_err_t tdeck_bsp_init(void)
     esp_lcd_panel_io_handle_t io    = NULL;
     ESP_RETURN_ON_ERROR(tdeck_display_init(&panel, &io), TAG, "显示初始化失败");
 
+    ESP_RETURN_ON_ERROR(tdeck_input_init(), TAG, "输入层初始化失败");
+
     int mv = tdeck_battery_mv();
     if (mv > 0) ESP_LOGI(TAG, "电池 %d mV", mv);
     else        ESP_LOGW(TAG, "电池电压读不到");

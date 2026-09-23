@@ -42,6 +42,11 @@ uint8_t tdeck_backlight_get(void);
 // 触摸(GT911)都在这里归一化,最终喂给 LVGL 的 indev,
 // 同时通过回调把原始事件抛给 app(自检应用要看原始事件)。
 
+// 轨迹球事件的 code 取值
+typedef enum {
+    TDECK_TB_UP, TDECK_TB_DOWN, TDECK_TB_LEFT, TDECK_TB_RIGHT, TDECK_TB_CLICK,
+} tdeck_trackball_dir_t;
+
 typedef enum {
     TDECK_INPUT_KEYBOARD,
     TDECK_INPUT_TRACKBALL,
@@ -55,6 +60,8 @@ typedef struct {
     int16_t  x, y;        // 触摸坐标,其它来源为 0
     uint32_t timestamp_ms;
 } tdeck_input_event_t;
+
+esp_err_t tdeck_input_init(void);
 
 typedef void (*tdeck_input_cb_t)(const tdeck_input_event_t* ev, void* user);
 void tdeck_input_subscribe(tdeck_input_cb_t cb, void* user);
