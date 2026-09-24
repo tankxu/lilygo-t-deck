@@ -9,24 +9,51 @@
 file(GLOB_RECURSE XZ_AUDIO    "src/audio/*.cc")
 file(GLOB_RECURSE XZ_PROTOCOL "src/protocols/*.cc")
 
+# T-Deck 板级适配 —— 我们自己写的那一半(Board / AudioCodec / Display / 启动入口)。
+# 单独一个目录、单独一个变量,是为了跟上游代码泾渭分明:
+# 跟上游同步时 src/ 下的东西可以整体覆盖,boards/t-deck/ 一个字都不用动。
+file(GLOB XZ_BOARD "src/boards/t-deck/*.cc")
+
 idf_component_register(
     SRCS
         "src/application.cc"
         "src/mcp_server.cc"
         "src/settings.cc"
         "src/system_info.cc"
+        "src/ota.cc"
+        "src/device_state_machine.cc"
+        "src/boards/common/board.cc"
+        "src/display/display.cc"
+        "src/backlight.cc"
         ${XZ_AUDIO}
         ${XZ_PROTOCOL}
+        ${XZ_BOARD}
     INCLUDE_DIRS
         "src" "src/led" "src/audio" "src/protocols" "src/display" "src/boards/common" "src/net" "src/assets"
+        "src/boards/t-deck"
     REQUIRES
         tdeck_bsp
         esp_timer esp_event nvs_flash esp_wifi esp_netif
         esp_http_client esp-tls mqtt json driver
-        esp_app_format spi_flash app_update
+        esp_app_format spi_flash app_update efuse
         78__esp-ml307 espressif__esp-sr espressif__esp_audio_effects
         lvgl__lvgl espressif__esp_lvgl_port esp_lcd
         espressif__esp_audio_codec espressif__esp_codec_dev
+    # 提示音。上游把它们放在 assets 分区里(和字体、唤醒词模型一起),
+    # 本工程的分区表没有 assets 分区(ADR-005),而 lang_config.h 里的
+    # Lang::Sounds::OGG_* 是【每个 include 它的 .cc 都会引用】的
+    # _binary_*_ogg_start 符号 —— 少一个就是一堆链接错误。总共 96KB,直接进固件。
+    EMBED_FILES
+        "assets/sounds/0.ogg" "assets/sounds/1.ogg" "assets/sounds/2.ogg"
+        "assets/sounds/3.ogg" "assets/sounds/4.ogg" "assets/sounds/5.ogg"
+        "assets/sounds/6.ogg" "assets/sounds/7.ogg" "assets/sounds/8.ogg"
+        "assets/sounds/9.ogg"
+        "assets/sounds/activation.ogg" "assets/sounds/err_pin.ogg"
+        "assets/sounds/err_reg.ogg" "assets/sounds/exclamation.ogg"
+        "assets/sounds/low_battery.ogg" "assets/sounds/popup.ogg"
+        "assets/sounds/success.ogg" "assets/sounds/upgrade.ogg"
+        "assets/sounds/vibration.ogg" "assets/sounds/welcome.ogg"
+        "assets/sounds/wificonfig.ogg"
 )
 
 # 上游这些宏是 main/CMakeLists.txt 按所选板子注入的。我们不继承那套逻辑,
@@ -38,4 +65,8 @@ idf_component_register(
 target_compile_definitions(${COMPONENT_LIB} PUBLIC
     BOARD_NAME="lilygo-t-deck"
     BOARD_TYPE="t-deck"
+    # 小智官方的版本检查 / 激活服务。设备第一次连上会在这里拿到激活码和
+    # WebSocket 地址,再写进 NVS —— 所以不需要在 secrets.h 里填服务器。
+    # 想换自建服务端:改这里,或者往 NVS 的 wifi/ota_url 写一条。
+    CONFIG_OTA_URL="https://api.tenclass.net/xiaozhi/ota/"
 )

@@ -17,8 +17,8 @@
 // 声道数同理。写死 24kHz 单声道去播 48kHz 的 PCM,声音会慢一倍 ——
 // 这种错不会报任何错误,只是听起来"被拉长了"。
 //
-// 麦克风(ES7210)不在这里 —— 它要经 I2C 配置,等小智集成时和它的
-// codec 层一起做,避免两套实现抢同一颗芯片。
+// 麦克风(ES7210)不在这里 —— 它要经 I2C 配置,实现在 tdeck_mic.c,
+// 用的是独立的 I2S_NUM_1(引脚和喇叭这一路完全不重叠,物理上没法共用外设)。
 
 #include "tdeck_bsp.h"
 #include "tdeck_pins.h"
@@ -107,12 +107,4 @@ int tdeck_speaker_write(const int16_t* buf, size_t samples, uint32_t timeout_ms)
         done += written / sizeof(int16_t);
     }
     return (int)(done * sizeof(int16_t));
-}
-
-int tdeck_mic_read(int16_t* buf, size_t samples, uint32_t timeout_ms)
-{
-    // 麦克风走 ES7210,需要 I2C 配置。等小智集成时一起做 ——
-    // 现在返回 -1 而不是假装成功,免得调用方以为读到了静音。
-    (void)buf; (void)samples; (void)timeout_ms;
-    return -1;
 }

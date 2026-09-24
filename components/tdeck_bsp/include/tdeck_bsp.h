@@ -91,6 +91,15 @@ void tdeck_set_voice_key_handler(tdeck_voice_key_cb_t cb, void* user);
 // 格式变了会自动重建 I2S 通道。
 esp_err_t tdeck_audio_init(uint32_t sample_rate, uint8_t channels);
 
+// ── 麦克风:ES7210(实现在 tdeck_mic.c)────────────────────
+// 建 I2S_NUM_1 收音通道并配置 ES7210。幂等,重复调用只会更新采样率。
+// 小智要 16kHz;录音类 app 想要别的采样率就在 start 之前重新 init。
+esp_err_t tdeck_mic_init(uint32_t sample_rate);
+esp_err_t tdeck_mic_start(void);      // 开始采集(功耗不低,不用时记得 stop)
+esp_err_t tdeck_mic_stop(void);
+void      tdeck_mic_set_gain(float db);   // ES7210 模拟前端增益,默认 30dB
+bool      tdeck_mic_running(void);
+
 // 阻塞读录音。返回实际读到的字节数,失败返回负数。
 int tdeck_mic_read(int16_t* buf, size_t samples, uint32_t timeout_ms);
 

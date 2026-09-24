@@ -163,8 +163,14 @@ void Application::Initialize() {
 }
 
 void Application::Run() {
-    // Set the priority of the main task to 10
-    vTaskPrioritySet(nullptr, 10);
+    // 上游这里写死 10 —— 独占整机时"音频事件优先于一切"是对的。
+    // 在这个 OS 里小智只是常驻后台的一员:优先级 10 会压过 esp_lvgl_port 的
+    // LVGL 任务(默认 4),小智一说话整个界面就掉帧。降到 5:仍高于 LVGL 和
+    // 音频输出任务(4),低于音频输入任务(8,它最怕丢帧)。
+#ifndef XZ_MAIN_TASK_PRIORITY
+#define XZ_MAIN_TASK_PRIORITY 5
+#endif
+    vTaskPrioritySet(nullptr, XZ_MAIN_TASK_PRIORITY);
 
     const EventBits_t ALL_EVENTS = 
         MAIN_EVENT_SCHEDULE |

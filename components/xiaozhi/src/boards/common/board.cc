@@ -2,7 +2,10 @@
 #include "system_info.h"
 #include "settings.h"
 #include "display/display.h"
-#include "display/oled_display.h"
+// 上游在这里 include display/oled_display.h 只为了 dynamic_cast 判断单色屏。
+// 本工程没有 oled_display.cc(只有头文件),dynamic_cast 会在链接期
+// 找不到 OledDisplay 的 typeinfo。本机是 320x240 彩屏,直接写死 false。
+#include "display/display.h"
 #include "assets/lang_config.h"
 
 #include <esp_log.h>
@@ -159,11 +162,7 @@ std::string Board::GetSystemInfoJson() {
     auto display = GetDisplay();
     if (display) {
         json += R"("display":{)";
-        if (dynamic_cast<OledDisplay*>(display)) {
-            json += R"("monochrome":)" + std::string("true") + R"(,)";
-        } else {
-            json += R"("monochrome":)" + std::string("false") + R"(,)";
-        }
+        json += R"("monochrome":false,)";
         json += R"("width":)" + std::to_string(display->width()) + R"(,)";
         json += R"("height":)" + std::to_string(display->height()) + R"(,)";
         json.pop_back(); // Remove the last comma

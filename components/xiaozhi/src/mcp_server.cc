@@ -77,7 +77,11 @@ void McpServer::AddCommonTools() {
             });
     }
 
-#ifdef HAVE_LVGL
+// 主题(深色/浅色)归 OS 统管:整机是浅色系的(深色会把背光漏光衬出来,
+// 见 docs/hardware.md),不接受被服务端一句话改掉。关掉这个工具还顺带省下
+// 一整条 LvglTheme/LvglImage/cbin_font 的依赖链 —— 那套东西是给上游
+// LcdDisplay 用的,本工程自己画界面,一行都用不上。
+#if 0
     auto display = board.GetDisplay();
     if (display && display->GetTheme() != nullptr) {
         AddTool("self.screen.set_theme",
@@ -96,6 +100,7 @@ void McpServer::AddCommonTools() {
                 return false;
             });
     }
+#endif
 
     auto camera = board.GetCamera();
     if (camera) {
@@ -119,7 +124,6 @@ void McpServer::AddCommonTools() {
                 return camera->Explain(question);
             });
     }
-#endif
 
     // Restore the original tools list to the end of the tools list
     tools_.insert(tools_.end(), original_tools.begin(), original_tools.end());
@@ -170,7 +174,10 @@ void McpServer::AddUserOnlyTools() {
 
     // Display control
 #ifdef HAVE_LVGL
-    auto display = dynamic_cast<LvglDisplay*>(Board::GetInstance().GetDisplay());
+    // 上游这里 dynamic_cast 到 LvglDisplay 是为了拿截图/预览图能力。
+    // 本工程的 Display 不是 LvglDisplay(我们自己画界面),而且 dynamic_cast
+    // 到一个没有实现文件的类会在链接期找不到 typeinfo —— 直接用基类指针。
+    auto display = Board::GetInstance().GetDisplay();
     if (display) {
         AddUserOnlyTool("self.screen.get_info", "Information about the screen, including width, height, etc.",
             PropertyList(),
@@ -178,15 +185,14 @@ void McpServer::AddUserOnlyTools() {
                 cJSON *json = cJSON_CreateObject();
                 cJSON_AddNumberToObject(json, "width", display->width());
                 cJSON_AddNumberToObject(json, "height", display->height());
-                if (dynamic_cast<OledDisplay*>(display)) {
-                    cJSON_AddBoolToObject(json, "monochrome", true);
-                } else {
-                    cJSON_AddBoolToObject(json, "monochrome", false);
-                }
+                cJSON_AddBoolToObject(json, "monochrome", false);   // 320x240 彩屏
                 return json;
             });
 
-#if CONFIG_LV_USE_SNAPSHOT
+// 截图和预览图关掉:它们依赖 LvglDisplay::SnapshotToJpeg / SetPreviewImage,
+// 那是上游 LcdDisplay 的能力。本机要看屏幕有 OS 的调试接口 GET /shot
+// (裸 RGB565,而且已经合成了 lv_layer_top,比这条路直接得多)。
+#if 0
         AddUserOnlyTool("self.screen.snapshot", "Snapshot the screen and upload it to a specific URL",
             PropertyList({
                 Property("url", kPropertyTypeString),
