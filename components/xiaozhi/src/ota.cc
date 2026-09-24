@@ -18,6 +18,7 @@
 #endif
 
 #include <cstring>
+#include <cctype>
 #include <vector>
 #include <sstream>
 #include <algorithm>
@@ -392,14 +393,29 @@ bool Ota::StartUpgrade(std::function<void(int progress, size_t speed)> callback)
 
 
 std::vector<int> Ota::ParseVersion(const std::string& version) {
+    // 上游这里直接 std::stoi,遇到非数字就抛 invalid_argument,而【没有人 catch】——
+    // 结果是整机 abort。这不是假想:根 CMakeLists 里没设 PROJECT_VER 时,
+    // ESP-IDF 拿 `git describe` 当 app version(一串 commit hash),
+    // 于是每次连上 WiFi、走到版本比较这一步就重启,现象离"版本号"十万八千里。
+    //
+    // 版本串有两个来源,两个都不该由我们信任:本机的 PROJECT_VER(人写的)、
+    // 服务端返回的 version 字段(远端给的)。所以这里只认数字,
+    // 非数字段一律当 0 —— 比较结果可能不精确,但设备不会因为一个脏字符串重启。
     std::vector<int> versionNumbers;
     std::stringstream ss(version);
     std::string segment;
-    
+
     while (std::getline(ss, segment, '.')) {
-        versionNumbers.push_back(std::stoi(segment));
+        int value = 0;
+        size_t i = 0;
+        while (i < segment.size() && isdigit((unsigned char)segment[i])) {
+            value = value * 10 + (segment[i] - '0');
+            if (value > 100000) { value = 100000; break; }   // 防溢出
+            i++;
+        }
+        versionNumbers.push_back(value);
     }
-    
+
     return versionNumbers;
 }
 

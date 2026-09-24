@@ -7,6 +7,14 @@
 // 就会报 conflicting declaration of C function。
 #include "tdeck_bsp.h"
 
+// OS 的系统音量(main/sys/volume.h)。这里【只声明不 include】:
+// components/ 不该反向依赖 main/ 的头文件路径。符号在最终链接时由 main 提供,
+// main 是 WHOLE_ARCHIVE,一定在。
+namespace tdeck { namespace volume {
+void set(int percent);
+int  get();
+}}
+
 #define TAG "TdeckAudioCodec"
 
 TdeckAudioCodec::TdeckAudioCodec(int input_sample_rate, int output_sample_rate) {
@@ -22,6 +30,9 @@ TdeckAudioCodec::TdeckAudioCodec(int input_sample_rate, int output_sample_rate) 
     // 麦克风常开会一直占着 I2S_NUM_1 的 DMA 和 ES7210 的模拟电流。
     tdeck_mic_init((uint32_t)input_sample_rate_);
     tdeck_mic_set_gain(input_gain_);
+
+    // 音量跟随系统当前值,别让小智自己那套 NVS 覆盖用户刚调好的音量
+    output_volume_ = tdeck::volume::get();
 
     // 录 150ms 自检。没有它的话,"麦克风到底通不通"要等到跟服务器对上话、
     // 而且对方一直听不见你说什么的时候才会被怀疑 —— 那时候可疑的东西太多了。
@@ -62,11 +73,11 @@ void TdeckAudioCodec::EnableOutput(bool enable) {
 
 void TdeckAudioCodec::SetOutputVolume(int volume) {
     AudioCodec::SetOutputVolume(volume);   // 记进 NVS(小智自己的 audio 命名空间)
-    // 功放没有音量脚,增益全在 BSP 的软件缩放里。这里直接下发,
-    // 好处是 MCP 的"调音量"是真能听出来的。
-    // ⚠️ 代价:OS 那边的系统音量(main/sys/volume.cc)不知道值被改了,
-    // HUD 和它的 NVS 会和实际音量不一致。等 OS 暴露一个 C 接口再接过去。
-    tdeck_speaker_set_volume((uint8_t)(volume < 0 ? 0 : (volume > 100 ? 100 : volume)));
+    // 走【系统音量】而不是直接下发给 BSP:音量是全局的,
+    // tdeck::volume::set 会同时更新功放、弹 HUD、存进 OS 的 NVS。
+    // 直接调 tdeck_speaker_set_volume 的话声音是变了,但设置 app 的滑块、
+    // 音量 HUD、下次开机读回的值全是旧的 —— 用户会觉得"音量自己跳回去了"。
+    tdeck::volume::set(volume);
 }
 
 int TdeckAudioCodec::Read(int16_t* dest, int samples) {

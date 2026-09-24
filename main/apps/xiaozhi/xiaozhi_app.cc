@@ -53,6 +53,10 @@ constexpr int SCR_W = 320, SCR_H = 240;
 // 而底部正好是用户视线从键盘抬起来第一眼看到的地方。
 constexpr int OV_X = 10, OV_Y = 118, OV_W = 300, OV_H = 112;
 
+// 中文字库只有 20px 一个字号,而它的 line_height 是 26(不是 20)。
+// 按字号估高度会让第二行溢出标签框、盖住下面的东西 —— 所有留高的地方按这个来。
+constexpr int LINE_H = 26;
+
 // 中文字体能不能【真的画出字】。
 //
 // 光看 font_cjk() 非空不够:cbin 字库是把结构体裸 dump 出来的,LVGL 小版本一变
@@ -292,16 +296,18 @@ private:
             lv_obj_set_style_border_width(card_, 0, LV_PART_MAIN);
             lv_obj_set_style_shadow_width(card_, 0, LV_PART_MAIN);
 
-            if (mode_ != Mode::Full) { avatar_.destroy(); avatar_.create(card_, SCR_W / 2, 88, 128); }
+            if (mode_ != Mode::Full) { avatar_.destroy(); avatar_.create(card_, SCR_W / 2, 84, 120); }
 
             // 状态行整行居中:宽度给满屏,flex 主轴居中,灯和字自己找位置
             lv_obj_set_width(row_, SCR_W);
-            lv_obj_set_pos(row_, 0, 158);
+            lv_obj_set_pos(row_, 0, 152);
             lv_obj_set_flex_align(row_, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
             lv_obj_set_width(status_, LV_SIZE_CONTENT);
 
-            lv_obj_set_pos(chatbox_, 12, 190);
-            lv_obj_set_size(chatbox_, SCR_W - 24, 44);
+            // 两行中文 = 52px,加上下各 2px 的余量。不是 44 —— 那是按 20px 字号
+            // 估出来的,中文第二行会直接溢出到屏幕外。
+            lv_obj_set_pos(chatbox_, 12, 182);
+            lv_obj_set_size(chatbox_, SCR_W - 24, LINE_H * 2 + 4);
             lv_obj_set_style_bg_opa(chatbox_, LV_OPA_COVER, LV_PART_MAIN);
             lv_obj_set_style_bg_color(chatbox_, lv_color_hex(C_CARD), LV_PART_MAIN);
             lv_obj_set_style_radius(chatbox_, 12, LV_PART_MAIN);
@@ -330,7 +336,7 @@ private:
             lv_obj_set_width(status_, LV_SIZE_CONTENT);
 
             lv_obj_set_pos(chatbox_, 98, 46);
-            lv_obj_set_size(chatbox_, OV_W - 110, 52);
+            lv_obj_set_size(chatbox_, OV_W - 110, LINE_H * 2);
             lv_obj_set_style_bg_opa(chatbox_, LV_OPA_TRANSP, LV_PART_MAIN);
             lv_obj_set_width(chat_, OV_W - 114);
             lv_obj_set_style_text_align(chat_, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);

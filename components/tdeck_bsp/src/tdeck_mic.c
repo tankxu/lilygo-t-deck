@@ -141,6 +141,19 @@ esp_err_t tdeck_mic_init(uint32_t sample_rate)
     s_dev = esp_codec_dev_new(&dev_cfg);
     ESP_RETURN_ON_FALSE(s_dev, ESP_FAIL, TAG, "codec_dev 创建失败");
 
+    // I2C 扫描放在这里,因为 tdeck_mic_init 是【必经之路】——
+    // 之前放在 probe 里,probe 又只在 codec 构造时调一次,日志里经常看不到。
+    // 扫描顺带验证扫描本身:键盘 0x55 和触摸 GT911 0x5D 一定在,
+    // 它们都没出现就说明是总线/电源的事,跟 ES7210 无关。
+    {
+        char line[128]; int n = 0; line[0] = 0;
+        for (uint8_t a = 0x08; a < 0x78 && n < 100; a++) {
+            if (i2c_master_probe(tdeck_i2c_bus(), a, 50) == ESP_OK)   // 第三参是毫秒不是 tick
+                n += snprintf(line + n, sizeof(line) - n, "0x%02X ", a);
+        }
+        ESP_LOGI(TAG, "I2C 总线上的器件:%s(ES7210 应在 0x40)", n ? line : "(一个都没有)");
+    }
+
     ESP_LOGI(TAG, "麦克风就绪 ES7210 %" PRIu32 "Hz  MCLK=%d SCK=%d LRCK=%d DIN=%d",
              sample_rate, TDECK_PIN_ES7210_MCLK, TDECK_PIN_ES7210_SCK,
              TDECK_PIN_ES7210_LRCK, TDECK_PIN_ES7210_DIN);
@@ -169,6 +182,27 @@ esp_err_t tdeck_mic_start(void)
     }
     esp_codec_dev_set_in_channel_gain(s_dev, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(s_slot), s_gain_db);
     s_running = true;
+
+    // 第一次开起来时把关键寄存器打一遍。放在 open 之后是因为 esp_codec_dev
+    // 要设备处于打开状态才转发寄存器读写。
+    //
+    // ⚠️ ES7210 的 ID 寄存器是 0x3D/0x3E,不是 0xFD/0xFE —— 后者是 ES8311 的习惯,
+    // 读 ES7210 的未定义地址永远回 0xFF,看起来像"芯片没应答",足以把排查
+    // 方向整个带偏(已经带偏过一次)。
+    static bool dumped = false;
+    if (!dumped) {
+        dumped = true;
+        int id_hi = 0, id_lo = 0, p12 = 0, p34 = 0, clk = 0;
+        esp_codec_dev_read_reg(s_dev, 0x3D, &id_hi);
+        esp_codec_dev_read_reg(s_dev, 0x3E, &id_lo);
+        esp_codec_dev_read_reg(s_dev, 0x4B, &p12);   // MIC12 电源,0x00 才是开
+        esp_codec_dev_read_reg(s_dev, 0x4C, &p34);   // MIC34 电源
+        esp_codec_dev_read_reg(s_dev, 0x02, &clk);   // 主时钟分频
+        ESP_LOGI(TAG, "ES7210 ID=0x%02X%02X(应 0x7210) MIC12_PWR=0x%02X MIC34_PWR=0x%02X CLK=0x%02X",
+                 id_hi & 0xFF, id_lo & 0xFF, p12 & 0xFF, p34 & 0xFF, clk & 0xFF);
+        ESP_LOGI(TAG, "  判读:全 0xFF = I2C 读不通;全 0x00 = 配置进去了但通道没上电;"
+                      "值正常 = 问题在 I2S 侧,查 MCLK(GPIO%d)有没有波形", TDECK_PIN_ES7210_MCLK);
+    }
     ESP_LOGI(TAG, "开始采集 %" PRIu32 "Hz,增益 %.0fdB", s_rate, s_gain_db);
     return ESP_OK;
 }
@@ -267,38 +301,6 @@ int tdeck_mic_probe_rms(uint32_t ms)
     // 默认那组读不到东西时,把四种组合(MIC1/2 与 MIC3/4 x 左/右 slot)都试一遍,
     // 谁有信号就留谁 —— 省掉"改一行、编译、烧录、再听"的四轮来回。
     if (!s_dev) return -1;
-
-    // 先确认 I2C 这一侧是通的:扫一遍总线,再读 ES7210 的芯片 ID(0xFD/0xFE = 0x72 0x10)。
-    // 读不到就不用往下猜通道了 —— 问题在 I2C 或者外设电源,不在选通。
-    // 扫描顺带验证扫描本身:键盘 0x55 和触摸 GT911 0x5D 一定在,
-    // 它们都没出现就说明是总线/电源的事,跟 ES7210 无关。
-    {
-        i2c_master_bus_handle_t bus = tdeck_i2c_bus();
-        char line[128]; int n = 0;
-        line[0] = 0;
-        for (uint8_t a = 0x08; a < 0x78 && n < 100; a++) {
-            if (i2c_master_probe(bus, a, 50) == ESP_OK)   // 第三参是毫秒不是 tick
-                n += snprintf(line + n, sizeof(line) - n, "0x%02X ", a);
-        }
-        ESP_LOGI(TAG, "I2C 总线上的器件:%s", n ? line : "(一个都没有)");
-    }
-
-    // ⚠️ ES7210 的 ID 寄存器是 0x3D/0x3E,不是 0xFD/0xFE ——
-    // 后者是 ES8311 的习惯,读 ES7210 的未定义地址只会回 0xFF,
-    // 看起来就像"芯片没应答",足以把排查方向整个带偏(我踩过)。
-    int id_hi = 0, id_lo = 0;
-    esp_codec_dev_read_reg(s_dev, 0x3D, &id_hi);
-    esp_codec_dev_read_reg(s_dev, 0x3E, &id_lo);
-    ESP_LOGI(TAG, "ES7210 芯片 ID = 0x%02X%02X(应为 0x7210)", id_hi & 0xFF, id_lo & 0xFF);
-
-    // 再打几个关键寄存器:MIC12/34 的电源(0x4B/0x4C,0x00 才是开)、
-    // 时钟分频(0x02)。全 0xFF 说明读不通,全 0x00 说明写进去了但没上电。
-    int p12 = 0, p34 = 0, clk = 0;
-    esp_codec_dev_read_reg(s_dev, 0x4B, &p12);
-    esp_codec_dev_read_reg(s_dev, 0x4C, &p34);
-    esp_codec_dev_read_reg(s_dev, 0x02, &clk);
-    ESP_LOGI(TAG, "ES7210 寄存器:MIC12_PWR(0x4B)=0x%02X MIC34_PWR(0x4C)=0x%02X CLK(0x02)=0x%02X",
-             p12 & 0xFF, p34 & 0xFF, clk & 0xFF);
 
     bool was_running = s_running;
     if (!was_running && tdeck_mic_start() != ESP_OK) return -1;
