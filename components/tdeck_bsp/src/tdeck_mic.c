@@ -20,6 +20,7 @@
 //    麦克风,没必要为它拉 TDM —— 那会要求 rx 通道也按 TDM 初始化,多一层出错面。
 
 #include "tdeck_bsp.h"
+#include <driver/gpio.h>
 #include "tdeck_pins.h"
 
 #include <driver/i2s_std.h>
@@ -52,7 +53,22 @@ static bool                          s_running;
 // MIC1+MIC2 来,探测不到声音时 tdeck_mic_probe_rms 会把四种组合都试一遍。
 // 官方 Microphone 例程给 MIC1|MIC2 设 0dB、给 MIC3|MIC4 设 **37.5dB(最大)** ——
 // 把最大增益放哪一组,基本就说明话筒焊在哪一组上。所以默认选 MIC3/4。
-static uint8_t                       s_mic_mask = ES7210_SEL_MIC3 | ES7210_SEL_MIC4;
+// ⚠️ 必须【四颗全选】,不能只选 MIC3/4。
+//
+// ES7210 有【两个】数据输出脚。LilyGO 驱动里那行注释说得很清楚:
+//     /* Force ADC1/2 output to SDOUT1 and ADC3/4 output to SDOUT2 */
+// 而 T-Deck 只把其中一个 SDOUT 接到了 GPIO14。所以非 TDM 模式下只选
+// MIC3/4 的话,数据全走到没接线的那个脚上 —— 实测 GPIO14 一次都不翻转、
+// 恒为低,而 MCLK/SCK/LRCK 三根时钟都正常在动。
+//
+// 四颗全选会让 esp_codec_dev 打开 TDM(mic_num >= 3),四路时分复用到
+// 同一个 SDOUT 上,连着的那根线才有数据。官方例程用的就是
+// AUDIO_HAL_ADC_INPUT_ALL,正是这个原因。
+//
+// 配合 tdeck_mic_start 里的 channel=2 / channel_mask=0,esp_codec_dev 会走
+// 它的 "Use 2 channel to fetch TDM data" 分支,把位宽减半塞进两个 slot。
+static uint8_t                       s_mic_mask = ES7210_SEL_MIC1 | ES7210_SEL_MIC2 |
+                                                  ES7210_SEL_MIC3 | ES7210_SEL_MIC4;
 static uint8_t                       s_slot;      // 取 I2S 的哪个 slot(0=左 1=右)
 // 模拟前端增益(dB)。30dB 是 esp-box / korvo 上验证过的驻极体麦克风起点。
 static float                         s_gain_db = 37.5f;   // 官方例程给 MIC3/4 的值
@@ -167,13 +183,20 @@ esp_err_t tdeck_mic_start(void)
     if (!s_dev) return ESP_ERR_INVALID_STATE;
     if (s_running) return ESP_OK;
 
-    // channel = 2:非 TDM 的 ES7210 在 I2S 线上固定出两个 slot。
-    // channel_mask 只留第 0 路 → esp_codec_dev 把 rx 通道 reconfig 成 MONO+SLOT_LEFT,
-    // 由硬件丢掉右 slot,省掉 CPU 做去交织。
+    // ⚠️ channel_mask 【留 0】,不要指定单路。
+    //
+    // 传了 channel_mask,esp_codec_dev 会把 I2S rx 通道 reconfig 成
+    // MONO + 单 slot,想让硬件直接丢掉另一路。看着省事,实际读回来【全是 0】。
+    // 官方例程(examples/Microphone)也不这么干 —— 它老老实实收两个 slot
+    // (I2S_CHANNEL_FMT_ALL_LEFT),在软件侧取需要的那一路。
+    // 硬件已证明是好的(官方出厂自检里对着说话 VAD 计数能跳到四十几),
+    // 所以差别只能出在这类配置上。
+    //
+    // 代价是 CPU 要做一次去交织,在 tdeck_mic_read 里做。
     esp_codec_dev_sample_info_t fs = {
         .bits_per_sample = 16,
         .channel         = 2,
-        .channel_mask    = ESP_CODEC_DEV_MAKE_CHANNEL_MASK(s_slot),
+        .channel_mask    = 0,
         .sample_rate     = s_rate,
         .mclk_multiple   = I2S_MCLK_MULTIPLE_256,
     };
@@ -241,6 +264,54 @@ esp_err_t tdeck_mic_start(void)
     ESP_LOGI(TAG, "开始采集 %" PRIu32 "Hz,增益 %.0fdB,MIC%s", s_rate, s_gain_db,
              s_mic_mask == (ES7210_SEL_MIC1 | ES7210_SEL_MIC2) ? "1/2" : "3/4");
     return ESP_OK;
+}
+
+// 用软件代替示波器:直接采 I2S 四根线的电平,数它翻转了多少次。
+//
+// 引脚虽然通过 GPIO matrix 接到了 I2S 外设,gpio_get_level() 读的仍然是
+// 【焊盘】上的真实电平,所以不用表笔也能判断每根线到底有没有在动。
+// 采样频率大概 1MHz 量级,远低于 MCLK 的 4.096MHz —— 数不准频率,
+// 但"有没有翻转"是准的,而这正是我们要回答的问题。
+//
+// 判读:
+//   MCLK/SCK/LRCK 不翻转 → ESP 这边时钟没出来(我们是主机,该查 i2s 配置)
+//   时钟都在翻、DIN 不翻   → ES7210 没在 SDOUT 上驱动数据
+//   DIN 也在翻但读回来全 0 → 数据到了外设却没进 DMA,问题在驱动层
+void tdeck_mic_probe_pins(void)
+{
+    const int pins[4]    = { TDECK_PIN_ES7210_MCLK, TDECK_PIN_ES7210_SCK,
+                             TDECK_PIN_ES7210_LRCK, TDECK_PIN_ES7210_DIN };
+    const char* names[4] = { "MCLK", "SCK ", "LRCK", "DIN " };
+    int flips[4] = {0}, high[4] = {0};
+    const int N = 8000;
+
+    // ⚠️ 先把输入通路打开再采。MCLK/SCK/LRCK 是【纯输出】,通过 GPIO matrix
+    // 接到 I2S 外设时,IO_MUX 的输入使能位可能是关的 —— 那样 gpio_get_level()
+    // 恒返回 0,一根好好在翻转的线会被误判成"死的"。
+    // (DIN 本来就是输入,它的读数一直可信。)
+    for (int k = 0; k < 4; k++) gpio_input_enable((gpio_num_t)pins[k]);
+
+    // 四根线【先全采完再打日志】。之前边采边打,只有第二行出得来 ——
+    // 关中断的紧循环和 UART 日志混在一起会丢输出。
+    for (int k = 0; k < 4; k++) {
+        // 【不要】关中断。关中断的紧循环夹着 USB-Serial-JTAG 的日志输出,
+        // 会把后面的 ESP_LOG 整段吞掉(实测四行只出得来一行)。
+        // 检测"有没有翻转"不需要连续采样,丢几个点无所谓。
+        int last = gpio_get_level(pins[k]);
+        for (int i = 0; i < N; i++) {
+            int v = gpio_get_level(pins[k]);
+            if (v != last) { flips[k]++; last = v; }
+            high[k] += v;
+        }
+    }
+
+    for (int k = 0; k < 4; k++) {
+        ESP_LOGW(TAG, "  GPIO%-2d %s 翻转 %5d / %d,高电平 %2d%%  → %s",
+                 pins[k], names[k], flips[k], N, high[k] * 100 / N,
+                 flips[k] > 10 ? "在动" : "不动");
+    }
+    ESP_LOGW(TAG, "  判读:时钟三根都在动而 DIN 不动 = ES7210 没输出数据;"
+                  "LRCK 不动 = 帧同步没发出去,ES7210 永远等不到一帧的开头");
 }
 
 esp_err_t tdeck_mic_stop(void)
@@ -362,8 +433,8 @@ int tdeck_mic_probe_rms(uint32_t ms)
     }
 
     if (rms <= 0) {
-        ESP_LOGW(TAG, "四种通道组合全是 0 —— 不是选通问题,查 MCLK(GPIO48)、"
-                      "ES7210 供电,或者这块板子的麦克风根本没焊");
+        ESP_LOGW(TAG, "四种通道组合全是 0。直接采四根线的电平,看断在哪一段:");
+        tdeck_mic_probe_pins();
     } else {
         ESP_LOGI(TAG, "麦克风可用:MIC%s slot%d",
                  s_mic_mask == (ES7210_SEL_MIC1 | ES7210_SEL_MIC2) ? "1/2" : "3/4", s_slot);
@@ -381,7 +452,21 @@ int tdeck_mic_read(int16_t* buf, size_t samples, uint32_t timeout_ms)
     (void)timeout_ms;
     if (!s_dev || !s_running || !buf || !samples) return -1;
 
-    int r = esp_codec_dev_read(s_dev, (void*)buf, (int)(samples * sizeof(int16_t)));
-    if (r != ESP_CODEC_DEV_OK) return -1;
-    return (int)(samples * sizeof(int16_t));
+    // 线上是两个 slot 交织的(见 tdeck_mic_start 里为什么不让硬件做单路),
+    // 这里取 s_slot 那一路,按单声道交给调用方 —— 上层不用知道这件事。
+    // 只有一个读者(小智的音频任务或自检),所以 scratch 放 static 不加锁;
+    // 放栈上的话调用者要多背 2KB,而这个项目已经因为估错栈崩过两次。
+    enum { FRAMES = 512 };
+    static int16_t scratch[FRAMES * 2];
+
+    size_t done = 0;
+    while (done < samples) {
+        size_t n = samples - done;
+        if (n > FRAMES) n = FRAMES;
+        int r = esp_codec_dev_read(s_dev, (void*)scratch, (int)(n * 2 * sizeof(int16_t)));
+        if (r != ESP_CODEC_DEV_OK) return done ? (int)(done * sizeof(int16_t)) : -1;
+        for (size_t i = 0; i < n; i++) buf[done + i] = scratch[i * 2 + (s_slot & 1)];
+        done += n;
+    }
+    return (int)(done * sizeof(int16_t));
 }

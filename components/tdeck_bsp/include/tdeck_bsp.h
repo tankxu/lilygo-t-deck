@@ -103,6 +103,8 @@ bool      tdeck_mic_running(void);
 // 上电自检:录 ms 毫秒算 RMS 并打一行日志。返回 RMS,失败返回 -1。
 // RMS 恒为 0 = ES7210 的 MIC 选通选错了通道(现象是"一切正常、就是静音")。
 int       tdeck_mic_probe_rms(uint32_t ms);
+// 软件示波器:采 MCLK/SCK/LRCK/DIN 四根线的电平,看谁在动、谁是死的
+void      tdeck_mic_probe_pins(void);
 
 // 手动指定 ES7210 的麦克风选通和取哪个 I2S slot。probe 会自己找,
 // 找到之后把结果写死在这里可以省掉每次开机 0.5 秒的探测。
