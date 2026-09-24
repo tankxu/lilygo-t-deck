@@ -393,6 +393,33 @@ bool fetch_cover(const char* key)
     esp_http_client_cleanup(cli);
     if (len < 100) { free(buf); return false; }
 
+    // ⚠️ LVGL 的 JPEG 嗅探【只认 JFIF】。lv_tjpgd.c 的 is_jpg() 是逐字节比对
+    //     FF D8 FF E0 00 10 'J' 'F' 'I' 'F'
+    // 也就是要求 SOI 之后紧跟着 APP0/JFIF 段。而服务端的封面是 ffmpeg(Lavc)
+    // 出的,SOI 之后是 COM 段(FF D8 FF FE ...) —— 完全合法的 JPEG,但嗅探
+    // 不认,decoder_info 直接返回 INVALID,图就【不显示也不报错】。
+    //
+    // 所以在 SOI 后面补一段标准的 18 字节 JFIF APP0。JPEG 允许 APP0 出现在
+    // 其它标记段之前,补上不影响原有的 COM 段,解码结果一模一样。
+    // (LVGL 9.6 的嗅探宽松些,所以这个问题是降到 9.5 之后才冒出来的 ——
+    //  而 9.5 是中文字库要的,见 idf_component.yml。)
+    if (len > 4 && buf[0] == 0xFF && buf[1] == 0xD8 &&
+        !(buf[2] == 0xFF && buf[3] == 0xE0)) {
+        static const uint8_t APP0[18] = {
+            0xFF, 0xE0, 0x00, 0x10, 'J', 'F', 'I', 'F', 0x00,
+            0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00
+        };
+        uint8_t* fixed = (uint8_t*)heap_caps_malloc(len + sizeof(APP0), MALLOC_CAP_SPIRAM);
+        if (fixed) {
+            fixed[0] = 0xFF; fixed[1] = 0xD8;                  // SOI
+            memcpy(fixed + 2, APP0, sizeof(APP0));             // 补 JFIF
+            memcpy(fixed + 2 + sizeof(APP0), buf + 2, len - 2); // 原样接上剩下的
+            free(buf);
+            buf = fixed;
+            len += sizeof(APP0);
+        }
+    }
+
     if (g_cover_buf) free(g_cover_buf);
     g_cover_buf = buf;
     g_cover_dsc = {};
