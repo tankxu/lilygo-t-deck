@@ -13,7 +13,3 @@ dependencies:
   # Opus/MP3 解码(小智同款,音乐播放器和将来的小智共用)
   espressif/esp_audio_codec:
     version: "^2.4.0"
-  # 中文字体(小智同款 puhui 子集)。Montserrat 只有 ASCII,
-  # 中文歌名/界面文字会全是方框。
-  78/xiaozhi-fonts:
-    version: "*"

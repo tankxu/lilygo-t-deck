@@ -1,0 +1,66 @@
+// fonts.cc — 中文字体
+//
+// 用【cbin 二进制字体】而不是把字库编成 .c 数组:
+//   · 通用中文字库有 7000~9000 个字形,编成 C 源码是 5~17MB 的文本,
+//     进版本库极其臃肿,每次编译还要重新 parse 一遍
+//   · 二进制格式 1.7MB,EMBED_FILES 原样嵌进固件,运行时 cbin_font_create
+//     一次建好,不占编译时间
+//
+// 选择从【内存】加载而不是从文件系统:省掉挂 FATFS 和注册 LVGL 文件系统驱动
+// 两层依赖。代价是这 1.7MB 占 app 分区而不是 storage 分区 —— app 分区有 6MB,
+// 目前用了不到 2MB,放得下。
+//
+// cbin_font.c/h 是从 78/xiaozhi-fonts 1.6.0 抠出来的本地副本,没有引整个组件:
+// 那个组件用 file(GLOB src/*.c) 会把 30MB 的字体源码全部编进来。
+// 2.0.0 版的加载器和这个 cbin 文件不兼容(实测渲染出错位的碎片)。
+//
+// 字库来自 parent-master 的 stackchan 资源:font_puhui_common_20_4,
+// 9291 个字形(含 GB2312 全部 6763 汉字 + 拼音声调 + 中文标点 + 全角),20px 4bpp。
+// 对比试过的两条弯路:78/xiaozhi-fonts 的 basic 版只有 801 字形(只够小智自己
+// UI 的固定用字,歌名照样方框),完整版是 5MB 的 .c 源码(进版本库太臃肿)。
+
+#include "fonts.h"
+#include "cbin_font.h"
+#include <esp_log.h>
+
+extern "C" const uint8_t puhui_start[] asm("_binary_font_puhui_common_20_4_bin_start");
+extern "C" const uint8_t puhui_end[]   asm("_binary_font_puhui_common_20_4_bin_end");
+
+namespace tdeck {
+namespace {
+const char* TAG = "fonts";
+lv_font_t* s_cjk = nullptr;
+}
+
+void fonts_init()
+{
+    if (s_cjk) return;
+    uint32_t sz = (uint32_t)(puhui_end - puhui_start);
+    // cbin 格式,不是 LVGL 标准 binfont —— 后者的 lv_binfont_create_from_buffer
+    // 读这个文件会直接失败(实测)。cbin_font_create 来自 78/xiaozhi-fonts。
+    s_cjk = cbin_font_create((uint8_t*)puhui_start);
+
+    // 自检:cbin 是把序列化数据直接映射成 lv_font_fmt_txt_dsc_t 的,
+    // 而这个结构在 LVGL 小版本之间会变布局。版本对不上时 cbin_font_create
+    // 仍然【返回非空】,只是查任何字形都落空 —— 屏幕上整片方框,连 ASCII 都是。
+    // 所以不能只看返回值,要真查一个已知字形。
+    //
+    // 这个字库是在 LVGL 9.4 下用 78 fork 的 lv_font_conv 生成的,我们跑 9.5,
+    // 实测就是全方框。留着这段自检:哪天把版本对齐了,它会自己开始工作。
+    if (s_cjk) {
+        lv_font_glyph_dsc_t g = {};
+        bool ok = lv_font_get_glyph_dsc(s_cjk, &g, 'A', 0) && g.box_w > 0;
+        if (!ok) {
+            ESP_LOGW(TAG, "中文字体查不到字形(LVGL 版本与字库不匹配),回落 Montserrat");
+            s_cjk = nullptr;
+        } else {
+            ESP_LOGI(TAG, "中文字体已加载(%u 字节)", (unsigned)sz);
+        }
+    } else {
+        ESP_LOGE(TAG, "中文字体加载失败(%u 字节)", (unsigned)sz);
+    }
+}
+
+const lv_font_t* font_cjk() { return s_cjk; }
+
+}  // namespace tdeck

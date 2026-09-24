@@ -10,6 +10,7 @@
 #include "app.h"
 #include "secrets.h"
 #include "tdeck_bsp.h"
+#include "ui/fonts.h"
 
 #include <cJSON.h>
 #include <esp_audio_simple_dec.h>
@@ -22,16 +23,14 @@
 #include <lvgl.h>
 #include <string.h>
 
-// 中文字体。LVGL 内建的 Montserrat 只有 ASCII,中文歌名会渲染成一排方框。
-// 这两个是小智 78/xiaozhi-fonts 里的 Noto Sans 子集(常用汉字 + ASCII)。
-extern "C" const lv_font_t font_noto_sans_basic_16_4;
-extern "C" const lv_font_t font_noto_sans_basic_20_4;
-
 namespace {
 
 const char* TAG = "music";
-const lv_font_t* F16 = &font_noto_sans_basic_16_4;
-const lv_font_t* F20 = &font_noto_sans_basic_20_4;
+// 中文字体没加载成功就回落到 Montserrat —— 宁可显示方框,不要空指针崩溃
+inline const lv_font_t* F16() { auto* f = tdeck::font_cjk(); return f ? f : &lv_font_montserrat_16; }
+inline const lv_font_t* F20() { auto* f = tdeck::font_cjk(); return f ? f : &lv_font_montserrat_20; }
+
+
 
 constexpr uint32_t C_ACCENT = 0x55853A;
 constexpr uint32_t C_TEXT   = 0x1b2117;
@@ -340,7 +339,7 @@ public:
         root_ = root;
         lv_obj_set_style_bg_color(root, lv_color_hex(0xF2F5EE), LV_PART_MAIN);
         lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
-        mk(root_, F20, C_TEXT, 14, 10, "Music");
+        mk(root_, F20(), C_TEXT, 14, 10, "Music");
 
         if (g_state.n_songs == 0) {
             loading_ = mk(root_, &lv_font_montserrat_16, C_MUTE, 14, 50, "loading...");
@@ -395,7 +394,7 @@ private:
         q_len_ = 0; q_[0] = 0;
         if (first) { q_[q_len_++] = first; q_[q_len_] = 0; }
         lv_obj_clean(root_);
-        mk(root_, F20, C_TEXT, 14, 10, "Search");
+        mk(root_, F20(), C_TEXT, 14, 10, "Search");
 
         lv_obj_t* box = lv_obj_create(root_);
         lv_obj_set_size(box, SCR_W - 24, 46);
@@ -406,7 +405,7 @@ private:
         lv_obj_set_style_border_color(box, lv_color_hex(C_ACCENT), LV_PART_MAIN);
         lv_obj_set_style_pad_all(box, 0, LV_PART_MAIN);
         lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
-        q_lbl_ = mk(box, F20, C_TEXT, 12, 11, q_);
+        q_lbl_ = mk(box, F20(), C_TEXT, 12, 11, q_);
 
         sr_ = mk(root_, &lv_font_montserrat_14, C_MUTE, 14, 104,
                  "type a song name, Enter to play");
@@ -417,7 +416,7 @@ private:
     bool search_input(const tdeck::InputEvent& ev)
     {
         if (ev.key == tdeck::Key::Back) { searching_ = false; lv_obj_clean(root_);
-            mk(root_, F20, C_TEXT, 14, 10, "Music"); build_list(); return true; }
+            mk(root_, F20(), C_TEXT, 14, 10, "Music"); build_list(); return true; }
         if (ev.key == tdeck::Key::Enter) {
             if (!q_len_) return true;
             lv_label_set_text(sr_, "searching...");
@@ -465,7 +464,7 @@ private:
         lv_obj_set_style_border_width(search_row_, 1, LV_PART_MAIN);
         lv_obj_set_style_pad_all(search_row_, 0, LV_PART_MAIN);
         lv_obj_remove_flag(search_row_, LV_OBJ_FLAG_SCROLLABLE);
-        mk(search_row_, F16, C_MUTE, 10, 6, LV_SYMBOL_PLUS "  Search a song");
+        mk(search_row_, F16(), C_MUTE, 10, 6, LV_SYMBOL_PLUS "  Search a song");
 
         list_ = lv_obj_create(root_);
         lv_obj_set_size(list_, SCR_W - 24, 152);
@@ -486,10 +485,10 @@ private:
             lv_obj_set_style_pad_all(r, 0, LV_PART_MAIN);
             lv_obj_remove_flag(r, LV_OBJ_FLAG_SCROLLABLE);
 
-            lv_obj_t* t = mk(r, F16, C_TEXT, 10, 3, g_songs[i].title);
+            lv_obj_t* t = mk(r, F16(), C_TEXT, 10, 3, g_songs[i].title);
             lv_label_set_long_mode(t, LV_LABEL_LONG_DOT);
             lv_obj_set_width(t, 230);
-            lv_obj_t* a = mk(r, F16, C_MUTE, 10, 22, g_songs[i].artist);
+            lv_obj_t* a = mk(r, F16(), C_MUTE, 10, 22, g_songs[i].artist);
             lv_label_set_long_mode(a, LV_LABEL_LONG_DOT);
             lv_obj_set_width(a, 230);
 
