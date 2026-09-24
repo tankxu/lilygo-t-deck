@@ -8,3 +8,4 @@ dependencies.lock
 
 # 本机配置(WiFi 凭据等),不进版本库
 main/secrets.h
+build-xz/
