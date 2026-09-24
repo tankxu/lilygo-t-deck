@@ -24,6 +24,8 @@
 #include "tdeck_pins.h"
 
 #include <driver/i2s_std.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <esp_check.h>
 #include <esp_log.h>
 #include <string.h>
@@ -35,6 +37,12 @@ static uint32_t          s_rate;
 static uint8_t           s_volume = 70;
 
 static uint8_t s_ch = 1;
+
+// 喇叭是【独占】资源:音乐 app 和小智都会往里写。下面那块缩放缓冲是共享的,
+// 两个任务同时进来会互相把对方的样本覆盖掉,放出来是一片撕裂的杂音。
+// 锁的粒度就是"一整块写完",谁拿到锁谁在这段时间里独占喇叭 ——
+// 把两路 PCM 交织进同一条 I2S 流本来也不是能听的东西,混音是另一回事。
+static SemaphoreHandle_t s_spk_mux;
 
 esp_err_t tdeck_audio_init(uint32_t sample_rate, uint8_t channels)
 {
@@ -49,6 +57,11 @@ esp_err_t tdeck_audio_init(uint32_t sample_rate, uint8_t channels)
     }
     s_rate = sample_rate;
     s_ch   = channels;
+
+    if (!s_spk_mux) {
+        s_spk_mux = xSemaphoreCreateMutex();
+        ESP_RETURN_ON_FALSE(s_spk_mux, ESP_ERR_NO_MEM, TAG, "喇叭互斥量创建失败");
+    }
 
     i2s_chan_config_t chan = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     chan.auto_clear = true;   // 没数据时自动填 0,否则停止播放会拖出一段噪声
@@ -91,8 +104,16 @@ int tdeck_speaker_write(const int16_t* buf, size_t samples, uint32_t timeout_ms)
     // 用平方曲线而不是线性 —— 人耳对响度的感知接近对数,
     // 线性衰减的话"50%"听起来还是很吵,到 20% 才开始明显变小。
     int32_t gain = (int32_t)s_volume * s_volume;   // 0..10000
+
+    // scaled 是共享的,必须在锁里用。见文件上方 s_spk_mux 的说明。
+    // 放 static 而不是栈上:这个函数的调用者(音乐解码任务、小智音频任务)
+    // 栈都不宽裕,1KB 白拿走不划算 —— 这个项目已经因为估错栈崩过两次了。
     static int16_t scaled[512];
     size_t done = 0;
+
+    if (s_spk_mux && xSemaphoreTake(s_spk_mux, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        return -1;   // 别人正占着喇叭,这一块丢掉,总比跟他搅在一起强
+    }
 
     while (done < samples) {
         size_t n = samples - done;
@@ -103,8 +124,10 @@ int tdeck_speaker_write(const int16_t* buf, size_t samples, uint32_t timeout_ms)
         size_t written = 0;
         esp_err_t e = i2s_channel_write(s_tx, scaled, n * sizeof(int16_t), &written,
                                         pdMS_TO_TICKS(timeout_ms));
-        if (e != ESP_OK) return (int)(done * sizeof(int16_t));
+        if (e != ESP_OK) break;
         done += written / sizeof(int16_t);
     }
+
+    if (s_spk_mux) xSemaphoreGive(s_spk_mux);
     return (int)(done * sizeof(int16_t));
 }
