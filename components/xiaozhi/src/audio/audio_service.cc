@@ -163,7 +163,10 @@ void AudioService::Start() {
         AudioService* audio_service = (AudioService*)arg;
         audio_service->OpusCodecTask();
         vTaskDelete(NULL);
-    }, "opus_codec", 2048 * 12, this, 2, &opus_codec_task_handle_);
+        // 上游给 24KB(2048*12)。实测(xz 的 30 秒栈水位日志)编解码峰值只用掉
+        // 约 7.9KB,而内部 RAM 是这块板子最紧的资源 —— 这里省下的 4KB
+        // 正好是 TLS 握手够不够的差别。留 12KB 余量已经很宽。
+    }, "opus_codec", 2048 * 10, this, 2, &opus_codec_task_handle_);
 }
 
 void AudioService::Stop() {

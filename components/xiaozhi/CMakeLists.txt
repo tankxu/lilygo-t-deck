@@ -29,7 +29,11 @@ idf_component_register(
         ${XZ_PROTOCOL}
         ${XZ_BOARD}
     INCLUDE_DIRS
-        "src" "src/led" "src/audio" "src/protocols" "src/display" "src/boards/common" "src/net" "src/assets"
+        # 注意:这里【不要】写不存在的目录。src/net 曾经在这一行里,但它是个空目录,
+        # git 不跟踪空目录 —— 新克隆出来 configure 直接失败:
+        #   CMake Error: Include directory '.../src/net' is not a directory
+        # 上游把 http/websocket/mqtt 抽象放在 esp-ml307 组件里,这里本来就不需要它。
+        "src" "src/led" "src/audio" "src/protocols" "src/display" "src/boards/common" "src/assets"
         "src/boards/t-deck"
     REQUIRES
         tdeck_bsp
