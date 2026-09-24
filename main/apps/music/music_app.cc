@@ -15,8 +15,10 @@
 #include <cJSON.h>
 #include <esp_audio_simple_dec.h>
 #include <esp_audio_simple_dec_default.h>
+#include <decoder/impl/esp_opus_dec.h>
 #include <esp_http_client.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <esp_lvgl_port.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -148,58 +150,95 @@ void play_task(void* arg)
     if (!cli) { g_play_task = nullptr; vTaskDelete(nullptr); }
 
     esp_audio_simple_dec_handle_t dec = nullptr;
-    uint8_t* in  = (uint8_t*)heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
-    uint8_t* out = (uint8_t*)heap_caps_malloc(8192, MALLOC_CAP_SPIRAM);
+    constexpr int IN_CAP = 8192, OUT_CAP = 16384;
+    uint8_t* in  = (uint8_t*)heap_caps_malloc(IN_CAP, MALLOC_CAP_SPIRAM);
+    uint8_t* out = (uint8_t*)heap_caps_malloc(OUT_CAP, MALLOC_CAP_SPIRAM);
 
     do {
         if (!in || !out) break;
         if (esp_http_client_open(cli, 0) != ESP_OK) break;
         esp_http_client_fetch_headers(cli);
 
+        // 【两层都要注册】。simple_dec 那一层管的是容器(Ogg 解复用),
+        // 真正解 Opus 帧的是元素解码器,在另一个注册表里。
+        // 只注册前者的话,Ogg 能正确识别出流是 Opus,然后报
+        //     Decoder OPUS(1398100047) not registered
+        // 这个错很容易被当成"容器不支持"而去换格式,实际只差一行注册。
+        esp_audio_simple_dec_register_default();
+        esp_opus_dec_register();
+
         esp_audio_simple_dec_cfg_t dcfg = {};
         dcfg.dec_type = ESP_AUDIO_SIMPLE_DEC_TYPE_OGG;
-        if (esp_audio_simple_dec_open(&dcfg, &dec) != ESP_AUDIO_ERR_OK) {
-            ESP_LOGE(TAG, "解码器打开失败");
+        esp_audio_err_t oe = esp_audio_simple_dec_open(&dcfg, &dec);
+        if (oe != ESP_AUDIO_ERR_OK) {
+            ESP_LOGE(TAG, "解码器打开失败 err=%d", (int)oe);
             break;
         }
+        ESP_LOGI(TAG, "开始播放:%s", g_play_url);
 
         tdeck_audio_init(SAMPLE_RATE);
         g_state.playing = true;
         g_state.pos_s = 0;
 
         int64_t samples_out = 0;
+        int64_t bytes_in = 0;
         int pending = 0;
+        int64_t t_log = esp_timer_get_time();
+        bool first_pcm = true;
+        int empty_reads = 0;
+
         while (!g_stop_req) {
-            int n = esp_http_client_read(cli, (char*)in + pending, 4096 - pending);
-            if (n <= 0 && pending == 0) break;
-            if (n > 0) pending += n;
+            int n = esp_http_client_read(cli, (char*)in + pending, IN_CAP - pending);
+            if (n > 0) { pending += n; bytes_in += n; empty_reads = 0; }
+            else if (pending == 0) {
+                // read 返回 0 不一定是流结束 —— 也可能只是这一刻没数据到。
+                // 直接 break 的话,一首 4 分钟的歌会在两秒钟"播完"。
+                // 连续多次取不到才认定结束。
+                if (esp_http_client_is_complete_data_received(cli)) break;
+                if (++empty_reads > 40) break;
+                vTaskDelay(pdMS_TO_TICKS(20));
+                continue;
+            }
 
             esp_audio_simple_dec_raw_t raw = {};
             raw.buffer = in;
             raw.len    = pending;
-            raw.eos    = (n <= 0);
-
-            esp_audio_simple_dec_out_t o = {};
-            o.buffer = out;
-            o.len    = 8192;
+            raw.eos    = false;
 
             while (raw.len > 0 && !g_stop_req) {
-                o.needed_size = 0;
+                // 每次调用前都要重置输出描述符。process() 会改写 o.len /
+                // o.decoded_size,沿用上一轮的值会让第二次调用就出错 ——
+                // 症状是只解出第一帧然后整首歌"结束"。
+                esp_audio_simple_dec_out_t o = {};
+                o.buffer = out;
+                o.len    = OUT_CAP;
+
                 esp_audio_err_t e = esp_audio_simple_dec_process(dec, &raw, &o);
                 if (e != ESP_AUDIO_ERR_OK) break;
+
                 if (o.decoded_size > 0) {
+                    if (first_pcm) {
+                        first_pcm = false;
+                        ESP_LOGI(TAG, "首帧 PCM:%u 字节", (unsigned)o.decoded_size);
+                    }
                     tdeck_speaker_write((int16_t*)out, o.decoded_size / 2, 1000);
                     samples_out += o.decoded_size / 2;
                     g_state.pos_s = (int)(samples_out / SAMPLE_RATE);
                 }
-                if (raw.consumed == 0) break;
+                if (raw.consumed == 0) break;   // 数据不够拼一帧,回去再拉
                 raw.buffer += raw.consumed;
                 raw.len    -= raw.consumed;
             }
-            // 没消费完的尾巴挪到开头,下一轮接着凑成完整帧
-            if (raw.len > 0 && raw.len < 4096) memmove(in, raw.buffer, raw.len);
-            pending = raw.len;
-            if (n <= 0) break;
+
+            // 没消费完的尾巴挪到开头,和下一批拼成完整帧
+            if (raw.len > 0 && raw.buffer != in) memmove(in, raw.buffer, raw.len);
+            pending = (int)raw.len;
+
+            if (esp_timer_get_time() - t_log > 5000000) {
+                t_log = esp_timer_get_time();
+                ESP_LOGI(TAG, "已拉 %lld KB,播到 %d 秒",
+                         (long long)(bytes_in / 1024), g_state.pos_s);
+            }
         }
     } while (0);
 
@@ -213,6 +252,8 @@ void play_task(void* arg)
     ESP_LOGI(TAG, "播放结束:%s", g_state.title);
     vTaskDelete(nullptr);
 }
+
+bool fetch_cover(const char* key);   // 定义在下面的封面小节
 
 // URL 编码。键盘只能打 ASCII,所以不用管多字节 —— 但空格和 & 必须转,
 // 否则查询串会被截断。
@@ -231,14 +272,24 @@ void urlencode(const char* in, char* out, size_t n)
     out[o] = 0;
 }
 
-void start_play(const char* url, const char* title, const char* artist, int dur)
+void start_play(const char* url, const char* title, const char* artist, int dur, const char* cover_key)
 {
+    if (cover_key && cover_key[0]) fetch_cover(cover_key);
     strncpy(g_play_url, url, sizeof(g_play_url) - 1);
     strncpy(g_state.title,  title  ? title  : "", sizeof(g_state.title) - 1);
     strncpy(g_state.artist, artist ? artist : "", sizeof(g_state.artist) - 1);
     g_state.dur_s = dur;
     g_stop_req = false;
-    xTaskCreate(play_task, "music_play", 8192, nullptr, 5, &g_play_task);
+    // 栈给 20K:Opus 解码器在栈上开大数组,8K 会溢出;但也不能给太大 ——
+    // FreeRTOS 的任务栈必须在【内部 RAM】,而这块板子内部 RAM 只剩百来 KB,
+    // 32K 会直接创建失败。失败时 xTaskCreate 返回非 pdPASS,不检查的话
+    // 现象是"点了播放什么都没发生、日志也没有",极难查。
+    BaseType_t ok = xTaskCreate(play_task, "music_play", 20480, nullptr, 5, &g_play_task);
+    if (ok != pdPASS) {
+        g_play_task = nullptr;
+        ESP_LOGE(TAG, "播放任务创建失败(内部 RAM 剩 %u 字节)",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    }
 }
 
 void stop_playback()
@@ -272,10 +323,59 @@ bool search_and_play(const char* query)
     if (ok) {
         start_play(au->valuestring,
                    cJSON_IsString(ti) ? ti->valuestring : query,
-                   cJSON_IsString(ar) ? ar->valuestring : "", 0);
+                   cJSON_IsString(ar) ? ar->valuestring : "", 0, nullptr);
     }
     cJSON_Delete(root);
     return ok;
+}
+
+// ── 封面 ──────────────────────────────────────────────────
+// 服务端能按尺寸裁好再发(/cover?w=&h=),所以拉下来的就是 120x120 的小图,
+// 4KB 左右。不用在设备上缩放,省掉一整套图像处理。
+//
+// 解码交给 LVGL 的 TJPGD:把 JPEG 原始字节包成 cf=RAW 的 image_dsc,
+// LVGL 的解码器链会自己认出是 JPEG。比自己调 tjpgd 再转 RGB565 省事得多。
+uint8_t*       g_cover_buf = nullptr;
+lv_image_dsc_t g_cover_dsc;
+
+bool fetch_cover(const char* key)
+{
+    char url[400];
+    snprintf(url, sizeof(url),
+             MUSIC_BASE_URL "/cover?f=%s.jpg&w=120&h=120&key=" MUSIC_TOKEN, key);
+
+    esp_http_client_config_t cfg = {};
+    cfg.url = url; cfg.timeout_ms = 8000;
+    esp_http_client_handle_t cli = esp_http_client_init(&cfg);
+    if (!cli) return false;
+
+    constexpr int CAP = 48 * 1024;
+    uint8_t* buf = (uint8_t*)heap_caps_malloc(CAP, MALLOC_CAP_SPIRAM);
+    if (!buf) { esp_http_client_cleanup(cli); return false; }
+
+    int len = 0;
+    if (esp_http_client_open(cli, 0) == ESP_OK) {
+        esp_http_client_fetch_headers(cli);
+        while (len < CAP) {
+            int n = esp_http_client_read(cli, (char*)buf + len, CAP - len);
+            if (n <= 0) break;
+            len += n;
+        }
+    }
+    esp_http_client_cleanup(cli);
+    if (len < 100) { free(buf); return false; }
+
+    if (g_cover_buf) free(g_cover_buf);
+    g_cover_buf = buf;
+    g_cover_dsc = {};
+    g_cover_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+    g_cover_dsc.header.cf    = LV_COLOR_FORMAT_RAW;   // 让解码器链去认格式
+    g_cover_dsc.header.w     = 120;
+    g_cover_dsc.header.h     = 120;
+    g_cover_dsc.data         = g_cover_buf;
+    g_cover_dsc.data_size    = len;
+    ESP_LOGI(TAG, "封面 %d 字节", len);
+    return true;
 }
 
 // ── UI ────────────────────────────────────────────────────
@@ -289,47 +389,40 @@ lv_obj_t* mk(lv_obj_t* p, const lv_font_t* f, uint32_t c, int x, int y, const ch
     return l;
 }
 
+// 三个界面。默认进曲库;一旦开始播放就切到正在播放页 ——
+// 音乐 app 的主界面本来就该是"现在在放什么",列表是去找歌时才用的。
+enum class View { Library, NowPlaying, Search };
+
 class MusicApp : public tdeck::App {
 public:
     const char* name() const override   { return "Music"; }
     const char* icon() const override   { return LV_SYMBOL_AUDIO; }
     uint32_t    accent() const override { return 0x55853A; }
-    // 搜索框里要能打全部字母(ADR-006 的后路)
-    bool wants_raw_keys() const override { return searching_; }
+    bool wants_raw_keys() const override { return view_ == View::Search; }
 
-    // 卡片是【入口】不是挂件:不显示正在播放什么,只要一眼认得出这是音乐。
-    // 一排高低不等的均衡器条 —— 不用读字就知道是什么,而且和其它卡片
-    // 在视觉上完全不会混。
+    // 卡片是入口不是挂件:一排静态均衡器条,靠形状认出这是音乐
     void render_card(lv_obj_t* card) override
     {
         const int W = 143, H = 94;
         lv_obj_set_style_bg_color(card, lv_color_hex(0x1E2A16), LV_PART_MAIN);
-
-        // 高度取一段固定序列而不是随机:每次进桌面看到的是同一张卡片,
-        // 随机会让人以为它在动
         static const int hs[] = { 18, 34, 26, 46, 30, 54, 22, 40, 28, 16 };
-        const int n = sizeof(hs) / sizeof(hs[0]);
-        const int bw = 8, gap = 5;
-        int total = n * bw + (n - 1) * gap;
-        int x0 = (W - total) / 2;
-
+        const int n = 10, bw = 8, gap = 5;
+        int x0 = (W - (n * bw + (n - 1) * gap)) / 2;
         for (int i = 0; i < n; i++) {
             lv_obj_t* b = lv_obj_create(card);
             lv_obj_set_size(b, bw, hs[i]);
             lv_obj_set_pos(b, x0 + i * (bw + gap), 20 + (56 - hs[i]) / 2);
             lv_obj_set_style_radius(b, bw / 2, LV_PART_MAIN);
-            // 中间几根更亮,做出"中心发光"的层次,不是一排死板的同色条
-            uint32_t c = (i >= 3 && i <= 6) ? 0xA8E063 : 0x6E8B4F;
-            lv_obj_set_style_bg_color(b, lv_color_hex(c), LV_PART_MAIN);
+            lv_obj_set_style_bg_color(b, lv_color_hex((i >= 3 && i <= 6) ? 0x55853A : 0x6E8B4F),
+                                      LV_PART_MAIN);
             lv_obj_set_style_border_width(b, 0, LV_PART_MAIN);
             lv_obj_set_style_pad_all(b, 0, LV_PART_MAIN);
             lv_obj_remove_flag(b, LV_OBJ_FLAG_SCROLLABLE);
             lv_obj_remove_flag(b, LV_OBJ_FLAG_CLICKABLE);
         }
-
         lv_obj_t* nm = lv_label_create(card);
         lv_obj_set_style_text_font(nm, &lv_font_montserrat_16, LV_PART_MAIN);
-        lv_obj_set_style_text_color(nm, lv_color_hex(0xE8EFE0), LV_PART_MAIN);
+        lv_obj_set_style_text_color(nm, lv_color_hex(0x1B2117), LV_PART_MAIN);
         lv_label_set_text(nm, "Music");
         lv_obj_set_pos(nm, 12, H - 26);
     }
@@ -337,30 +430,340 @@ public:
     void on_enter(lv_obj_t* root) override
     {
         root_ = root;
-        lv_obj_set_style_bg_color(root, lv_color_hex(0xF2F5EE), LV_PART_MAIN);
+        lv_obj_set_style_bg_color(root, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
         lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
-        mk(root_, F20(), C_TEXT, 14, 10, "Music");
+        self_ = this;
+
+        tick_ = lv_timer_create([](lv_timer_t* t) {
+            static_cast<MusicApp*>(lv_timer_get_user_data(t))->on_tick();
+        }, 500, this);
 
         if (g_state.n_songs == 0) {
-            loading_ = mk(root_, &lv_font_montserrat_16, C_MUTE, 14, 50, "loading...");
-            // 拉歌单是阻塞 HTTP,不能在 LVGL 任务里做,否则整个界面卡住
-            xTaskCreate([](void* self) {
+            show_loading();
+            xTaskCreate([](void* s) {
                 fetch_list();
                 lvgl_port_lock(0);
-                static_cast<MusicApp*>(self)->build_list();
+                auto* self = static_cast<MusicApp*>(s);
+                if (self->root_) self->show_library();
                 lvgl_port_unlock();
                 vTaskDelete(nullptr);
             }, "music_list", 8192, this, 4, nullptr);
         } else {
-            build_list();
+            g_state.playing ? show_now() : show_library();
         }
     }
 
-    void on_exit() override { root_ = list_ = search_row_ = nullptr; }
+    void on_exit() override
+    {
+        if (tick_) { lv_timer_delete(tick_); tick_ = nullptr; }
+        root_ = nullptr; self_ = nullptr;
+        clear_refs();
+    }
 
     bool on_input(const tdeck::InputEvent& ev) override
     {
-        if (searching_) return search_input(ev);
+        switch (view_) {
+        case View::Search:     return search_input(ev);
+        case View::NowPlaying: return now_input(ev);
+        case View::Library:    return lib_input(ev);
+        }
+        return false;
+    }
+
+private:
+    void clear_refs()
+    {
+        list_ = search_row_ = q_lbl_ = sr_ = nullptr;
+        cover_ = title_ = artist_ = bar_fill_ = t_cur_ = t_tot_ = btn_play_ = nullptr;
+        for (auto& r : rows_) r = nullptr;
+        for (auto& m : play_mark_) m = nullptr;
+    }
+
+    static lv_obj_t* lbl(lv_obj_t* p, const lv_font_t* f, uint32_t c, int x, int y, const char* s)
+    {
+        lv_obj_t* l = lv_label_create(p);
+        lv_obj_set_style_text_font(l, f, LV_PART_MAIN);
+        lv_obj_set_style_text_color(l, lv_color_hex(c), LV_PART_MAIN);
+        lv_label_set_text(l, s);
+        lv_obj_set_pos(l, x, y);
+        return l;
+    }
+
+    void show_loading()
+    {
+        lv_obj_clean(root_); clear_refs();
+        lbl(root_, F20(), 0x1B2117, 14, 100, "loading...");
+    }
+
+    // ── 正在播放 ──────────────────────────────────────────
+    // 封面 + 标题 + 进度 + 传输控件。深色底 —— 音乐播放器几乎都是深色,
+    // 封面在深底上才显得亮;而且这一屏几乎没有留白,漏光没有显形的余地。
+    void show_now()
+    {
+        view_ = View::NowPlaying;
+        lv_obj_clean(root_); clear_refs();
+
+        // 封面。没拉到就画一块占位,不要留个空洞
+        cover_ = lv_image_create(root_);
+        lv_obj_set_pos(cover_, 16, 44);
+        if (g_cover_buf) {
+            lv_image_set_src(cover_, &g_cover_dsc);
+        } else {
+            lv_obj_delete(cover_);
+            cover_ = lv_obj_create(root_);
+            lv_obj_set_size(cover_, 120, 120);
+            lv_obj_set_pos(cover_, 16, 44);
+            lv_obj_set_style_bg_color(cover_, lv_color_hex(0xE8EEE0), LV_PART_MAIN);
+            lv_obj_set_style_radius(cover_, 10, LV_PART_MAIN);
+            lv_obj_set_style_border_width(cover_, 0, LV_PART_MAIN);
+            lv_obj_remove_flag(cover_, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_t* n = lbl(cover_, &lv_font_montserrat_28, 0x55853A, 0, 0, LV_SYMBOL_AUDIO);
+            lv_obj_center(n);
+        }
+
+        const int RX = 152, RW = 154;
+        title_ = lbl(root_, F20(), 0x141A10, RX, 48, g_state.title);
+        lv_label_set_long_mode(title_, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(title_, RW);
+        // 定宽不够,还要定高。LONG_DOT 在高度不受限时会先换行再省略,
+        // 长标题会一路长下去把艺术家和进度条压在底下。
+        lv_obj_set_height(title_, 52);
+
+        artist_ = lbl(root_, F16(), 0x6A7360, RX, 104, g_state.artist);
+        lv_label_set_long_mode(artist_, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(artist_, RW);
+        lv_obj_set_height(artist_, 22);
+
+        lv_obj_t* track = lv_obj_create(root_);
+        lv_obj_set_size(track, RW, 4);
+        lv_obj_set_pos(track, RX, 134);
+        lv_obj_set_style_bg_color(track, lv_color_hex(0xDDE3D4), LV_PART_MAIN);
+        lv_obj_set_style_radius(track, 2, LV_PART_MAIN);
+        lv_obj_set_style_border_width(track, 0, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(track, 0, LV_PART_MAIN);
+        lv_obj_remove_flag(track, LV_OBJ_FLAG_SCROLLABLE);
+
+        bar_fill_ = lv_obj_create(track);
+        lv_obj_set_size(bar_fill_, 0, 4);
+        lv_obj_set_pos(bar_fill_, 0, 0);
+        lv_obj_set_style_bg_color(bar_fill_, lv_color_hex(0x55853A), LV_PART_MAIN);
+        lv_obj_set_style_radius(bar_fill_, 2, LV_PART_MAIN);
+        lv_obj_set_style_border_width(bar_fill_, 0, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(bar_fill_, 0, LV_PART_MAIN);
+
+        t_cur_ = lbl(root_, &lv_font_montserrat_14, 0x6A7360, RX, 144, "0:00");
+        t_tot_ = lbl(root_, &lv_font_montserrat_14, 0x6A7360, RX + RW - 34, 144, "0:00");
+
+        // 传输控件。做成真按钮而不是标签 —— 触摸能点,不用非得走轨迹球
+        btn_play_ = mk_btn(120, 178, 56, LV_SYMBOL_PAUSE, [](lv_event_t* e) {
+            auto* s = static_cast<MusicApp*>(lv_event_get_user_data(e));
+            s->toggle();
+        });
+        mk_btn(56,  182, 44, LV_SYMBOL_PREV, [](lv_event_t* e) {
+            static_cast<MusicApp*>(lv_event_get_user_data(e))->skip(-1);
+        });
+        mk_btn(204, 182, 44, LV_SYMBOL_NEXT, [](lv_event_t* e) {
+            static_cast<MusicApp*>(lv_event_get_user_data(e))->skip(1);
+        });
+        mk_btn(272, 182, 40, LV_SYMBOL_LIST, [](lv_event_t* e) {
+            static_cast<MusicApp*>(lv_event_get_user_data(e))->show_library();
+        });
+
+        lbl(root_, &lv_font_montserrat_14, 0x8A9480, 16, 14, "NOW PLAYING");
+        on_tick();
+    }
+
+    lv_obj_t* mk_btn(int cx, int cy, int d, const char* sym, lv_event_cb_t cb)
+    {
+        lv_obj_t* b = lv_obj_create(root_);
+        lv_obj_set_size(b, d, d);
+        lv_obj_set_pos(b, cx - d / 2, cy - d / 2);
+        lv_obj_set_style_radius(b, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(b, lv_color_hex(d >= 56 ? 0x55853A : 0xEDF1E7), LV_PART_MAIN);
+        lv_obj_set_style_border_width(b, 0, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(b, 0, LV_PART_MAIN);
+        lv_obj_remove_flag(b, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(b, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, this);
+        lv_obj_t* s = lbl(b, &lv_font_montserrat_20, d >= 56 ? 0xFFFFFF : 0x55853A, 0, 0, sym);
+        lv_obj_center(s);
+        return b;
+    }
+
+    void on_tick()
+    {
+        if (view_ != View::NowPlaying || !bar_fill_) {
+            if (view_ == View::Library) paint_playing();
+            return;
+        }
+        int dur = g_state.dur_s > 0 ? g_state.dur_s : 1;
+        int w = 154 * g_state.pos_s / dur;
+        if (w > 154) w = 154;
+        lv_obj_set_width(bar_fill_, w);
+        char b[16];
+        snprintf(b, sizeof(b), "%d:%02d", g_state.pos_s / 60, g_state.pos_s % 60);
+        lv_label_set_text(t_cur_, b);
+        snprintf(b, sizeof(b), "%d:%02d", g_state.dur_s / 60, g_state.dur_s % 60);
+        lv_label_set_text(t_tot_, b);
+        if (btn_play_) {
+            lv_obj_t* s = lv_obj_get_child(btn_play_, 0);
+            if (s) lv_label_set_text(s, g_state.playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+        }
+    }
+
+    void toggle()
+    {
+        if (g_state.playing) { stop_playback(); }
+        else if (playing_idx_ >= 0) { play_index(playing_idx_); }
+        on_tick();
+    }
+
+    void skip(int d)
+    {
+        if (g_state.n_songs == 0) return;
+        int n = playing_idx_ < 0 ? 0 : (playing_idx_ + d + g_state.n_songs) % g_state.n_songs;
+        stop_playback();
+        play_index(n);
+        show_now();
+    }
+
+    void play_index(int i)
+    {
+        if (i < 0 || i >= g_state.n_songs) return;
+        char u[400];
+        snprintf(u, sizeof(u), MUSIC_BASE_URL "/audio?f=%s.opus&key=" MUSIC_TOKEN, g_songs[i].key);
+        start_play(u, g_songs[i].title, g_songs[i].artist, g_songs[i].dur, g_songs[i].key);
+        playing_idx_ = i;
+    }
+
+    bool now_input(const tdeck::InputEvent& ev)
+    {
+        switch (ev.key) {
+        case tdeck::Key::Enter: toggle();          return true;
+        case tdeck::Key::Left:  skip(-1);          return true;
+        case tdeck::Key::Right: skip(1);           return true;
+        case tdeck::Key::Down:  show_library();    return true;
+        default: return false;
+        }
+    }
+
+    // ── 曲库 ──────────────────────────────────────────────
+    void show_library()
+    {
+        view_ = View::Library;
+        lv_obj_clean(root_); clear_refs();
+        lbl(root_, &lv_font_montserrat_14, 0x8A9480, 16, 14, "LIBRARY");
+
+        if (g_state.playing) {
+            // 顶部一条"正在播放",点了回到播放页 —— 手机音乐 app 的标配
+            lv_obj_t* mini = lv_obj_create(root_);
+            lv_obj_set_size(mini, SCR_W - 28, 30);
+            lv_obj_set_pos(mini, 14, 34);
+            lv_obj_set_style_bg_color(mini, lv_color_hex(0xE8EEE0), LV_PART_MAIN);
+            lv_obj_set_style_radius(mini, 8, LV_PART_MAIN);
+            lv_obj_set_style_border_width(mini, 0, LV_PART_MAIN);
+            lv_obj_set_style_pad_all(mini, 0, LV_PART_MAIN);
+            lv_obj_remove_flag(mini, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(mini, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(mini, [](lv_event_t* e) {
+                static_cast<MusicApp*>(lv_event_get_user_data(e))->show_now();
+            }, LV_EVENT_CLICKED, this);
+            lv_obj_t* l = lbl(mini, F16(), 0x55853A, 10, 5, g_state.title);
+            lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+            lv_obj_set_width(l, 240);
+            lbl(mini, &lv_font_montserrat_16, 0x55853A, SCR_W - 60, 5, LV_SYMBOL_PLAY);
+        }
+
+        int top = g_state.playing ? 70 : 34;
+        search_row_ = lv_obj_create(root_);
+        lv_obj_set_size(search_row_, SCR_W - 28, 30);
+        lv_obj_set_pos(search_row_, 14, top);
+        lv_obj_set_style_bg_color(search_row_, lv_color_hex(0xF4F6F0), LV_PART_MAIN);
+        lv_obj_set_style_radius(search_row_, 8, LV_PART_MAIN);
+        lv_obj_set_style_border_width(search_row_, 1, LV_PART_MAIN);
+        lv_obj_set_style_border_color(search_row_, lv_color_hex(0xD2DAC4), LV_PART_MAIN);
+        lv_obj_set_style_pad_all(search_row_, 0, LV_PART_MAIN);
+        lv_obj_remove_flag(search_row_, LV_OBJ_FLAG_SCROLLABLE);
+        lbl(search_row_, F16(), 0x6A7360, 10, 5, LV_SYMBOL_PLUS "  Search a song");
+
+        list_ = lv_obj_create(root_);
+        lv_obj_set_size(list_, SCR_W - 28, SCR_H - top - 44);
+        lv_obj_set_pos(list_, 14, top + 38);
+        lv_obj_set_style_bg_opa(list_, LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_set_style_border_width(list_, 0, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(list_, 0, LV_PART_MAIN);
+        lv_obj_set_scroll_dir(list_, LV_DIR_VER);
+        lv_obj_set_scrollbar_mode(list_, LV_SCROLLBAR_MODE_OFF);
+
+        for (int i = 0; i < g_state.n_songs; i++) {
+            lv_obj_t* r = lv_obj_create(list_);
+            lv_obj_set_size(r, SCR_W - 32, 42);
+            lv_obj_set_pos(r, 0, i * 46);
+            lv_obj_set_style_bg_color(r, lv_color_hex(0xF4F6F0), LV_PART_MAIN);
+            lv_obj_set_style_radius(r, 8, LV_PART_MAIN);
+            lv_obj_set_style_border_width(r, 1, LV_PART_MAIN);
+            lv_obj_set_style_pad_all(r, 0, LV_PART_MAIN);
+            lv_obj_remove_flag(r, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_set_user_data(r, (void*)(intptr_t)i);
+            lv_obj_add_flag(r, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(r, [](lv_event_t* e) {
+                auto* s = static_cast<MusicApp*>(lv_event_get_user_data(e));
+                int idx = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target_obj(e));
+                s->stop_and_play(idx);
+            }, LV_EVENT_CLICKED, this);
+
+            lv_obj_t* tl = lbl(r, F16(), 0x1B2117, 10, 2, g_songs[i].title);
+            lv_label_set_long_mode(tl, LV_LABEL_LONG_DOT); lv_obj_set_width(tl, 220);
+            lv_obj_t* al = lbl(r, F16(), 0x8A9480, 10, 21, g_songs[i].artist);
+            lv_label_set_long_mode(al, LV_LABEL_LONG_DOT); lv_obj_set_width(al, 220);
+            char d[16];
+            snprintf(d, sizeof(d), "%d:%02d", g_songs[i].dur / 60, g_songs[i].dur % 60);
+            lbl(r, &lv_font_montserrat_14, 0x8A9480, SCR_W - 66, 12, d);
+            play_mark_[i] = lbl(r, &lv_font_montserrat_16, 0x55853A, SCR_W - 92, 11, LV_SYMBOL_PLAY);
+            lv_obj_add_flag(play_mark_[i], LV_OBJ_FLAG_HIDDEN);
+            rows_[i] = r;
+        }
+        paint(); paint_playing();
+    }
+
+    void stop_and_play(int i)
+    {
+        stop_playback();
+        play_index(i);
+        show_now();
+    }
+
+    void paint()
+    {
+        if (search_row_) {
+            bool on = (sel_ < 0);
+            lv_obj_set_style_border_color(search_row_,
+                lv_color_hex(on ? 0x55853A : 0xD2DAC4), LV_PART_MAIN);
+            lv_obj_set_style_border_width(search_row_, on ? 2 : 1, LV_PART_MAIN);
+        }
+        for (int i = 0; i < g_state.n_songs; i++) {
+            if (!rows_[i]) continue;
+            bool on = (i == sel_);
+            lv_obj_set_style_border_color(rows_[i],
+                lv_color_hex(on ? 0x55853A : 0xE0E5D8), LV_PART_MAIN);
+            lv_obj_set_style_border_width(rows_[i], on ? 2 : 1, LV_PART_MAIN);
+        }
+        if (sel_ >= 0 && g_state.n_songs && rows_[sel_])
+            lv_obj_scroll_to_view(rows_[sel_], LV_ANIM_ON);
+    }
+
+    void paint_playing()
+    {
+        for (int i = 0; i < g_state.n_songs; i++) {
+            if (!play_mark_[i]) continue;
+            bool on = (i == playing_idx_ && g_state.playing);
+            if (on) lv_obj_remove_flag(play_mark_[i], LV_OBJ_FLAG_HIDDEN);
+            else    lv_obj_add_flag(play_mark_[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    bool lib_input(const tdeck::InputEvent& ev)
+    {
         if (g_state.n_songs == 0) {
             if (ev.key == tdeck::Key::Enter) { enter_search(0); return true; }
             return false;
@@ -369,68 +772,52 @@ public:
         case tdeck::Key::Up:   if (sel_ > -1) { sel_--; paint(); } return true;
         case tdeck::Key::Down: if (sel_ < g_state.n_songs - 1) { sel_++; paint(); } return true;
         case tdeck::Key::Enter:
-            // sel_ == -1 是列表顶上的搜索行。
-            // 原来做的是"打字即搜索",但 s 会弹快捷键浮层、n 会退出应用
-            // (ADR-006 的系统保留键),常见歌名根本起不了头。
-            // 显式入口不依赖任何字母,反而更可靠。
             if (sel_ < 0) { enter_search(0); return true; }
-            if (g_state.playing) { stop_playback(); return true; }
-            {
-                char u[400];
-                snprintf(u, sizeof(u), MUSIC_BASE_URL "/audio?f=%s.opus&key=" MUSIC_TOKEN,
-                         g_songs[sel_].key);
-                start_play(u, g_songs[sel_].title, g_songs[sel_].artist, g_songs[sel_].dur);
-            }
+            stop_and_play(sel_);
             return true;
-
         default: return false;
         }
     }
 
-private:
+    // ── 搜索 ──────────────────────────────────────────────
     void enter_search(char first)
     {
-        searching_ = true;
+        view_ = View::Search;
         q_len_ = 0; q_[0] = 0;
         if (first) { q_[q_len_++] = first; q_[q_len_] = 0; }
-        lv_obj_clean(root_);
-        mk(root_, F20(), C_TEXT, 14, 10, "Search");
+        lv_obj_clean(root_); clear_refs();
+        lbl(root_, &lv_font_montserrat_14, 0x8A9480, 16, 14, "SEARCH");
 
         lv_obj_t* box = lv_obj_create(root_);
-        lv_obj_set_size(box, SCR_W - 24, 46);
-        lv_obj_set_pos(box, 12, 44);
-        lv_obj_set_style_bg_color(box, lv_color_hex(C_CARD), LV_PART_MAIN);
+        lv_obj_set_size(box, SCR_W - 28, 46);
+        lv_obj_set_pos(box, 14, 44);
+        lv_obj_set_style_bg_color(box, lv_color_hex(0xF4F6F0), LV_PART_MAIN);
         lv_obj_set_style_radius(box, 10, LV_PART_MAIN);
         lv_obj_set_style_border_width(box, 2, LV_PART_MAIN);
-        lv_obj_set_style_border_color(box, lv_color_hex(C_ACCENT), LV_PART_MAIN);
+        lv_obj_set_style_border_color(box, lv_color_hex(0x55853A), LV_PART_MAIN);
         lv_obj_set_style_pad_all(box, 0, LV_PART_MAIN);
         lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
-        q_lbl_ = mk(box, F20(), C_TEXT, 12, 11, q_);
+        q_lbl_ = lbl(box, F20(), 0x1B2117, 12, 11, q_);
 
-        sr_ = mk(root_, &lv_font_montserrat_14, C_MUTE, 14, 104,
-                 "type a song name, Enter to play");
-        mk(root_, &lv_font_montserrat_14, C_MUTE, 14, SCR_H - 24,
-           "Enter: play      ESC: back");
+        sr_ = lbl(root_, F16(), 0x8A9480, 16, 104, "type a song name, Enter to play");
+        lbl(root_, &lv_font_montserrat_14, 0x9AA490, 16, SCR_H - 24, "Enter: play      ESC: back");
     }
 
     bool search_input(const tdeck::InputEvent& ev)
     {
-        if (ev.key == tdeck::Key::Back) { searching_ = false; lv_obj_clean(root_);
-            mk(root_, F20(), C_TEXT, 14, 10, "Music"); build_list(); return true; }
+        if (ev.key == tdeck::Key::Back) { show_library(); return true; }
         if (ev.key == tdeck::Key::Enter) {
             if (!q_len_) return true;
             lv_label_set_text(sr_, "searching...");
-            lv_refr_now(nullptr);
-            // 搜索是阻塞 HTTP(服务端可能要现去下载),丢到任务里做,
-            // 否则 LVGL 卡住几十秒,看起来像死机
             static char qcopy[128];
             strncpy(qcopy, q_, sizeof(qcopy) - 1);
-            self_ = this;
             xTaskCreate([](void*) {
                 bool ok = search_and_play(qcopy);
                 lvgl_port_lock(0);
-                if (self_ && self_->sr_)
-                    lv_label_set_text(self_->sr_, ok ? "playing" : "not found");
+                if (self_ && self_->root_) {
+                    if (ok) self_->show_now();
+                    else if (self_->sr_) lv_label_set_text(self_->sr_, "not found");
+                }
                 lvgl_port_unlock();
                 vTaskDelete(nullptr);
             }, "music_search", 8192, nullptr, 4, nullptr);
@@ -447,81 +834,16 @@ private:
         return false;
     }
 
-    void build_list()
-    {
-        if (!root_) return;
-        if (loading_) { lv_obj_delete(loading_); loading_ = nullptr; }
-        if (g_state.n_songs == 0) {
-            mk(root_, &lv_font_montserrat_16, C_MUTE, 14, 50, "no tracks (check network)");
-            return;
-        }
-        // 搜索行固定在列表上方,不随列表滚动 —— 它是个功能入口不是一条数据
-        search_row_ = lv_obj_create(root_);
-        lv_obj_set_size(search_row_, SCR_W - 24, 32);
-        lv_obj_set_pos(search_row_, 12, 36);
-        lv_obj_set_style_bg_color(search_row_, lv_color_hex(C_CARD), LV_PART_MAIN);
-        lv_obj_set_style_radius(search_row_, 8, LV_PART_MAIN);
-        lv_obj_set_style_border_width(search_row_, 1, LV_PART_MAIN);
-        lv_obj_set_style_pad_all(search_row_, 0, LV_PART_MAIN);
-        lv_obj_remove_flag(search_row_, LV_OBJ_FLAG_SCROLLABLE);
-        mk(search_row_, F16(), C_MUTE, 10, 6, LV_SYMBOL_PLUS "  Search a song");
-
-        list_ = lv_obj_create(root_);
-        lv_obj_set_size(list_, SCR_W - 24, 152);
-        lv_obj_set_pos(list_, 12, 74);
-        lv_obj_set_style_bg_opa(list_, LV_OPA_TRANSP, LV_PART_MAIN);
-        lv_obj_set_style_border_width(list_, 0, LV_PART_MAIN);
-        lv_obj_set_style_pad_all(list_, 0, LV_PART_MAIN);
-        lv_obj_set_scroll_dir(list_, LV_DIR_VER);
-        lv_obj_set_scrollbar_mode(list_, LV_SCROLLBAR_MODE_OFF);
-
-        for (int i = 0; i < g_state.n_songs; i++) {
-            lv_obj_t* r = lv_obj_create(list_);
-            lv_obj_set_size(r, SCR_W - 28, 46);
-            lv_obj_set_pos(r, 0, i * 50);
-            lv_obj_set_style_bg_color(r, lv_color_hex(C_CARD), LV_PART_MAIN);
-            lv_obj_set_style_radius(r, 8, LV_PART_MAIN);
-            lv_obj_set_style_border_width(r, 1, LV_PART_MAIN);
-            lv_obj_set_style_pad_all(r, 0, LV_PART_MAIN);
-            lv_obj_remove_flag(r, LV_OBJ_FLAG_SCROLLABLE);
-
-            lv_obj_t* t = mk(r, F16(), C_TEXT, 10, 3, g_songs[i].title);
-            lv_label_set_long_mode(t, LV_LABEL_LONG_DOT);
-            lv_obj_set_width(t, 230);
-            lv_obj_t* a = mk(r, F16(), C_MUTE, 10, 22, g_songs[i].artist);
-            lv_label_set_long_mode(a, LV_LABEL_LONG_DOT);
-            lv_obj_set_width(a, 230);
-
-            char d[16];
-            snprintf(d, sizeof(d), "%d:%02d", g_songs[i].dur / 60, g_songs[i].dur % 60);
-            mk(r, &lv_font_montserrat_14, C_MUTE, SCR_W - 70, 15, d);
-            rows_[i] = r;
-        }
-        paint();
-    }
-
-    void paint()
-    {
-        if (search_row_) {
-            bool on = (sel_ < 0);
-            lv_obj_set_style_border_color(search_row_, lv_color_hex(on ? C_ACCENT : C_LINE), LV_PART_MAIN);
-            lv_obj_set_style_border_width(search_row_, on ? 2 : 1, LV_PART_MAIN);
-        }
-        for (int i = 0; i < g_state.n_songs; i++) {
-            bool on = (i == sel_);
-            lv_obj_set_style_border_color(rows_[i], lv_color_hex(on ? C_ACCENT : C_LINE), LV_PART_MAIN);
-            lv_obj_set_style_border_width(rows_[i], on ? 2 : 1, LV_PART_MAIN);
-        }
-        if (sel_ >= 0 && g_state.n_songs) lv_obj_scroll_to_view(rows_[sel_], LV_ANIM_ON);
-    }
-
-    lv_obj_t* root_ = nullptr, *list_ = nullptr, *loading_ = nullptr;
+    lv_obj_t* root_ = nullptr, *list_ = nullptr, *search_row_ = nullptr;
+    lv_obj_t* q_lbl_ = nullptr, *sr_ = nullptr;
+    lv_obj_t* cover_ = nullptr, *title_ = nullptr, *artist_ = nullptr;
+    lv_obj_t* bar_fill_ = nullptr, *t_cur_ = nullptr, *t_tot_ = nullptr, *btn_play_ = nullptr;
     lv_obj_t* rows_[MAX_SONGS] = {};
-    lv_obj_t* q_lbl_ = nullptr, *sr_ = nullptr, *search_row_ = nullptr;
-    char      q_[128] = {};
-    int       q_len_ = 0;
-    bool      searching_ = false;
-    int       sel_ = 0;
+    lv_obj_t* play_mark_[MAX_SONGS] = {};
+    lv_timer_t* tick_ = nullptr;
+    char q_[128] = {};
+    int  q_len_ = 0, sel_ = 0, playing_idx_ = -1;
+    View view_ = View::Library;
     static MusicApp* self_;
 };
 

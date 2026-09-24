@@ -52,6 +52,10 @@ CONFIG_LV_USE_DRAW_SW_COMPLEX_GRADIENTS=y
 # 截图接口要用(默认关)
 CONFIG_LV_USE_SNAPSHOT=y
 
+# 专辑封面是 JPEG。服务端能按尺寸裁好再发(/cover?w=&h=),
+# 所以设备侧只要能解基线 JPEG 就够,不用 libjpeg-turbo 那种大家伙。
+CONFIG_LV_USE_TJPGD=y
+
 
 
 

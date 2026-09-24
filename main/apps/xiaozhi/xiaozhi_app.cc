@@ -17,10 +17,12 @@
 
 namespace {
 
-constexpr uint32_t C_BG     = 0x0E1309;
-constexpr uint32_t C_TEXT   = 0xE8EFE0;
-constexpr uint32_t C_MUTE   = 0x8FA37C;
-constexpr uint32_t C_ACCENT = 0xA8E063;
+// 背景跟随整机的浅色系。只有【脸本身】是深色 —— 亮绿的眼睛需要深底才发得出光,
+// 那是一个 150px 的圆,不构成大面积深色,不会把背光漏光衬出来。
+constexpr uint32_t C_BG     = 0xFFFFFF;
+constexpr uint32_t C_TEXT   = 0x1B2117;
+constexpr uint32_t C_MUTE   = 0x8A9480;
+constexpr uint32_t C_ACCENT = 0x55853A;
 constexpr int SCR_W = 320, SCR_H = 240;
 
 class XiaozhiApp : public tdeck::App {
@@ -42,9 +44,6 @@ public:
         lv_obj_set_style_bg_color(root, lv_color_hex(C_BG), LV_PART_MAIN);
         lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
 
-        // 深色背景是这里唯一的例外:整机是浅色主题(浅色压得住背光漏光),
-        // 但小智是一张脸 —— 亮绿的眼睛只有在深底上才发得出光。
-        // 这块界面也几乎没有大面积留白,漏光没有显形的余地。
         avatar_.create(root_, SCR_W / 2, 96, 150);
 
         status_ = lv_label_create(root_);
