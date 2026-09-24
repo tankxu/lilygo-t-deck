@@ -100,6 +100,14 @@ esp_err_t tdeck_mic_stop(void);
 void      tdeck_mic_set_gain(float db);   // ES7210 模拟前端增益,默认 30dB
 bool      tdeck_mic_running(void);
 
+// 上电自检:录 ms 毫秒算 RMS 并打一行日志。返回 RMS,失败返回 -1。
+// RMS 恒为 0 = ES7210 的 MIC 选通选错了通道(现象是"一切正常、就是静音")。
+int       tdeck_mic_probe_rms(uint32_t ms);
+
+// 手动指定 ES7210 的麦克风选通和取哪个 I2S slot。probe 会自己找,
+// 找到之后把结果写死在这里可以省掉每次开机 0.5 秒的探测。
+esp_err_t tdeck_mic_select(uint8_t mic_mask, uint8_t slot);
+
 // 阻塞读录音。返回实际读到的字节数,失败返回负数。
 int tdeck_mic_read(int16_t* buf, size_t samples, uint32_t timeout_ms);
 

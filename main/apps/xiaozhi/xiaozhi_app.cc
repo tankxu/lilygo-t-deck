@@ -149,9 +149,18 @@ public:
 
     void on_exit() override
     {
-        // 只收起面板。内核、连接、音频线程全部继续活着 —— 这是 ADR-004 的核心。
+        // 只收起【整页】。内核、连接、音频线程全部继续活着 —— 这是 ADR-004 的核心。
         in_app_ = false;
-        hide();
+
+        // 正在对话时切走,不是关掉它,而是【降级成悬浮窗】:
+        // 话说到一半因为用户去开了个别的 app 就消失,是最让人恼火的一种交互。
+        // 真正空闲了才整个收起来。
+        using S = xz::State;
+        auto s = xz::state();
+        if (s == S::Listening || s == S::Speaking || s == S::Connecting || s == S::Activating)
+            show(Mode::Overlay);
+        else
+            hide();
     }
 
     bool on_input(const tdeck::InputEvent& ev) override

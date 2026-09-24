@@ -22,6 +22,10 @@ TdeckAudioCodec::TdeckAudioCodec(int input_sample_rate, int output_sample_rate) 
     // 麦克风常开会一直占着 I2S_NUM_1 的 DMA 和 ES7210 的模拟电流。
     tdeck_mic_init((uint32_t)input_sample_rate_);
     tdeck_mic_set_gain(input_gain_);
+
+    // 录 150ms 自检。没有它的话,"麦克风到底通不通"要等到跟服务器对上话、
+    // 而且对方一直听不见你说什么的时候才会被怀疑 —— 那时候可疑的东西太多了。
+    tdeck_mic_probe_rms(150);
 }
 
 TdeckAudioCodec::~TdeckAudioCodec() {

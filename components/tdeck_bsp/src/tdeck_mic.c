@@ -27,6 +27,8 @@
 #include <esp_codec_dev.h>
 #include <esp_codec_dev_defaults.h>
 #include <esp_log.h>
+#include <math.h>
+#include <stdlib.h>
 
 static const char* TAG = "tdeck_mic";
 
@@ -46,6 +48,10 @@ static const audio_codec_if_t*       s_codec_if;
 static esp_codec_dev_handle_t        s_dev;
 static uint32_t                      s_rate;
 static bool                          s_running;
+// ES7210 上哪一路接着 T-Deck 那颗麦克风,板子没有任何文档说。默认按最常见的
+// MIC1+MIC2 来,探测不到声音时 tdeck_mic_probe_rms 会把四种组合都试一遍。
+static uint8_t                       s_mic_mask = ES7210_SEL_MIC1 | ES7210_SEL_MIC2;
+static uint8_t                       s_slot;      // 取 I2S 的哪个 slot(0=左 1=右)
 // 模拟前端增益(dB)。30dB 是 esp-box / korvo 上验证过的驻极体麦克风起点。
 static float                         s_gain_db = 30.0f;
 
@@ -119,10 +125,10 @@ esp_err_t tdeck_mic_init(uint32_t sample_rate)
 
     es7210_codec_cfg_t es_cfg = {
         .ctrl_if      = s_ctrl_if,
-        .master_mode  = false,                                 // ESP 出时钟,ES7210 当从
-        .mic_selected = ES7210_SEL_MIC1 | ES7210_SEL_MIC2,     // 见文件头注释 3
+        .master_mode  = false,                // ESP 出时钟,ES7210 当从
+        .mic_selected = s_mic_mask,           // 见文件头注释 3
         .mclk_src     = ES7210_MCLK_FROM_PAD,
-        .mclk_div     = 0,                                     // 0 = 用默认的 256
+        .mclk_div     = 0,                    // 0 = 用默认的 256
     };
     s_codec_if = es7210_codec_new(&es_cfg);
     ESP_RETURN_ON_FALSE(s_codec_if, ESP_FAIL, TAG, "ES7210 初始化失败(检查 I2C 0x40)");
@@ -152,7 +158,7 @@ esp_err_t tdeck_mic_start(void)
     esp_codec_dev_sample_info_t fs = {
         .bits_per_sample = 16,
         .channel         = 2,
-        .channel_mask    = ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0),
+        .channel_mask    = ESP_CODEC_DEV_MAKE_CHANNEL_MASK(s_slot),
         .sample_rate     = s_rate,
         .mclk_multiple   = I2S_MCLK_MULTIPLE_256,
     };
@@ -161,7 +167,7 @@ esp_err_t tdeck_mic_start(void)
         ESP_LOGE(TAG, "麦克风打开失败 %d", r);
         return ESP_FAIL;
     }
-    esp_codec_dev_set_in_channel_gain(s_dev, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0), s_gain_db);
+    esp_codec_dev_set_in_channel_gain(s_dev, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(s_slot), s_gain_db);
     s_running = true;
     ESP_LOGI(TAG, "开始采集 %" PRIu32 "Hz,增益 %.0fdB", s_rate, s_gain_db);
     return ESP_OK;
@@ -179,13 +185,142 @@ void tdeck_mic_set_gain(float db)
 {
     s_gain_db = db;
     if (s_running) {
-        esp_codec_dev_set_in_channel_gain(s_dev, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0), db);
+        esp_codec_dev_set_in_channel_gain(s_dev, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(s_slot), db);
     }
 }
 
 bool tdeck_mic_running(void)
 {
     return s_running;
+}
+
+// 换一种"哪颗 MIC / 哪个 slot"的组合。I2S 通道和 I2C 控制接口不动,
+// 只重建 es7210 的 codec 对象 —— mic_selected 是 es7210_codec_new 时写进寄存器的,
+// 改它必须重新 new 一次。
+esp_err_t tdeck_mic_select(uint8_t mic_mask, uint8_t slot)
+{
+    if (!s_dev) return ESP_ERR_INVALID_STATE;
+    if (mic_mask == s_mic_mask && slot == s_slot) return ESP_OK;
+
+    bool was_running = s_running;
+    if (s_running) tdeck_mic_stop();
+    esp_codec_dev_delete(s_dev);
+    audio_codec_delete_codec_if(s_codec_if);
+
+    s_mic_mask = mic_mask;
+    s_slot     = slot;
+
+    es7210_codec_cfg_t es_cfg = {
+        .ctrl_if      = s_ctrl_if,
+        .master_mode  = false,
+        .mic_selected = s_mic_mask,
+        .mclk_src     = ES7210_MCLK_FROM_PAD,
+        .mclk_div     = 0,
+    };
+    s_codec_if = es7210_codec_new(&es_cfg);
+    ESP_RETURN_ON_FALSE(s_codec_if, ESP_FAIL, TAG, "ES7210 重配失败");
+
+    esp_codec_dev_cfg_t dev_cfg = {
+        .dev_type = ESP_CODEC_DEV_TYPE_IN,
+        .codec_if = s_codec_if,
+        .data_if  = s_data_if,
+    };
+    s_dev = esp_codec_dev_new(&dev_cfg);
+    ESP_RETURN_ON_FALSE(s_dev, ESP_FAIL, TAG, "codec_dev 重建失败");
+
+    if (was_running) tdeck_mic_start();
+    return ESP_OK;
+}
+
+// 录一段算 RMS。内部用,不开关通道。
+static int measure_rms(uint32_t ms, int* out_peak)
+{
+    const size_t N = 512;
+    int16_t* buf = malloc(N * sizeof(int16_t));
+    if (!buf) return -1;
+    uint32_t frames = (ms * s_rate / 1000) / N;
+    if (frames == 0) frames = 1;
+    double acc = 0; size_t n = 0; int peak = 0;
+    for (uint32_t f = 0; f < frames; f++) {
+        if (tdeck_mic_read(buf, N, 500) <= 0) break;
+        for (size_t i = 0; i < N; i++) {
+            acc += (double)buf[i] * buf[i];
+            int a = buf[i] < 0 ? -buf[i] : buf[i];
+            if (a > peak) peak = a;
+        }
+        n += N;
+    }
+    free(buf);
+    if (out_peak) *out_peak = peak;
+    return n ? (int)sqrt(acc / n) : -1;
+}
+
+int tdeck_mic_probe_rms(uint32_t ms)
+{
+    // 上电自检:录一小段算 RMS。
+    //
+    // 为什么值得单独做一个:ES7210 有四路麦克风输入,T-Deck 只焊了一颗,
+    // 但板子没说它接在哪一路。选错了的表现是【一切正常、只是永远静音】——
+    // I2C 认得到芯片、I2S 收得到数据、上层跑得好好的,就是全 0。
+    // 这条日志把"选对没有"从"跟服务器对完话才知道"提前到了开机 5 秒。
+    //
+    // 默认那组读不到东西时,把四种组合(MIC1/2 与 MIC3/4 x 左/右 slot)都试一遍,
+    // 谁有信号就留谁 —— 省掉"改一行、编译、烧录、再听"的四轮来回。
+    if (!s_dev) return -1;
+
+    // 先确认 I2C 这一侧是通的:扫一遍总线,再读 ES7210 的芯片 ID(0xFD/0xFE = 0x72 0x10)。
+    // 读不到就不用往下猜通道了 —— 问题在 I2C 或者外设电源,不在选通。
+    // 扫描顺带验证扫描本身:键盘 0x55 和触摸 GT911 0x5D 一定在,
+    // 它们都没出现就说明是总线/电源的事,跟 ES7210 无关。
+    {
+        i2c_master_bus_handle_t bus = tdeck_i2c_bus();
+        char line[128]; int n = 0;
+        line[0] = 0;
+        for (uint8_t a = 0x08; a < 0x78 && n < 100; a++) {
+            if (i2c_master_probe(bus, a, 50) == ESP_OK)   // 第三参是毫秒不是 tick
+                n += snprintf(line + n, sizeof(line) - n, "0x%02X ", a);
+        }
+        ESP_LOGI(TAG, "I2C 总线上的器件:%s", n ? line : "(一个都没有)");
+    }
+
+    int id_hi = 0, id_lo = 0;
+    esp_codec_dev_read_reg(s_dev, 0xFD, &id_hi);
+    esp_codec_dev_read_reg(s_dev, 0xFE, &id_lo);
+    ESP_LOGI(TAG, "ES7210 芯片 ID = 0x%02X%02X(应为 0x7210)", id_hi & 0xFF, id_lo & 0xFF);
+
+    bool was_running = s_running;
+    if (!was_running && tdeck_mic_start() != ESP_OK) return -1;
+
+    int peak = 0;
+    int rms = measure_rms(ms, &peak);
+    ESP_LOGI(TAG, "录音自检:MIC%s slot%d → RMS=%d 峰值=%d",
+             s_mic_mask == (ES7210_SEL_MIC1 | ES7210_SEL_MIC2) ? "1/2" : "3/4", s_slot, rms, peak);
+
+    if (rms <= 0) {
+        // 默认组合是哑的,把其它三种试一遍
+        const struct { uint8_t mask; uint8_t slot; const char* name; } combos[] = {
+            { ES7210_SEL_MIC1 | ES7210_SEL_MIC2, 1, "MIC1/2 slot1" },
+            { ES7210_SEL_MIC3 | ES7210_SEL_MIC4, 0, "MIC3/4 slot0" },
+            { ES7210_SEL_MIC3 | ES7210_SEL_MIC4, 1, "MIC3/4 slot1" },
+        };
+        for (size_t i = 0; i < sizeof(combos) / sizeof(combos[0]); i++) {
+            if (tdeck_mic_select(combos[i].mask, combos[i].slot) != ESP_OK) continue;
+            int p = 0, r = measure_rms(ms, &p);
+            ESP_LOGI(TAG, "录音自检:%s → RMS=%d 峰值=%d", combos[i].name, r, p);
+            if (r > 0) { rms = r; peak = p; break; }
+        }
+    }
+
+    if (rms <= 0) {
+        ESP_LOGW(TAG, "四种通道组合全是 0 —— 不是选通问题,查 MCLK(GPIO48)、"
+                      "ES7210 供电,或者这块板子的麦克风根本没焊");
+    } else {
+        ESP_LOGI(TAG, "麦克风可用:MIC%s slot%d",
+                 s_mic_mask == (ES7210_SEL_MIC1 | ES7210_SEL_MIC2) ? "1/2" : "3/4", s_slot);
+    }
+
+    if (!was_running) tdeck_mic_stop();
+    return rms;
 }
 
 int tdeck_mic_read(int16_t* buf, size_t samples, uint32_t timeout_ms)
