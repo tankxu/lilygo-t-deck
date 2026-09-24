@@ -492,6 +492,31 @@ public:
     uint32_t    accent() const override { return 0x55853A; }
     bool wants_raw_keys() const override { return view_ == View::Search; }
 
+    // 快捷键一律进 s 那张表,不画在界面上(见 app.h 的 Shortcut 注释)。
+    int shortcuts(const tdeck::Shortcut** out) const override
+    {
+        static const tdeck::Shortcut lib[] = {
+            { "y / click", "play selected" },
+            { "ball U/D",  "pick a song" },
+        };
+        static const tdeck::Shortcut now[] = {
+            { "y / click", "play / pause" },
+            { "ball L/R",  "prev / next" },
+            { "ball down", "back to list" },
+        };
+        static const tdeck::Shortcut sea[] = {
+            { "type",      "song name" },
+            { "enter",     "search and play" },
+            { "esc",       "back to list" },
+        };
+        switch (view_) {
+        case View::Library:    *out = lib; return 2;
+        case View::NowPlaying: *out = now; return 3;
+        case View::Search:     *out = sea; return 3;
+        }
+        return 0;
+    }
+
     // 卡片是入口不是挂件:一排静态均衡器条,靠形状认出这是音乐
     void render_card(lv_obj_t* card) override
     {
@@ -1196,8 +1221,8 @@ private:
         lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
         q_lbl_ = lbl(box, F20(), 0x1B2117, 12, 11, q_);
 
-        sr_ = lbl(root_, F16(), 0x8A9480, 16, 104, "type a song name, Enter to play");
-        lbl(root_, &lv_font_montserrat_14, 0x9AA490, 16, SCR_H - 24, "Enter: play      ESC: back");
+        // 提示只说"要干什么",不说"按哪个键" —— 快捷键统一进 s 那张表。
+        sr_ = lbl(root_, F16(), 0x8A9480, 16, 104, "输入歌名");
     }
 
     bool search_input(const tdeck::InputEvent& ev)

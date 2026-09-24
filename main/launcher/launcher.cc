@@ -451,6 +451,38 @@ private:
     {
         if (sc_) { lv_obj_delete(sc_); sc_ = nullptr; return; }
 
+        // 全局的永远在,app 自己的接在后面。
+        // app 不该把快捷键画在自己界面里(见 app.h 的 Shortcut 注释),
+        // 这张表是唯一的去处,所以它必须知道"现在在哪个 app 里"。
+        struct Row { const char* k; const char* d; };
+        static const Row global_home[] = {
+            { "ball L/R",   "switch screen" },
+            { "ball U/D",   "move selection" },
+            { "y / click",  "open" },
+            { "o / i",      "volume + / -" },
+            { "0",          "talk to XIAOZHI" },
+            { "s",          "this list" },
+        };
+        static const Row global_app[] = {
+            { "n / b",      "back" },
+            { "q",          "quit to home" },
+            { "o / i",      "volume + / -" },
+            { "0",          "talk to XIAOZHI" },
+            { "s",          "this list" },
+        };
+        const Row* base  = current_ ? global_app : global_home;
+        int        nbase = current_ ? (int)(sizeof(global_app) / sizeof(global_app[0]))
+                                    : (int)(sizeof(global_home) / sizeof(global_home[0]));
+
+        const Shortcut* own = nullptr;
+        int nown = current_ ? current_->shortcuts(&own) : 0;
+        if (nown > 8) nown = 8;
+
+        const int ROW = 20;
+        const int rows = nbase + (nown ? nown + 1 : 0);      // +1 是 app 名那一行
+        const int box_h = 46 + rows * ROW + 12;
+        const int box_w = 268;
+
         sc_ = lv_obj_create(lv_layer_top());
         lv_obj_set_size(sc_, SCR_W, SCR_H);
         lv_obj_set_pos(sc_, 0, 0);
@@ -461,7 +493,7 @@ private:
         lv_obj_remove_flag(sc_, LV_OBJ_FLAG_SCROLLABLE);
 
         lv_obj_t* box = lv_obj_create(sc_);
-        lv_obj_set_size(box, 268, 206);
+        lv_obj_set_size(box, box_w, box_h > SCR_H - 8 ? SCR_H - 8 : box_h);
         lv_obj_center(box);
         lv_obj_set_style_radius(box, 18, LV_PART_MAIN);
         lv_obj_set_style_bg_color(box, lv_color_hex(C_CARD), LV_PART_MAIN);
@@ -474,23 +506,25 @@ private:
         lv_obj_t* h = mk_label(box, &lv_font_montserrat_20, C_TEXT, "Shortcuts");
         lv_obj_set_pos(h, 18, 14);
 
-        struct { const char* k; const char* d; } rows[] = {
-            { "ball L/R",   "switch screen" },
-            { "ball U/D",   "move selection" },
-            { "y / click",  "open" },
-            { "n / b",      "back" },
-            { "q",          "quit to home" },
-            { "o / i",      "volume + / -" },
-            { "0",          "talk to XIAOZHI" },
-            { "s",          "this list" },
-        };
-        int y = 48;
-        for (auto& r : rows) {
-            lv_obj_t* k = mk_label(box, &lv_font_montserrat_14, C_TEXT, r.k);
+        int y = 46;
+        for (int i = 0; i < nbase; i++) {
+            lv_obj_t* k = mk_label(box, &lv_font_montserrat_14, C_TEXT, base[i].k);
             lv_obj_set_pos(k, 18, y);
-            lv_obj_t* d = mk_label(box, &lv_font_montserrat_14, C_MUTE, r.d);
+            lv_obj_t* d = mk_label(box, &lv_font_montserrat_14, C_MUTE, base[i].d);
             lv_obj_set_pos(d, 130, y);
-            y += 20;
+            y += ROW;
+        }
+        if (nown && own) {
+            lv_obj_t* nm = mk_label(box, &lv_font_montserrat_14, C_ACCENT, current_->name());
+            lv_obj_set_pos(nm, 18, y);
+            y += ROW;
+            for (int i = 0; i < nown; i++) {
+                lv_obj_t* k = mk_label(box, &lv_font_montserrat_14, C_TEXT, own[i].key);
+                lv_obj_set_pos(k, 18, y);
+                lv_obj_t* d = mk_label(box, &lv_font_montserrat_14, C_MUTE, own[i].desc);
+                lv_obj_set_pos(d, 130, y);
+                y += ROW;
+            }
         }
     }
 

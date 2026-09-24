@@ -14,6 +14,7 @@ idf_component_register(
         "apps/settings/settings_app.cc"
         "apps/music/music_app.cc"
         "apps/xiaozhi/xiaozhi_app.cc"
+        "apps/selftest/selftest_app.cc"
     INCLUDE_DIRS
         "." "app_framework"
     REQUIRES

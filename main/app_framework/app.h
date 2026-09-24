@@ -27,6 +27,19 @@ struct InputEvent {
     bool long_press = false;
 };
 
+// app 自己的快捷键。
+//
+// ⚠️ app【不要】把快捷键画在自己的界面里 —— 屏幕就 320×240,
+// 每个界面都留一行"esc back / y enter"是纯粹的浪费,而且各 app 各写一套
+// 措辞,看起来也不像一个系统。统一的去处是按 s 弹出的那张表,
+// launcher 会把这里返回的内容接在全局快捷键后面。
+//
+// 界面上该留的是【控件】(能点的返回按钮、播放键),不是【提示文字】。
+struct Shortcut {
+    const char* key;    // 例如 "esc" / "y" / "ball L/R"
+    const char* desc;
+};
+
 class App {
 public:
     virtual ~App() = default;
@@ -49,6 +62,10 @@ public:
     // 声明了这个的 app 拿到全部按键,代价是【自己负责提供退路】:
     // ESC 和轨迹球中键仍然由 OS 保留,永远能退出去。
     virtual bool wants_raw_keys() const { return false; }
+
+    // 当前界面生效的快捷键。按 s 的那一刻才调,所以可以随界面变化返回不同内容。
+    // 返回条数,*out 指向一个静态数组。
+    virtual int shortcuts(const Shortcut** out) const { (void)out; return 0; }
 
     // ── 卡片 ──
     // 桌面上的卡片是一个【内容整体】,不是"图标 + 标题 + 描述"的容器:
