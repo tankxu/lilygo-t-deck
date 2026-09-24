@@ -283,10 +283,22 @@ int tdeck_mic_probe_rms(uint32_t ms)
         ESP_LOGI(TAG, "I2C 总线上的器件:%s", n ? line : "(一个都没有)");
     }
 
+    // ⚠️ ES7210 的 ID 寄存器是 0x3D/0x3E,不是 0xFD/0xFE ——
+    // 后者是 ES8311 的习惯,读 ES7210 的未定义地址只会回 0xFF,
+    // 看起来就像"芯片没应答",足以把排查方向整个带偏(我踩过)。
     int id_hi = 0, id_lo = 0;
-    esp_codec_dev_read_reg(s_dev, 0xFD, &id_hi);
-    esp_codec_dev_read_reg(s_dev, 0xFE, &id_lo);
+    esp_codec_dev_read_reg(s_dev, 0x3D, &id_hi);
+    esp_codec_dev_read_reg(s_dev, 0x3E, &id_lo);
     ESP_LOGI(TAG, "ES7210 芯片 ID = 0x%02X%02X(应为 0x7210)", id_hi & 0xFF, id_lo & 0xFF);
+
+    // 再打几个关键寄存器:MIC12/34 的电源(0x4B/0x4C,0x00 才是开)、
+    // 时钟分频(0x02)。全 0xFF 说明读不通,全 0x00 说明写进去了但没上电。
+    int p12 = 0, p34 = 0, clk = 0;
+    esp_codec_dev_read_reg(s_dev, 0x4B, &p12);
+    esp_codec_dev_read_reg(s_dev, 0x4C, &p34);
+    esp_codec_dev_read_reg(s_dev, 0x02, &clk);
+    ESP_LOGI(TAG, "ES7210 寄存器:MIC12_PWR(0x4B)=0x%02X MIC34_PWR(0x4C)=0x%02X CLK(0x02)=0x%02X",
+             p12 & 0xFF, p34 & 0xFF, clk & 0xFF);
 
     bool was_running = s_running;
     if (!was_running && tdeck_mic_start() != ESP_OK) return -1;
