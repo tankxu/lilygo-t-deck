@@ -1,6 +1,15 @@
 dependencies:
   idf:
     version: ">=5.4"
+  # ⚠️ LVGL 必须【钉死 9.5】,不能让 esp_lvgl_port 传递依赖去解到 9.6。
+  #
+  # 中文字库 font_puhui_common_20_4.bin 来自 78/xiaozhi-fonts,那是个
+  # 【结构体裸 dump】格式(cbin),不是 LVGL 官方的 binfont —— 加载时直接把
+  # 文件头当 lv_font_t 用。9.6 改了 lv_font_t 的字段顺序(dsc 从偏移 24 挪到
+  # 了 0,还新增了 cap_height / x_height),dump 就对不上了。
+  # 症状极其隐蔽:cbin_font_create 返回非 NULL,一个字都渲染不出来,不报错。
+  lvgl/lvgl:
+    version: "~9.5.0"
   # LVGL 9 + Espressif 的移植层(负责 flush 回调、indev、LVGL 任务)
   espressif/esp_lvgl_port:
     version: "^2.9.0"

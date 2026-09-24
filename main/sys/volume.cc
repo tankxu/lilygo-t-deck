@@ -58,8 +58,10 @@ void build_hud()
 {
     s_hud = lv_obj_create(lv_layer_top());
     lv_obj_set_size(s_hud, HUD_W, HUD_H);
-    // 贴顶不贴底:底部在音乐播放页是控制键那一行,盖住等于挡住手要按的地方。
-    lv_obj_align(s_hud, LV_ALIGN_TOP_MID, 0, 8);
+    // 居中。顶部和底部都试过,都不行:底部是音乐播放页的控制键那一行,
+    // 顶部是返回 / 曲库那两颗药丸 —— 盖住的都是手正要按的东西。
+    // 屏幕正中反而是各个 app 控件最少的地方,而且 HUD 只停留 1.4s。
+    lv_obj_align(s_hud, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_bg_color(s_hud, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(s_hud, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_radius(s_hud, HUD_H / 2, LV_PART_MAIN);

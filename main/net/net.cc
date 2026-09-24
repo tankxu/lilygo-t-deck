@@ -136,7 +136,10 @@ void fetch_weather()
     // 循环读到底。单次 esp_http_client_read 只保证返回"已到达的"数据,
     // 不保证是整个响应体 —— 加了 daily 字段后响应变长,单次读会截断,
     // JSON 解析直接失败。这个 bug 在响应短的时候不会暴露。
-    char buf[1024] = {};
+    // 放静态区不放栈上:这个任务的栈要留给 mbedTLS 握手,1KB 也是钱。
+    // 只有 net_task 一个调用者,不存在并发问题。
+    static char buf[1024];
+    memset(buf, 0, sizeof(buf));
     int  len = 0;
     if (esp_http_client_open(cli, 0) == ESP_OK) {
         esp_http_client_fetch_headers(cli);
@@ -199,6 +202,11 @@ void net_task(void*)
     debug_server_start();   // 开发期调试接口,要等拿到 IP
 
     fetch_weather();
+    // TLS 握手就是这个任务栈的峰值时刻,过完了立刻报一次余量。
+    // 爆栈的后果是隔壁任务被写坏(表现成 LVGL 随机崩),不会指向这里,
+    // 所以宁可平时多打一行日志,也别等到再查一遍。
+    ESP_LOGI(TAG, "net 任务栈余量 %u 字节",
+             (unsigned)(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t)));
     int64_t last_wx = esp_timer_get_time();
 
     char hhmm[8], sub[64], last_hhmm[8] = {};
@@ -309,7 +317,14 @@ void net_start()
     ESP_ERROR_CHECK(err);
 
     wifi_start();
-    xTaskCreate(net_task, "net", 6144, nullptr, 4, nullptr);
+    // ⚠️ 栈【不能】按"这个任务代码很少"来估。net_task 要跑 HTTPS:
+    // mbedTLS 握手本身就要 8~10KB 栈,再加上证书 bundle 的解析和 cJSON,
+    // 6144 直接爆栈 —— 而且是【爆过头】,一次写穿的距离超过了 FreeRTOS 的
+    // 栈溢出金丝雀,所以不会报 stack overflow,只会把隔壁任务的数据结构写坏。
+    // 表现出来是 LVGL 任务过一会儿随机崩:有时 Cache error / MMU fault,
+    // 有时在 xEventGroupSetBits 的自旋锁上转到 Interrupt WDT 超时。
+    // 两种都跟真正的原因一点关系都没有,查错方向很容易被带偏。
+    xTaskCreate(net_task, "net", 12288, nullptr, 4, nullptr);
 }
 
 }  // namespace tdeck

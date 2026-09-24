@@ -574,30 +574,72 @@ private:
         t_cur_ = lbl(root_, &lv_font_montserrat_14, 0x6A7360, RX, 144, "0:00");
         t_tot_ = lbl(root_, &lv_font_montserrat_14, 0x6A7360, RX + RW - 34, 144, "0:00");
 
+        // ── 左上角:返回 / 曲库 ────────────────────────────
+        // 右上角【不放东西】:那一角背光漏光最重(见 docs/hardware.md),
+        // 浅色内容摆上去会被红光吃掉。
+        mk_pill(12, 10, LV_SYMBOL_LEFT, "Back", [](lv_event_t* e) {
+            (void)e; tdeck::launcher_back();
+        });
+        mk_pill(88, 10, LV_SYMBOL_LIST, "Playlist", [](lv_event_t* e) {
+            static_cast<MusicApp*>(lv_event_get_user_data(e))->show_library();
+        });
+
         // ── 底部控制条 ────────────────────────────────────
         // 封面占到 y=164,所有按钮必须整体落在它【下面】。之前按钮 cy 是
         // 178/182、直径 56,上沿到 150,被封面压住了一半 —— 一行统一 cy=196,
         // 最大的那颗上沿也只到 168,不会再撞。
         //
-        // 右上角【不放东西】:那一角是背光漏光最重的地方(见 docs/hardware.md),
-        // 浅色内容摆上去会被红光吃掉。所以回曲库的入口放在这一行最右边。
+        // 音量胶囊靠左,传输键组在【剩下的空间里】居中(不是全屏居中):
+        // 胶囊右沿 76,屏宽 320,所以组心在 198,左右各留 48。全屏居中的话
+        // 右边会空出 86px,看着像掉了一个按钮。
         constexpr int ROW_Y = 196;
-        mk_vol_pill(40, ROW_Y);
-        mk_btn(108, ROW_Y, 44, LV_SYMBOL_PREV, [](lv_event_t* e) {
+        mk_vol_pill(42, ROW_Y);
+        mk_btn(146, ROW_Y, 44, LV_SYMBOL_PREV, [](lv_event_t* e) {
             static_cast<MusicApp*>(lv_event_get_user_data(e))->skip(-1);
         });
-        btn_play_ = mk_btn(160, ROW_Y, 56, LV_SYMBOL_PAUSE, [](lv_event_t* e) {
+        btn_play_ = mk_btn(198, ROW_Y, 56, LV_SYMBOL_PAUSE, [](lv_event_t* e) {
             static_cast<MusicApp*>(lv_event_get_user_data(e))->toggle();
         });
-        mk_btn(212, ROW_Y, 44, LV_SYMBOL_NEXT, [](lv_event_t* e) {
+        mk_btn(250, ROW_Y, 44, LV_SYMBOL_NEXT, [](lv_event_t* e) {
             static_cast<MusicApp*>(lv_event_get_user_data(e))->skip(1);
         });
-        mk_btn(290, ROW_Y, 38, LV_SYMBOL_LIST, [](lv_event_t* e) {
-            static_cast<MusicApp*>(lv_event_get_user_data(e))->show_library();
-        });
 
-        lbl(root_, &lv_font_montserrat_14, 0x8A9480, 16, 14, "NOW PLAYING");
         on_tick();
+    }
+
+    // 图标 + 文字的小药丸按钮。图标用 LVGL 的 symbol 字形,不用 "<" / "=" 这类
+    // 字符凑合 —— 字符在 20px 下辨识度差,而且和正文混在一起不像可按的东西。
+    lv_obj_t* mk_pill(int x, int y, const char* sym, const char* text, lv_event_cb_t cb)
+    {
+        lv_obj_t* b = lv_obj_create(root_);
+        lv_obj_set_height(b, 26);
+        lv_obj_set_pos(b, x, y);
+        lv_obj_set_style_radius(b, 13, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(b, lv_color_hex(0xEDF1E7), LV_PART_MAIN);
+        lv_obj_set_style_border_width(b, 0, LV_PART_MAIN);
+        lv_obj_set_style_pad_hor(b, 10, LV_PART_MAIN);
+        lv_obj_set_style_pad_ver(b, 0, LV_PART_MAIN);
+        lv_obj_set_style_pad_column(b, 5, LV_PART_MAIN);
+        lv_obj_remove_flag(b, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(b, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, this);
+        // flex + 宽度自适应内容:文字长度不一样("Back" vs "Playlist"),
+        // 写死宽度不是留白太多就是把字挤掉。
+        lv_obj_set_layout(b, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(b, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(b, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_width(b, LV_SIZE_CONTENT);
+
+        lv_obj_t* i = lv_label_create(b);
+        lv_obj_set_style_text_font(i, &lv_font_montserrat_14, LV_PART_MAIN);
+        lv_obj_set_style_text_color(i, lv_color_hex(0x55853A), LV_PART_MAIN);
+        lv_label_set_text(i, sym);
+
+        lv_obj_t* l = lv_label_create(b);
+        lv_obj_set_style_text_font(l, &lv_font_montserrat_14, LV_PART_MAIN);
+        lv_obj_set_style_text_color(l, lv_color_hex(0x3D4636), LV_PART_MAIN);
+        lv_label_set_text(l, text);
+        return b;
     }
 
     // 音量做成一颗胶囊,左右各一半:− 和 + 是一对,分成两颗独立圆钮会让它们
@@ -740,9 +782,11 @@ private:
             lv_obj_add_event_cb(mini, [](lv_event_t* e) {
                 static_cast<MusicApp*>(lv_event_get_user_data(e))->show_now();
             }, LV_EVENT_CLICKED, this);
-            lv_obj_t* l = lbl(mini, F16(), 0x55853A, 10, 5, g_state.title);
+            // 定宽【还要】定高:LONG_DOT 是按高度截的,只限宽的话长标题会
+            // 换到第二行,从这条 30px 高的小条里溢出去,盖住下面的搜索框。
+            lv_obj_t* l = lbl(mini, F16(), 0x55853A, 10, 6, g_state.title);
+            lv_obj_set_size(l, 232, 18);
             lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
-            lv_obj_set_width(l, 240);
             lbl(mini, &lv_font_montserrat_16, 0x55853A, SCR_W - 60, 5, LV_SYMBOL_PLAY);
         }
 

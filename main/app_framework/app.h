@@ -94,6 +94,7 @@ private:
 
 // 启动桌面:订阅输入、显示应用列表。由 app_main 调用。
 void launcher_begin();
+void launcher_back();   // 回到桌面。app 画在界面上的返回按钮用这个
 
 // 桌面数据注入。联网子系统拿到数据后调这两个,桌面不关心数据从哪来。
 void launcher_set_time(const char* hhmm, const char* sub_line);

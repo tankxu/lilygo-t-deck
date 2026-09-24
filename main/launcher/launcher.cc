@@ -147,6 +147,10 @@ public:
         if (wifi_) lv_obj_set_style_text_opa(wifi_, on ? LV_OPA_COVER : LV_OPA_40, LV_PART_MAIN);
     }
 
+    // app 画在界面上的「返回」按钮走这里。back() 本身是私有的实现细节,
+    // 但屏幕上那颗按钮是公开入口,得有个正经出口。
+    void request_back() { back(); }
+
 private:
     // ── 构建 ──
     void build()
@@ -634,6 +638,9 @@ private:
 }  // namespace
 
 void launcher_begin()                                { Host::instance().begin(); }
+// app 自己画返回按钮时要的退路。键盘 n/b 和轨迹球有 Host 统一兜底,
+// 但屏幕上那颗「返回」是 app 画的,得有个正经出口。
+void launcher_back()                                 { Host::instance().request_back(); }
 void launcher_set_time(const char* a, const char* b) { Host::instance().set_time(a, b); }
 void launcher_set_weather(int code, float t, float lo, float hi) { Host::instance().set_weather(code, t, lo, hi); }
 void launcher_set_online(bool on)                    { Host::instance().set_online(on); }
