@@ -50,10 +50,12 @@ static uint32_t                      s_rate;
 static bool                          s_running;
 // ES7210 上哪一路接着 T-Deck 那颗麦克风,板子没有任何文档说。默认按最常见的
 // MIC1+MIC2 来,探测不到声音时 tdeck_mic_probe_rms 会把四种组合都试一遍。
-static uint8_t                       s_mic_mask = ES7210_SEL_MIC1 | ES7210_SEL_MIC2;
+// 官方 Microphone 例程给 MIC1|MIC2 设 0dB、给 MIC3|MIC4 设 **37.5dB(最大)** ——
+// 把最大增益放哪一组,基本就说明话筒焊在哪一组上。所以默认选 MIC3/4。
+static uint8_t                       s_mic_mask = ES7210_SEL_MIC3 | ES7210_SEL_MIC4;
 static uint8_t                       s_slot;      // 取 I2S 的哪个 slot(0=左 1=右)
 // 模拟前端增益(dB)。30dB 是 esp-box / korvo 上验证过的驻极体麦克风起点。
-static float                         s_gain_db = 30.0f;
+static float                         s_gain_db = 37.5f;   // 官方例程给 MIC3/4 的值
 
 esp_err_t tdeck_mic_init(uint32_t sample_rate)
 {
@@ -203,7 +205,41 @@ esp_err_t tdeck_mic_start(void)
         ESP_LOGI(TAG, "  判读:全 0xFF = I2C 读不通;全 0x00 = 配置进去了但通道没上电;"
                       "值正常 = 问题在 I2S 侧,查 MCLK(GPIO%d)有没有波形", TDECK_PIN_ES7210_MCLK);
     }
-    ESP_LOGI(TAG, "开始采集 %" PRIu32 "Hz,增益 %.0fdB", s_rate, s_gain_db);
+    // ── 对齐 LilyGO 官方 Microphone 例程 ──────────────────────
+    //
+    // 官方例程(examples/Microphone + lib/es7210)启动时把每颗 MIC 的
+    // 模拟电源寄存器写成 0x00:
+    //     REG47/48/49/4A = 0x00
+    // 而 esp_codec_dev 的 es7210 驱动在 start 里写的是 **0x08**(bit3 置位)。
+    // 这一位按数据手册是 PGA 的下电位 —— 置着的话 ADC 在跑、时钟也对,
+    // 但模拟前端没工作,I2S 上读回来就是一片 0(而且 peak 也是 0,
+    // 这正是我们看到的现象:活着的 ADC 就算在安静房间也会有几个 LSB 的底噪)。
+    //
+    // 另外官方 init 把 ANALOG_REG40 写成 0xC3,esp_codec_dev 写 0x43。
+    //
+    // 这些都在 esp_codec_dev 打开设备【之后】覆写,不然会被它的 start 覆盖回去。
+    for (int r = 0x47; r <= 0x4A; r++) esp_codec_dev_write_reg(s_dev, r, 0x00);
+    esp_codec_dev_write_reg(s_dev, 0x40, 0xC3);
+
+    static bool dumped2 = false;
+    if (!dumped2) {
+        dumped2 = true;
+        int m1 = 0, m2 = 0, m3 = 0, m4 = 0, an = 0, p12 = 0, p34 = 0;
+        esp_codec_dev_read_reg(s_dev, 0x47, &m1);
+        esp_codec_dev_read_reg(s_dev, 0x48, &m2);
+        esp_codec_dev_read_reg(s_dev, 0x49, &m3);
+        esp_codec_dev_read_reg(s_dev, 0x4A, &m4);
+        esp_codec_dev_read_reg(s_dev, 0x40, &an);
+        esp_codec_dev_read_reg(s_dev, 0x4B, &p12);
+        esp_codec_dev_read_reg(s_dev, 0x4C, &p34);
+        ESP_LOGI(TAG, "覆写后:MIC1..4_PWR=%02X %02X %02X %02X  ANALOG=%02X  "
+                      "MIC12_PWR=%02X MIC34_PWR=%02X(0x00 才是开)",
+                 m1 & 0xFF, m2 & 0xFF, m3 & 0xFF, m4 & 0xFF, an & 0xFF,
+                 p12 & 0xFF, p34 & 0xFF);
+    }
+
+    ESP_LOGI(TAG, "开始采集 %" PRIu32 "Hz,增益 %.0fdB,MIC%s", s_rate, s_gain_db,
+             s_mic_mask == (ES7210_SEL_MIC1 | ES7210_SEL_MIC2) ? "1/2" : "3/4");
     return ESP_OK;
 }
 
