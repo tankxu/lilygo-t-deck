@@ -79,8 +79,12 @@ esp_err_t h_shot(httpd_req_t* req)
     // 截图里根本不存在,而屏幕上明明看得见。这会让人把"浮层没弹出来"和
     // "浮层弹了但截图看不到"搞混,白白查半天。
     // 所以这里把 top layer 单独拍成 ARGB8888,再按 alpha 合上去。
-    if (snap) {
-        lv_obj_t* top = lv_layer_top();
+    // top 和 sys 两层都要合。sys 层放的是 LVGL 自己的性能监视器
+    // (LV_USE_PERF_MONITOR),调性能的时候全靠它 —— 只合 top 的话
+    // 屏幕上明明有 FPS 读数,截图里却没有。
+    lv_obj_t* overlays[2] = { lv_layer_top(), lv_layer_sys() };
+    for (int oi = 0; oi < 2 && snap; oi++) {
+        lv_obj_t* top = overlays[oi];
         if (lv_obj_get_child_count(top) > 0) {
             lv_draw_buf_t* ov = lv_snapshot_take(top, LV_COLOR_FORMAT_ARGB8888);
             if (ov) {

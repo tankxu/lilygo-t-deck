@@ -11,6 +11,8 @@
 // 全局键位见 ADR-006。q 在 Host 层截获不下发,是逃生口。
 
 #include "app.h"
+#include <esp_heap_caps.h>
+#include <string.h>
 #include "avatar.h"
 #include "sys/volume.h"
 #include "wx_icon.h"
@@ -71,6 +73,34 @@ const lv_image_dsc_t kWallpaper = {
     .data_size = SCR_W * SCR_H * 2,
     .data      = wallpaper_start,
 };
+
+// ⚠️ 贴图源【搬到 PSRAM】,不要直接从 flash 读。
+//
+// EMBED_FILES 嵌进来的数据在 flash 里,靠 MMU 映射读。滑动时整屏每帧都要
+// 重贴一遍壁纸和四张卡片配图,这些读会和 CPU 取指令抢同一条 flash 总线,
+// cache 来回颠簸 —— 同样是 RGB565 直贴,放 flash 比放 PSRAM 慢得多。
+// 开机时拷一份到 PSRAM(壁纸 150KB + 四张配图 107KB),之后只读 PSRAM。
+const lv_image_dsc_t* to_psram(const lv_image_dsc_t* src)
+{
+    if (!src) return nullptr;
+    auto* dsc = (lv_image_dsc_t*)heap_caps_malloc(sizeof(lv_image_dsc_t), MALLOC_CAP_SPIRAM);
+    void* data = heap_caps_malloc(src->data_size, MALLOC_CAP_SPIRAM);
+    if (!dsc || !data) {           // PSRAM 不够就退回 flash,别让界面起不来
+        free(dsc); free(data);
+        return src;
+    }
+    memcpy(data, src->data, src->data_size);
+    *dsc = *src;
+    dsc->data = (const uint8_t*)data;
+    return dsc;
+}
+
+const lv_image_dsc_t* wallpaper_dsc()
+{
+    static const lv_image_dsc_t* cached = nullptr;
+    if (!cached) cached = to_psram(&kWallpaper);
+    return cached;
+}
 
 lv_obj_t* mk_label(lv_obj_t* p, const lv_font_t* f, uint32_t c, const char* txt)
 {
@@ -156,7 +186,11 @@ private:
     void build()
     {
         scr_ = lv_obj_create(nullptr);
-        lv_obj_set_style_bg_image_src(scr_, &kWallpaper, LV_PART_MAIN);
+        // 壁纸挂在【屏幕】上,不是挂在页面上 —— 和手机一样:背景不动,只有内容滑。
+        // 之前为了能整页 snapshot 把壁纸挪到了每一页上,结果壁纸跟着一起滑了,这是错的。
+        lv_obj_set_style_bg_image_src(scr_, wallpaper_dsc(), LV_PART_MAIN);
+        // 这块屏是直角的,背景不要圆角(lv_obj 的默认主题会给圆角)
+        lv_obj_set_style_radius(scr_, 0, LV_PART_MAIN);
         lv_obj_set_style_pad_all(scr_, 0, LV_PART_MAIN);
         lv_obj_remove_flag(scr_, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -185,13 +219,14 @@ private:
             lv_obj_t* pg = lv_obj_create(pages_);
             lv_obj_set_size(pg, SCR_W, SCR_H);
             lv_obj_set_style_bg_opa(pg, LV_OPA_TRANSP, LV_PART_MAIN);
+            lv_obj_set_style_radius(pg, 0, LV_PART_MAIN);
             lv_obj_set_style_border_width(pg, 0, LV_PART_MAIN);
             lv_obj_set_style_pad_all(pg, 0, LV_PART_MAIN);
             lv_obj_remove_flag(pg, LV_OBJ_FLAG_SCROLLABLE);
             return pg;
         };
-        build_home(mk_page());
-        build_apps(mk_page());
+        pg_obj_[0] = mk_page();  build_home(pg_obj_[0]);
+        pg_obj_[1] = mk_page();  build_apps(pg_obj_[1]);
 
         // 圆点指示器建在 scr_ 上而不是 pages_ 里,切屏时它不跟着走
         for (int i = 0; i < PAGES; i++) {
@@ -357,13 +392,40 @@ private:
                 lv_obj_set_style_bg_opa(c, LV_OPA_COVER, LV_PART_MAIN);
                 lv_obj_set_style_border_width(c, 1, LV_PART_MAIN);
                 lv_obj_set_style_border_color(c, lv_color_hex(C_LINE), LV_PART_MAIN);
-                lv_obj_set_style_shadow_width(c, 14, LV_PART_MAIN);
-                lv_obj_set_style_shadow_offset_y(c, 3, LV_PART_MAIN);
-                lv_obj_set_style_shadow_opa(c, LV_OPA_20, LV_PART_MAIN);
-                lv_obj_set_style_clip_corner(c, true, LV_PART_MAIN);  // 内容不许溢出圆角
+                // ⚠️ 卡片【不加阴影】。LVGL 的阴影是软件高斯模糊,
+                // 滑动时整屏每帧重画,实测宽度 6 就要吃掉约 40ms/帧
+                // (89ms → 44ms)。卡片本身是浓郁的彩色配图,不靠阴影也跳得出来。
+                lv_obj_set_style_shadow_width(c, 0, LV_PART_MAIN);
+                // ── 卡片内容 ────────────────────────────────────
+                //
+                // 优先用整幅配图(App::card_art)。这既是为了好看,也是为了快:
+                // 实测(LV_USE_PERF_MONITOR,滑动中)四张卡片的矢量内容
+                // —— 均衡器条、仪表盘圆弧、色带 —— 每帧要重画 75ms,
+                // 而它们一动不动。整幅贴图之后这一项几乎归零。
+                //
+                //   原样                     152ms/帧   5 FPS
+                //   关阴影                   111ms      8 FPS
+                //   再不画卡片内容            36ms      23 FPS
+                //
+                // 标题直接压在图上,不加半透明黑条 —— 图的左下角在生成时
+                // 就烘了一层平滑的暗角(tools/gen_card_art.py),白字压上去
+                // 既看得清又不脏。
+                const lv_image_dsc_t* art = a->card_art();
+                if (art) {
+                    // ⚠️ 用【背景图】而不是子 image 控件。
+                    // 配图是方的、卡片是圆角的,子控件要靠 clip_corner 裁角,
+                    // 而 clip_corner 会让 LVGL 为每张卡开一个中间图层再合成 ——
+                    // 实测滑动时 125ms/帧,比不用配图还慢。
+                    // 背景图是在画背景时【顺带】按圆角遮罩的,不开图层,几乎白送。
+                    if (!art_psram_[i]) art_psram_[i] = to_psram(art);
+                    lv_obj_set_style_bg_image_src(c, art_psram_[i], LV_PART_MAIN);
 
-                // 卡片内容由 app 自己画(见 App::render_card 的注释)
-                a->render_card(c);
+                    lv_obj_t* nm = mk_label(c, &lv_font_montserrat_16, 0xFFFFFF,
+                                            a->card_title());
+                    lv_obj_set_pos(nm, 10, CH - 26);
+                } else {
+                    a->render_card(c);
+                }
 
                 lv_obj_set_user_data(c, (void*)(intptr_t)i);
                 lv_obj_add_flag(c, LV_OBJ_FLAG_CLICKABLE);
@@ -392,7 +454,7 @@ private:
             lv_obj_set_style_border_width(cards_[i], on ? 2 : 1, LV_PART_MAIN);
             lv_obj_set_style_border_color(cards_[i],
                 lv_color_hex(on ? a->accent() : C_LINE), LV_PART_MAIN);
-            lv_obj_set_style_shadow_opa(cards_[i], on ? LV_OPA_40 : LV_OPA_20, LV_PART_MAIN);
+
         }
     }
 
@@ -656,6 +718,12 @@ private:
     lv_obj_t*   app_scr_ = nullptr;
     lv_obj_t*   scr_ = nullptr, *pages_ = nullptr, *sc_ = nullptr;
     lv_obj_t*   cards_[MAX_APPS] = {};
+    lv_draw_buf_t* card_snap_[MAX_APPS] = {};   // 卡片内容烘出来的位图
+    lv_obj_t*      pg_obj_[PAGES] = {};
+    const lv_image_dsc_t* art_psram_[MAX_APPS] = {};
+    lv_obj_t*      snap_img_[PAGES] = {};
+    lv_draw_buf_t* snap_buf_[PAGES] = {};
+    bool           scrolling_ = false;
     lv_obj_t*   dots_[PAGES] = {};
     lv_obj_t*   clock_ = nullptr, *date_ = nullptr, *wx_ = nullptr, *wx_desc_ = nullptr;
     lv_obj_t*   wx_icon_ = nullptr, *bat_ = nullptr, *bat_body_ = nullptr;

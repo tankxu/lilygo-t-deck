@@ -75,6 +75,18 @@ public:
     //
     // card 是一块 143x94、已经设好圆角和阴影的容器,app 往里画什么都行。
     // 默认实现是退化形式(图标 + 名称),只给还没做卡片的 app 兜底。
+    // 卡片配图:143x94 的 RGB565 整幅图(tools/gen_card_art.py 生成)。
+    //
+    // 返回非空时 launcher 直接把它整幅贴进卡片,左下角叠一行白色标题,
+    // 不再调 render_card()。这既是为了好看,也是为了快 ——
+    // 实测四张卡片的矢量内容每帧要重画 75ms,而它们一动不动。
+    virtual const lv_image_dsc_t* card_art() const { return nullptr; }
+
+    // 卡片上显示的标题。name() 是给日志和身份判断用的全大写标识,
+    // 不适合直接印在卡片上。
+    virtual const char* card_title() const { return name(); }
+
+    // 没有配图时的回退:自己在卡片上画。
     virtual void render_card(lv_obj_t* card);
 
     // ── 生命周期 ──

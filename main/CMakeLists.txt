@@ -27,5 +27,7 @@ idf_component_register(
     # 组件被编成静态库,链接器默认只拉取「被引用到」的 .o —— app 的 .o 会被整个丢掉,
     # 注册表里空空如也,而且不报任何错。
     EMBED_FILES "assets/wallpaper.rgb565" "assets/font_puhui_common_20_4.bin"
+               "assets/card_music.rgb565" "assets/card_settings.rgb565"
+               "assets/card_palette.rgb565" "assets/card_selftest.rgb565"
     WHOLE_ARCHIVE
 )

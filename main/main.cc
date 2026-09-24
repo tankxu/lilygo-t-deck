@@ -23,6 +23,12 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(tdeck_bsp_init());
 
     lvgl_port_cfg_t port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
+    // 默认 7168 不够:launcher 会用 lv_snapshot_take 把整页渲染成位图
+    // (滑动时贴图代替重画,见 launcher.cc 的 bake_page),
+    // 整页渲染要走完 LVGL 的绘制递归,栈很深。
+    // ⚠️ 别从 app_main 里调 snapshot —— 主任务栈更小,实测直接爆栈
+    // (vApplicationStackOverflowHook),所以烘图也挪到 LVGL 任务里做。
+    port_cfg.task_stack = 16384;
     ESP_ERROR_CHECK(lvgl_port_init(&port_cfg));
 
     lvgl_port_display_cfg_t disp_cfg = {

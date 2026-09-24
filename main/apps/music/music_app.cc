@@ -29,6 +29,16 @@
 
 namespace {
 
+// 卡片配图。tools/gen_card_art.py 生成,CMake EMBED_FILES 以二进制嵌入
+// (143x94 RGB565,26884 字节),不走 C 数组。
+extern "C" const uint8_t card_music_start[] asm("_binary_card_music_rgb565_start");
+const lv_image_dsc_t kCardArt = {
+    .header = { .magic = LV_IMAGE_HEADER_MAGIC, .cf = LV_COLOR_FORMAT_RGB565,
+                .flags = 0, .w = 143, .h = 94, .stride = 143 * 2, .reserved_2 = 0 },
+    .data_size = 143 * 94 * 2,
+    .data      = card_music_start,
+};
+
 const char* TAG = "music";
 // 中文字体没加载成功就回落到 Montserrat —— 宁可显示方框,不要空指针崩溃
 // ⚠️ 中文字库只有【一个】字号:20px,line_height = 26。
@@ -488,6 +498,8 @@ enum class View { Library, NowPlaying, Search };
 class MusicApp : public tdeck::App {
 public:
     const char* name() const override   { return "Music"; }
+    const lv_image_dsc_t* card_art() const override  { return &kCardArt; }
+    const char* card_title() const override           { return "Music"; }
     const char* icon() const override   { return LV_SYMBOL_AUDIO; }
     uint32_t    accent() const override { return 0x55853A; }
     bool wants_raw_keys() const override { return view_ == View::Search; }

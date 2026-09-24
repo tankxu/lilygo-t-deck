@@ -112,3 +112,11 @@ CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 # 所以这块缓存不吃内部 RAM。
 CONFIG_LV_CACHE_DEF_SIZE=524288
 CONFIG_LV_IMAGE_HEADER_CACHE_DEF_CNT=32
+
+# 调性能时把这两行改成 y,屏幕左上角会显示 "FPS / CPU%" 和
+# "总耗时 (渲染 | 刷屏)"。分清是渲染慢还是 SPI 慢全靠它 ——
+# 这次就是靠它发现瓶颈在渲染(152ms 里 147ms 是渲染,刷屏只占 5ms),
+# 而不是我一开始猜的 SPI 时钟。
+# 注意 LV_USE_PERF_MONITOR 依赖 LV_USE_SYSMON,要一起开。
+# CONFIG_LV_USE_SYSMON=y
+# CONFIG_LV_USE_PERF_MONITOR=y

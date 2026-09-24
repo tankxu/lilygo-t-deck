@@ -17,6 +17,16 @@
 
 namespace {
 
+// 卡片配图。tools/gen_card_art.py 生成,CMake EMBED_FILES 以二进制嵌入
+// (143x94 RGB565,26884 字节),不走 C 数组。
+extern "C" const uint8_t card_settings_start[] asm("_binary_card_settings_rgb565_start");
+const lv_image_dsc_t kCardArt = {
+    .header = { .magic = LV_IMAGE_HEADER_MAGIC, .cf = LV_COLOR_FORMAT_RGB565,
+                .flags = 0, .w = 143, .h = 94, .stride = 143 * 2, .reserved_2 = 0 },
+    .data_size = 143 * 94 * 2,
+    .data      = card_settings_start,
+};
+
 constexpr uint32_t C_ACCENT = 0x55853A;
 constexpr uint32_t C_TEXT   = 0x1b2117;
 constexpr uint32_t C_MUTE   = 0x6a7360;
@@ -34,6 +44,8 @@ enum class View { Menu, WifiList, Password };
 class SettingsApp : public tdeck::App {
 public:
     const char* name() const override   { return "Settings"; }
+    const lv_image_dsc_t* card_art() const override  { return &kCardArt; }
+    const char* card_title() const override           { return "Settings"; }
     const char* icon() const override   { return LV_SYMBOL_SETTINGS; }
     uint32_t    accent() const override { return 0x4F6B3E; }
     // 密码框里要能打全部字符(ADR-006 的后路)

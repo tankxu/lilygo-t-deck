@@ -15,6 +15,16 @@
 
 namespace {
 
+// 卡片配图。tools/gen_card_art.py 生成,CMake EMBED_FILES 以二进制嵌入
+// (143x94 RGB565,26884 字节),不走 C 数组。
+extern "C" const uint8_t card_palette_start[] asm("_binary_card_palette_rgb565_start");
+const lv_image_dsc_t kCardArt = {
+    .header = { .magic = LV_IMAGE_HEADER_MAGIC, .cf = LV_COLOR_FORMAT_RGB565,
+                .flags = 0, .w = 143, .h = 94, .stride = 143 * 2, .reserved_2 = 0 },
+    .data_size = 143 * 94 * 2,
+    .data      = card_palette_start,
+};
+
 constexpr int COLS = 16, ROWS = 16;
 constexpr int CW = 19, CH = 11;            // 色块尺寸:16*19=304 宽,16*11=176 高
 constexpr int GX = (320 - COLS * CW) / 2;  // = 8,左右各留 8
@@ -55,6 +65,8 @@ inline uint16_t to565(Rgb c)
 class PaletteApp : public tdeck::App {
 public:
     const char* name() const override   { return "Palette"; }
+    const lv_image_dsc_t* card_art() const override  { return &kCardArt; }
+    const char* card_title() const override           { return "Palette"; }
     const char* icon() const override   { return LV_SYMBOL_IMAGE; }
     uint32_t    accent() const override { return 0x55853A; }
 
