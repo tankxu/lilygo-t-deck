@@ -57,6 +57,22 @@ void Avatar::create(lv_obj_t* parent, int cx, int cy, int d)
     lv_obj_set_style_pad_all(head_, 0, LV_PART_MAIN);
     lv_obj_remove_flag(head_, LV_OBJ_FLAG_SCROLLABLE);
 
+    // ⚠️ 这张脸有两个主人(首屏的小头像、小智应用里的大脸),而且小智在
+    // Full / Overlay 之间切形态时会整个重建。对象随时可能被【别人】删掉:
+    // 父容器被 lv_obj_clean、所在 screen 被 lv_obj_delete_delayed……
+    // 那时 Avatar 自己一无所知,eye_l_ 还指着已经释放的对象,而三个定时器
+    // 和动画还在跑,下一拍就往野指针上 lv_obj_set_size —— 崩在 LVGL 深处,
+    // 回溯里看不出跟 Avatar 有关系。
+    // 所以挂一个 DELETE 事件:谁删的都行,删了就地自清。
+    lv_obj_add_event_cb(head_, [](lv_event_t* e) {
+        auto* self = static_cast<Avatar*>(lv_event_get_user_data(e));
+        lv_anim_delete(self, nullptr);
+        for (auto** tm : { &self->t_blink_, &self->t_gaze_, &self->t_squint_ }) {
+            if (*tm) { lv_timer_delete(*tm); *tm = nullptr; }
+        }
+        self->head_ = self->eye_l_ = self->eye_r_ = nullptr;
+    }, LV_EVENT_DELETE, this);
+
     auto mk_eye = [&](int dx) {
         lv_obj_t* e = lv_obj_create(head_);
         lv_obj_set_style_bg_color(e, lv_color_hex(C_EYE), LV_PART_MAIN);
@@ -91,10 +107,16 @@ void Avatar::apply_eye_geom()
 
 void Avatar::destroy()
 {
+    // 动画要【先】删。三个 eye_*_cb 的 var 都是 this,定时器停了动画也还在跑,
+    // 照样会回调进来改 eye_w_/eye_h_ 再去画已经删掉的对象。
+    // lv_anim_delete(this, nullptr) 按 var 匹配,一次把这张脸的动画全清掉。
+    lv_anim_delete(this, nullptr);
     for (auto** t : { &t_blink_, &t_gaze_, &t_squint_ }) {
         if (*t) { lv_timer_delete(*t); *t = nullptr; }
     }
-    if (head_) { lv_obj_delete(head_); head_ = eye_l_ = eye_r_ = nullptr; }
+    // head_ 上挂了 LV_EVENT_DELETE 回调,会把三个指针清掉,这里不用再清
+    if (head_) lv_obj_delete(head_);
+    head_ = eye_l_ = eye_r_ = nullptr;
 }
 
 void Avatar::eye_h_cb(void* var, int32_t v)
@@ -116,6 +138,7 @@ void Avatar::eye_shift_cb(void* var, int32_t v)
 void Avatar::on_blink(lv_timer_t* t)
 {
     auto* s = static_cast<Avatar*>(lv_timer_get_user_data(t));
+    if (!s->head_) return;   // 脸已经被删了,别再往野指针上起动画
     lv_anim_t a;
     lv_anim_init(&a);
     lv_anim_set_var(&a, s);
@@ -130,6 +153,7 @@ void Avatar::on_blink(lv_timer_t* t)
 void Avatar::on_gaze(lv_timer_t* t)
 {
     auto* s = static_cast<Avatar*>(lv_timer_get_user_data(t));
+    if (!s->head_) return;   // 脸已经被删了,别再往野指针上起动画
     int amp = s->d_ * 8 / 100;
     lv_anim_t a;
     lv_anim_init(&a);
@@ -148,6 +172,7 @@ void Avatar::on_gaze(lv_timer_t* t)
 void Avatar::on_squint(lv_timer_t* t)
 {
     auto* s = static_cast<Avatar*>(lv_timer_get_user_data(t));
+    if (!s->head_) return;   // 脸已经被删了,别再往野指针上起动画
     s->in_bar_ = !s->in_bar_;
 
     int tw = s->in_bar_ ? s->bar_w_ : s->base_w_;

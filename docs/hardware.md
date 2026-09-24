@@ -202,3 +202,57 @@ IDF 通用 ST7789 驱动只发 SLPOUT / MADCTL / COLMOD / RAMCTRL,
 
 缓解手段:背光别开太高(40~50% 观感明显改善且省电),
 UI 用深灰底(如 `#0d1117`)而不是纯黑。
+
+## 软件:三个"崩在别处"的坑
+
+这三个的共同点是**崩溃现场和真正的原因完全无关**,照着回溯查会一路走偏。
+
+### 1. 任务栈按"代码量"估 → 隔壁任务被写坏
+
+`net` 任务原本给了 6144 字节,它要跑 HTTPS。mbedTLS 握手实测峰值就要
+**约 10KB**,直接爆栈。而且爆的距离远超 FreeRTOS 的栈溢出金丝雀,
+所以**不报 stack overflow**,只是把相邻任务的数据结构写坏。
+
+表现出来是 LVGL 任务过一会儿随机崩,而且每次现象还不一样:
+- LVGL 9.6 上是 `Cache error / MMU entry fault`
+- LVGL 9.5 上是在 `xEventGroupSetBits` 的自旋锁上转到 `Interrupt wdt timeout`
+
+两个都指向 LVGL,跟 `net` 一点关系都看不出来。
+
+**规矩:凡是跑 TLS 的任务,栈 16KB 起步。**内部 RAM 很紧张,
+所以 `xTaskCreate` 的返回值必须检查 —— 内部堆不够时它是**静默失败**的。
+
+⚠️ 查证时注意:ESP-IDF 的 `uxTaskGetStackHighWaterMark()` 返回的是**字节**,
+不是原版 FreeRTOS 文档里的**字**。乘 `sizeof(StackType_t)` 会虚报 4 倍,
+正好会让人误判"栈很宽裕"。
+
+### 2. LVGL 动画/定时器活得比它操作的对象久
+
+`Avatar` 的三个动画 `var` 都是 Avatar 自己,`lv_timer` 也挂着 `this`。
+只删对象、不删动画的话,动画下一拍照样回调进来,往已经释放的
+`lv_obj_t*` 上 `lv_obj_set_size` —— 崩在 LVGL 深处,回溯里看不出跟 Avatar 有关。
+
+更隐蔽的是:对象可能被**别人**删掉(父容器 `lv_obj_clean`、
+所在 screen 被 `lv_obj_delete_delayed`),这时 Avatar 自己根本不知道。
+
+两条都要做:
+- `destroy()` 里先 `lv_anim_delete(this, nullptr)` 再删定时器和对象
+- 在根对象上挂 `LV_EVENT_DELETE`,谁删的都能就地自清
+
+### 3. 字库是"结构体裸 dump",跟 LVGL 版本绑死
+
+`main/assets/font_puhui_common_20_4.bin`(来自 `78/xiaozhi-fonts`)**不是**
+LVGL 官方的 binfont 格式,而是 `lv_font_t` + `lv_font_fmt_txt_dsc_t` 的
+**内存镜像**(指针换成了偏移)。所以它和结构体布局绑死。
+
+LVGL 9.6 改了 `lv_font_t`:`dsc` 从偏移 24 挪到了 0,还新增了
+`cap_height` / `x_height`。于是 `cbin_font_create()` **返回非 NULL,
+一个字都渲染不出来,不报任何错**。
+
+所以 `main/idf_component.yml` 里把 `lvgl/lvgl` 钉死在 `~9.5.0` ——
+不能让 `esp_lvgl_port` 的传递依赖去解版本。改 LVGL 版本前先想清楚字库。
+
+⚠️ 换过 LVGL 版本之后 `sdkconfig` 要**重新生成**:残留的旧版本 Kconfig 项
+(例如 9.6 的 `CONFIG_LV_ASSERT_HANDLER_INCLUDE=""`)会让编译报
+`empty filename in #include`。自定义项都在 `sdkconfig.defaults` 里,删掉
+`sdkconfig` 重新 `reconfigure` 不会丢东西。

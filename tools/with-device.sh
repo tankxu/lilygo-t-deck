@@ -15,8 +15,12 @@ WAIT=${TDECK_LOCK_WAIT:-900}
 for ((i = 0; i < WAIT; i++)); do
     if mkdir "$LOCK" 2>/dev/null; then
         echo "$$" > "$LOCK/pid"
-        trap 'rm -rf "$LOCK"' EXIT
-        exec "$@"
+        # ⚠️ 这里【不能】用 exec:exec 会把当前 shell 整个换掉,
+        # EXIT trap 也就跟着没了,锁永远不会释放,下一个人要等 15 分钟
+        # 的陈旧锁回收。必须让 shell 活着等子进程结束,再自己删锁。
+        trap 'rm -rf "$LOCK"' EXIT INT TERM
+        "$@"
+        exit $?
     fi
     # 陈旧锁回收:持有者已经不在了,或者拿着超过 15 分钟没放
     if [ -f "$LOCK/pid" ]; then

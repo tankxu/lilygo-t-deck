@@ -113,6 +113,10 @@ void wifi_start()
     ESP_ERROR_CHECK(esp_wifi_start());
 }
 
+// TLS 握手实测峰值约 10KB(12288 的栈只剩 2.2KB 余量,太紧)。
+// 16KB 留出余量:证书链长度、mbedTLS 配置、以后加的 HTTPS 调用都会吃栈。
+constexpr int NET_TASK_STACK = 16384;
+
 // ── 天气 ──
 void fetch_weather()
 {
@@ -205,8 +209,12 @@ void net_task(void*)
     // TLS 握手就是这个任务栈的峰值时刻,过完了立刻报一次余量。
     // 爆栈的后果是隔壁任务被写坏(表现成 LVGL 随机崩),不会指向这里,
     // 所以宁可平时多打一行日志,也别等到再查一遍。
-    ESP_LOGI(TAG, "net 任务栈余量 %u 字节",
-             (unsigned)(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t)));
+    // ⚠️ ESP-IDF 的 uxTaskGetStackHighWaterMark 返回的是【字节】,
+    // 不是原版 FreeRTOS 文档里的【字】。乘 sizeof(StackType_t) 会虚报 4 倍,
+    // 正好会让人误以为栈很宽裕。
+    ESP_LOGI(TAG, "net 任务栈余量 %u 字节(峰值用掉 %u)",
+             (unsigned)uxTaskGetStackHighWaterMark(nullptr),
+             (unsigned)(NET_TASK_STACK - uxTaskGetStackHighWaterMark(nullptr)));
     int64_t last_wx = esp_timer_get_time();
 
     char hhmm[8], sub[64], last_hhmm[8] = {};
@@ -324,7 +332,7 @@ void net_start()
     // 表现出来是 LVGL 任务过一会儿随机崩:有时 Cache error / MMU fault,
     // 有时在 xEventGroupSetBits 的自旋锁上转到 Interrupt WDT 超时。
     // 两种都跟真正的原因一点关系都没有,查错方向很容易被带偏。
-    xTaskCreate(net_task, "net", 12288, nullptr, 4, nullptr);
+    xTaskCreate(net_task, "net", NET_TASK_STACK, nullptr, 4, nullptr);
 }
 
 }  // namespace tdeck
