@@ -184,6 +184,20 @@ static void input_task(void* arg)
             }
         }
 
+        // 栈余量报警。UI 是在这条栈上建的,余量会随着 app 变复杂而缩水,
+        // 与其等它写穿内存再去查 LVGL,不如在这里先喊一声。
+        // ⚠️ ESP-IDF 的 uxTaskGetStackHighWaterMark 返回【字节】不是【字】。
+        {
+            static UBaseType_t worst = ~0U;
+            UBaseType_t free_now = uxTaskGetStackHighWaterMark(NULL);
+            if (free_now < worst) {
+                worst = free_now;
+                if (free_now < 2048) {
+                    ESP_LOGW(TAG, "输入任务栈只剩 %u 字节了", (unsigned)free_now);
+                }
+            }
+        }
+
         vTaskDelay(pdMS_TO_TICKS(POLL_PERIOD_MS));
     }
 }
@@ -193,7 +207,19 @@ esp_err_t tdeck_input_init(void)
     ESP_RETURN_ON_ERROR(trackball_init(), TAG, "轨迹球初始化失败");
     ESP_RETURN_ON_ERROR(keyboard_init(),  TAG, "键盘初始化失败");
 
-    BaseType_t ok = xTaskCreate(input_task, "tdeck_input", 4096, NULL, 5, NULL);
+    // ⚠️ 这个栈【不能】按"轮询几个 GPIO 能用多少"来估。
+    //
+    // 事件回调是【同步】派发的:回调里 launcher 拿 LVGL 锁,然后在这条栈上
+    // 直接干完所有事 —— 翻页动画、建快捷键浮层、打开 app(整个界面都是在
+    // 这里 new 出来的)。LVGL 建对象是很吃栈的,4096 会被写穿。
+    //
+    // 写穿的距离又一次超过了 FreeRTOS 的金丝雀,所以【不报 stack overflow】,
+    // 只是把相邻内存写坏。实际踩到的是 esp_lvgl_port 的 event group 自旋锁:
+    // 锁的值被改成了永远等不到 SPINLOCK_FREE 的垃圾,于是 LVGL 任务在
+    // esp_cpu_compare_and_set 里死转,另一个核空闲 —— 最后以
+    // "Interrupt wdt timeout" 崩在 lv_obj_scroll_by_raw 里,现场跟输入
+    // 一点关系都看不出来。按一下轨迹球必现。
+    BaseType_t ok = xTaskCreate(input_task, "tdeck_input", 12288, NULL, 5, NULL);
     ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_ERR_NO_MEM, TAG, "输入任务创建失败");
 
     ESP_LOGI(TAG, "输入层就绪(轮询 %dms)", POLL_PERIOD_MS);

@@ -31,8 +31,16 @@ namespace {
 
 const char* TAG = "music";
 // 中文字体没加载成功就回落到 Montserrat —— 宁可显示方框,不要空指针崩溃
+// ⚠️ 中文字库只有【一个】字号:20px,line_height = 26。
+// 所以 F16() 和 F20() 拿到的是同一个字体,名字里的 16/20 只是回落到
+// Montserrat 时的字号。排版时高度一律按 CJK_LINE_H 算,按 16px 估会
+// 让文字从标签框里溢出去,盖住下一行。
+constexpr int CJK_LINE_H = 26;
 inline const lv_font_t* F16() { auto* f = tdeck::font_cjk(); return f ? f : &lv_font_montserrat_16; }
 inline const lv_font_t* F20() { auto* f = tdeck::font_cjk(); return f ? f : &lv_font_montserrat_20; }
+// 图标(LV_SYMBOL_*)是 FontAwesome 的私用区码位,中文字库里【没有】,
+// 用 F16() 画会变成缺字形方框。图标一律用 Montserrat。
+inline const lv_font_t* FICON() { return &lv_font_montserrat_16; }
 
 
 
@@ -42,6 +50,7 @@ constexpr uint32_t C_MUTE   = 0x6a7360;
 constexpr uint32_t C_LINE   = 0xd6dbcd;
 constexpr uint32_t C_CARD   = 0xffffff;
 constexpr int SCR_W = 320, SCR_H = 240;
+constexpr int ROW_H = 34;      // 一行文字(26)+ 上下留白
 
 constexpr int MAX_SONGS   = 24;
 constexpr int SAMPLE_RATE = 24000;
@@ -547,12 +556,12 @@ private:
         lv_obj_set_width(title_, RW);
         // 定宽不够,还要定高。LONG_DOT 在高度不受限时会先换行再省略,
         // 长标题会一路长下去把艺术家和进度条压在底下。
-        lv_obj_set_height(title_, 52);
+        lv_obj_set_height(title_, CJK_LINE_H * 2);   // 恰好两行
 
         artist_ = lbl(root_, F16(), 0x6A7360, RX, 104, g_state.artist);
         lv_label_set_long_mode(artist_, LV_LABEL_LONG_DOT);
         lv_obj_set_width(artist_, RW);
-        lv_obj_set_height(artist_, 22);
+        lv_obj_set_height(artist_, CJK_LINE_H);
 
         lv_obj_t* track = lv_obj_create(root_);
         lv_obj_set_size(track, RW, 4);
@@ -771,7 +780,7 @@ private:
         if (g_state.playing) {
             // 顶部一条"正在播放",点了回到播放页 —— 手机音乐 app 的标配
             lv_obj_t* mini = lv_obj_create(root_);
-            lv_obj_set_size(mini, SCR_W - 28, 30);
+            lv_obj_set_size(mini, SCR_W - 28, CJK_LINE_H + 8);
             lv_obj_set_pos(mini, 14, 34);
             lv_obj_set_style_bg_color(mini, lv_color_hex(0xE8EEE0), LV_PART_MAIN);
             lv_obj_set_style_radius(mini, 8, LV_PART_MAIN);
@@ -784,10 +793,10 @@ private:
             }, LV_EVENT_CLICKED, this);
             // 定宽【还要】定高:LONG_DOT 是按高度截的,只限宽的话长标题会
             // 换到第二行,从这条 30px 高的小条里溢出去,盖住下面的搜索框。
-            lv_obj_t* l = lbl(mini, F16(), 0x55853A, 10, 6, g_state.title);
-            lv_obj_set_size(l, 232, 18);
+            lv_obj_t* l = lbl(mini, F16(), 0x55853A, 10, 4, g_state.title);
+            lv_obj_set_size(l, 232, CJK_LINE_H);
             lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
-            lbl(mini, &lv_font_montserrat_16, 0x55853A, SCR_W - 60, 5, LV_SYMBOL_PLAY);
+            lbl(mini, FICON(), 0x55853A, SCR_W - 60, 6, LV_SYMBOL_PLAY);
         }
 
         int top = g_state.playing ? 70 : 34;
@@ -800,7 +809,8 @@ private:
         lv_obj_set_style_border_color(search_row_, lv_color_hex(0xD2DAC4), LV_PART_MAIN);
         lv_obj_set_style_pad_all(search_row_, 0, LV_PART_MAIN);
         lv_obj_remove_flag(search_row_, LV_OBJ_FLAG_SCROLLABLE);
-        lbl(search_row_, F16(), 0x6A7360, 10, 5, LV_SYMBOL_PLUS "  Search a song");
+        lbl(search_row_, FICON(), 0x6A7360, 10, 7, LV_SYMBOL_PLUS);
+        lbl(search_row_, F16(), 0x6A7360, 30, 2, "Search a song");
 
         list_ = lv_obj_create(root_);
         lv_obj_set_size(list_, SCR_W - 28, SCR_H - top - 44);
@@ -813,8 +823,8 @@ private:
 
         for (int i = 0; i < g_state.n_songs; i++) {
             lv_obj_t* r = lv_obj_create(list_);
-            lv_obj_set_size(r, SCR_W - 32, 42);
-            lv_obj_set_pos(r, 0, i * 46);
+            lv_obj_set_size(r, SCR_W - 32, ROW_H);
+            lv_obj_set_pos(r, 0, i * (ROW_H + 4));
             lv_obj_set_style_bg_color(r, lv_color_hex(0xF4F6F0), LV_PART_MAIN);
             lv_obj_set_style_radius(r, 8, LV_PART_MAIN);
             lv_obj_set_style_border_width(r, 1, LV_PART_MAIN);
@@ -828,18 +838,26 @@ private:
                 s->stop_and_play(idx);
             }, LV_EVENT_CLICKED, this);
 
-            // LV_LABEL_LONG_DOT 是按【高度】截的:只设宽度,长标题会换到第二行,
-            // 正好盖住下面固定 y 的歌手名。必须把高度也钉成一行。
-            lv_obj_t* tl = lbl(r, F16(), 0x1B2117, 10, 3, g_songs[i].title);
-            lv_obj_set_size(tl, 210, 18);
+            // 标题和艺术家合成一行。
+            // 240 高的屏幕上两行一行 26px,一条目就要 56px,连三条都放不下。
+            // 中文字库只有 20px 一个字号,没法把副行做小,所以并成一行,
+            // 艺术家降成次要信息(完整信息在播放页上)。
+            // LV_LABEL_LONG_DOT 是按【高度】截的,所以高度必须钉成恰好一行,
+            // 否则长标题会换行、从行框里溢出去盖住下一条。
+            char line[160];
+            if (g_songs[i].artist[0])
+                snprintf(line, sizeof(line), "%s \u00b7 %s", g_songs[i].title, g_songs[i].artist);
+            else
+                snprintf(line, sizeof(line), "%s", g_songs[i].title);
+            lv_obj_t* tl = lbl(r, F16(), 0x1B2117, 10, (ROW_H - CJK_LINE_H) / 2, line);
+            lv_obj_set_size(tl, 196, CJK_LINE_H);
             lv_label_set_long_mode(tl, LV_LABEL_LONG_DOT);
-            lv_obj_t* al = lbl(r, F16(), 0x8A9480, 10, 22, g_songs[i].artist);
-            lv_obj_set_size(al, 210, 18);
-            lv_label_set_long_mode(al, LV_LABEL_LONG_DOT);
+            lv_obj_t* al = nullptr;
             char d[16];
             snprintf(d, sizeof(d), "%d:%02d", g_songs[i].dur / 60, g_songs[i].dur % 60);
-            lbl(r, &lv_font_montserrat_14, 0x8A9480, SCR_W - 66, 12, d);
-            play_mark_[i] = lbl(r, &lv_font_montserrat_16, 0x55853A, SCR_W - 92, 11, LV_SYMBOL_PLAY);
+            lbl(r, &lv_font_montserrat_14, 0x8A9480, SCR_W - 66, (ROW_H - 18) / 2, d);
+            play_mark_[i] = lbl(r, FICON(), 0x55853A, SCR_W - 92, (ROW_H - 18) / 2, LV_SYMBOL_PLAY);
+            (void)al;
             lv_obj_add_flag(play_mark_[i], LV_OBJ_FLAG_HIDDEN);
             rows_[i] = r;
         }

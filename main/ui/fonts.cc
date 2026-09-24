@@ -49,7 +49,12 @@ void fonts_init()
     // 实测就是全方框。留着这段自检:哪天把版本对齐了,它会自己开始工作。
     if (s_cjk) {
         lv_font_glyph_dsc_t g = {};
-        bool ok = lv_font_get_glyph_dsc(s_cjk, &g, 'A', 0) && g.box_w > 0;
+        // 用【汉字】验,不能用 'A'。
+        // 这个字库是结构体裸 dump,和 LVGL 的 lv_font_fmt_txt_dsc_t 布局绑死。
+        // 布局对不上的时候,前几张 cmap(ASCII 那几张)往往还能歪打正着解出来,
+        // 'A' 照样有 box_w —— 于是自检通过,而真正要的汉字一个都画不出来。
+        // U+4F60「你」落在第 19 张 cmap 上,能查到它才算这个字库是真的可用。
+        bool ok = lv_font_get_glyph_dsc(s_cjk, &g, 0x4F60, 0) && g.box_w > 0;
         if (!ok) {
             ESP_LOGW(TAG, "中文字体查不到字形(LVGL 版本与字库不匹配),回落 Montserrat");
             s_cjk = nullptr;
