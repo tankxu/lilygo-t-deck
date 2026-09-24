@@ -53,6 +53,8 @@ constexpr int SCR_W = 320, SCR_H = 240;
 constexpr int ROW_H = 34;      // 一行文字(26)+ 上下留白
 
 constexpr int MAX_SONGS   = 24;
+constexpr int COVER_PX    = 120;   // 播放页大图
+constexpr int THUMB_PX    = 46;    // 列表行缩略图
 constexpr int SAMPLE_RATE = 24000;
 
 struct Song {
@@ -366,20 +368,22 @@ bool search_and_play(const char* query)
 uint8_t*       g_cover_buf = nullptr;
 lv_image_dsc_t g_cover_dsc;
 
-bool fetch_cover(const char* key)
+// 下载一张封面 JPEG。px 是服务端裁好的边长。
+// 成功返回 PSRAM 上的缓冲(调用方 free),*out_len 是长度。
+uint8_t* fetch_jpeg(const char* key, int px, int* out_len)
 {
     char url[400];
     snprintf(url, sizeof(url),
-             MUSIC_BASE_URL "/cover?f=%s.jpg&w=120&h=120&key=" MUSIC_TOKEN, key);
+             MUSIC_BASE_URL "/cover?f=%s.jpg&w=%d&h=%d&key=" MUSIC_TOKEN, key, px, px);
 
     esp_http_client_config_t cfg = {};
     cfg.url = url; cfg.timeout_ms = 8000;
     esp_http_client_handle_t cli = esp_http_client_init(&cfg);
-    if (!cli) return false;
+    if (!cli) return nullptr;
 
-    constexpr int CAP = 48 * 1024;
+    const int CAP = 48 * 1024;
     uint8_t* buf = (uint8_t*)heap_caps_malloc(CAP, MALLOC_CAP_SPIRAM);
-    if (!buf) { esp_http_client_cleanup(cli); return false; }
+    if (!buf) { esp_http_client_cleanup(cli); return nullptr; }
 
     int len = 0;
     if (esp_http_client_open(cli, 0) == ESP_OK) {
@@ -391,7 +395,7 @@ bool fetch_cover(const char* key)
         }
     }
     esp_http_client_cleanup(cli);
-    if (len < 100) { free(buf); return false; }
+    if (len < 100) { free(buf); return nullptr; }
 
     // ⚠️ LVGL 的 JPEG 嗅探【只认 JFIF】。lv_tjpgd.c 的 is_jpg() 是逐字节比对
     //     FF D8 FF E0 00 10 'J' 'F' 'I' 'F'
@@ -411,8 +415,8 @@ bool fetch_cover(const char* key)
         };
         uint8_t* fixed = (uint8_t*)heap_caps_malloc(len + sizeof(APP0), MALLOC_CAP_SPIRAM);
         if (fixed) {
-            fixed[0] = 0xFF; fixed[1] = 0xD8;                  // SOI
-            memcpy(fixed + 2, APP0, sizeof(APP0));             // 补 JFIF
+            fixed[0] = 0xFF; fixed[1] = 0xD8;                   // SOI
+            memcpy(fixed + 2, APP0, sizeof(APP0));              // 补 JFIF
             memcpy(fixed + 2 + sizeof(APP0), buf + 2, len - 2); // 原样接上剩下的
             free(buf);
             buf = fixed;
@@ -420,18 +424,51 @@ bool fetch_cover(const char* key)
         }
     }
 
+    *out_len = len;
+    return buf;
+}
+
+void fill_dsc(lv_image_dsc_t* d, uint8_t* buf, int len, int px)
+{
+    *d = {};
+    d->header.magic = LV_IMAGE_HEADER_MAGIC;
+    d->header.cf    = LV_COLOR_FORMAT_RAW;   // 让解码器链去认格式
+    d->header.w     = px;
+    d->header.h     = px;
+    d->data         = buf;
+    d->data_size    = len;
+}
+
+// 播放页那张大图
+bool fetch_cover(const char* key)
+{
+    int len = 0;
+    uint8_t* buf = fetch_jpeg(key, COVER_PX, &len);
+    if (!buf) return false;
     if (g_cover_buf) free(g_cover_buf);
     g_cover_buf = buf;
-    g_cover_dsc = {};
-    g_cover_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
-    g_cover_dsc.header.cf    = LV_COLOR_FORMAT_RAW;   // 让解码器链去认格式
-    g_cover_dsc.header.w     = 120;
-    g_cover_dsc.header.h     = 120;
-    g_cover_dsc.data         = g_cover_buf;
-    g_cover_dsc.data_size    = len;
+    fill_dsc(&g_cover_dsc, g_cover_buf, len, COVER_PX);
     ESP_LOGI(TAG, "封面 %d 字节", len);
     return true;
 }
+
+// ── 列表缩略图 ────────────────────────────────────────────
+// 列表里每行都要一张小封面 —— 这是"像个正经 app"和"一堆文字"的分界线。
+// 缓存条目是固定数组,地址稳定,lv_image 可以直接指过去不用再拷。
+// 抓取放后台任务里逐张来:一次 24 个 HTTP 请求会把界面卡死,而且顺序抓
+// 正好是从上往下,用户看到的就是"图一张张浮出来",和手机上一样。
+struct Thumb {
+    uint8_t*       buf = nullptr;
+    lv_image_dsc_t dsc{};
+    bool           ready = false;
+};
+Thumb g_thumbs[MAX_SONGS];
+
+TaskHandle_t   g_thumb_task = nullptr;
+volatile bool  g_thumb_stop = false;
+// UI 重建代数。后台抓完图要回贴到行上,但那时界面可能已经被重建甚至拆掉了。
+// 拿代数对一下,过期的更新直接丢掉,不去碰野指针。
+volatile uint32_t g_ui_gen = 0;
 
 // ── UI ────────────────────────────────────────────────────
 lv_obj_t* mk(lv_obj_t* p, const lv_font_t* f, uint32_t c, int x, int y, const char* s)
@@ -533,6 +570,9 @@ private:
 
         for (auto& r : rows_) r = nullptr;
         for (auto& m : play_mark_) m = nullptr;
+        for (auto& x : row_img_) x = nullptr;
+        for (auto& x : row_ph_)  x = nullptr;
+        mini_ = nullptr;
     }
 
     static lv_obj_t* lbl(lv_obj_t* p, const lv_font_t* f, uint32_t c, int x, int y, const char* s)
@@ -798,97 +838,285 @@ private:
     }
 
     // ── 曲库 ──────────────────────────────────────────────
+    // ── 首页:曲库 ────────────────────────────────────────
+    //
+    // 排版照手机音乐 app 来:顶部标题栏,下面是通栏的列表,每行左边一张
+    // 封面、右边两行字(歌名 / 歌手)和时长,底部在播放时浮一条 mini player。
+    //
+    // 几个尺寸不是随手定的:
+    //  · 中文字库只有 20px 一个字号,行高【26】。两行字就是 52,所以行高
+    //    定 58,封面 46 正好塞得下并且左右留白对称。
+    //  · 240 高的屏幕,标题栏 36 + mini 44 之后只剩 160,看得到不到三行。
+    //    这就是这块屏的真实容量,与其把字压小到看不清,不如老老实实滚动。
+    //  · 每首歌是一张独立圆角卡片,不是通栏的长条。卡片之间靠留白分隔,
+    //    不用发丝线 —— 留白比线更干净,而且卡片有自己的投影,层次是"浮起来"
+    //    的而不是"划出来"的。代价是同屏看到的条数更少,这块屏就这么大。
+    static constexpr int HDR_H  = 36;
+    static constexpr int MINI_H = 44;
+    static constexpr int CARD_X = 12;                 // 卡片左右留白
+    static constexpr int CARD_W = SCR_W - CARD_X * 2;
+    static constexpr int CARD_H = 62;
+    static constexpr int CARD_GAP = 8;
+    static constexpr int THUMB_X = 8, TEXT_X = 64;
+
     void show_library()
     {
         view_ = View::Library;
         lv_obj_clean(root_); clear_refs();
-        lbl(root_, &lv_font_montserrat_14, 0x8A9480, 16, 14, "LIBRARY");
+        g_ui_gen++;                       // 之前那批回贴作废
 
-        if (g_state.playing) {
-            // 顶部一条"正在播放",点了回到播放页 —— 手机音乐 app 的标配
-            lv_obj_t* mini = lv_obj_create(root_);
-            lv_obj_set_size(mini, SCR_W - 28, CJK_LINE_H + 8);
-            lv_obj_set_pos(mini, 14, 34);
-            lv_obj_set_style_bg_color(mini, lv_color_hex(0xE8EEE0), LV_PART_MAIN);
-            lv_obj_set_style_radius(mini, 8, LV_PART_MAIN);
-            lv_obj_set_style_border_width(mini, 0, LV_PART_MAIN);
-            lv_obj_set_style_pad_all(mini, 0, LV_PART_MAIN);
-            lv_obj_remove_flag(mini, LV_OBJ_FLAG_SCROLLABLE);
-            lv_obj_add_flag(mini, LV_OBJ_FLAG_CLICKABLE);
-            lv_obj_add_event_cb(mini, [](lv_event_t* e) {
-                static_cast<MusicApp*>(lv_event_get_user_data(e))->show_now();
-            }, LV_EVENT_CLICKED, this);
-            // 定宽【还要】定高:LONG_DOT 是按高度截的,只限宽的话长标题会
-            // 换到第二行,从这条 30px 高的小条里溢出去,盖住下面的搜索框。
-            lv_obj_t* l = lbl(mini, F16(), 0x55853A, 10, 4, g_state.title);
-            lv_obj_set_size(l, 232, CJK_LINE_H);
-            lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
-            lbl(mini, FICON(), 0x55853A, SCR_W - 60, 6, LV_SYMBOL_PLAY);
-        }
+        build_header();
 
-        int top = g_state.playing ? 70 : 34;
-        search_row_ = lv_obj_create(root_);
-        lv_obj_set_size(search_row_, SCR_W - 28, 30);
-        lv_obj_set_pos(search_row_, 14, top);
-        lv_obj_set_style_bg_color(search_row_, lv_color_hex(0xF4F6F0), LV_PART_MAIN);
-        lv_obj_set_style_radius(search_row_, 8, LV_PART_MAIN);
-        lv_obj_set_style_border_width(search_row_, 1, LV_PART_MAIN);
-        lv_obj_set_style_border_color(search_row_, lv_color_hex(0xD2DAC4), LV_PART_MAIN);
-        lv_obj_set_style_pad_all(search_row_, 0, LV_PART_MAIN);
-        lv_obj_remove_flag(search_row_, LV_OBJ_FLAG_SCROLLABLE);
-        lbl(search_row_, FICON(), 0x6A7360, 10, 7, LV_SYMBOL_PLUS);
-        lbl(search_row_, F16(), 0x6A7360, 30, 2, "Search a song");
+        bool playing = g_state.playing;
+        int  list_h  = SCR_H - HDR_H - (playing ? MINI_H : 0);
 
         list_ = lv_obj_create(root_);
-        lv_obj_set_size(list_, SCR_W - 28, SCR_H - top - 44);
-        lv_obj_set_pos(list_, 14, top + 38);
+        lv_obj_set_size(list_, SCR_W, list_h);
+        lv_obj_set_pos(list_, 0, HDR_H);
         lv_obj_set_style_bg_opa(list_, LV_OPA_TRANSP, LV_PART_MAIN);
         lv_obj_set_style_border_width(list_, 0, LV_PART_MAIN);
         lv_obj_set_style_pad_all(list_, 0, LV_PART_MAIN);
         lv_obj_set_scroll_dir(list_, LV_DIR_VER);
         lv_obj_set_scrollbar_mode(list_, LV_SCROLLBAR_MODE_OFF);
 
-        for (int i = 0; i < g_state.n_songs; i++) {
-            lv_obj_t* r = lv_obj_create(list_);
-            lv_obj_set_size(r, SCR_W - 32, ROW_H);
-            lv_obj_set_pos(r, 0, i * (ROW_H + 4));
-            lv_obj_set_style_bg_color(r, lv_color_hex(0xF4F6F0), LV_PART_MAIN);
-            lv_obj_set_style_radius(r, 8, LV_PART_MAIN);
-            lv_obj_set_style_border_width(r, 1, LV_PART_MAIN);
-            lv_obj_set_style_pad_all(r, 0, LV_PART_MAIN);
-            lv_obj_remove_flag(r, LV_OBJ_FLAG_SCROLLABLE);
-            lv_obj_set_user_data(r, (void*)(intptr_t)i);
-            lv_obj_add_flag(r, LV_OBJ_FLAG_CLICKABLE);
-            lv_obj_add_event_cb(r, [](lv_event_t* e) {
-                auto* s = static_cast<MusicApp*>(lv_event_get_user_data(e));
-                int idx = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target_obj(e));
-                s->stop_and_play(idx);
-            }, LV_EVENT_CLICKED, this);
+        for (int i = 0; i < g_state.n_songs; i++) build_row(i);
 
-            // 标题和艺术家合成一行。
-            // 240 高的屏幕上两行一行 26px,一条目就要 56px,连三条都放不下。
-            // 中文字库只有 20px 一个字号,没法把副行做小,所以并成一行,
-            // 艺术家降成次要信息(完整信息在播放页上)。
-            // LV_LABEL_LONG_DOT 是按【高度】截的,所以高度必须钉成恰好一行,
-            // 否则长标题会换行、从行框里溢出去盖住下一条。
-            char line[160];
-            if (g_songs[i].artist[0])
-                snprintf(line, sizeof(line), "%s \u00b7 %s", g_songs[i].title, g_songs[i].artist);
-            else
-                snprintf(line, sizeof(line), "%s", g_songs[i].title);
-            lv_obj_t* tl = lbl(r, F16(), 0x1B2117, 10, (ROW_H - CJK_LINE_H) / 2, line);
-            lv_obj_set_size(tl, 196, CJK_LINE_H);
-            lv_label_set_long_mode(tl, LV_LABEL_LONG_DOT);
-            lv_obj_t* al = nullptr;
-            char d[16];
-            snprintf(d, sizeof(d), "%d:%02d", g_songs[i].dur / 60, g_songs[i].dur % 60);
-            lbl(r, &lv_font_montserrat_14, 0x8A9480, SCR_W - 66, (ROW_H - 18) / 2, d);
-            play_mark_[i] = lbl(r, FICON(), 0x55853A, SCR_W - 92, (ROW_H - 18) / 2, LV_SYMBOL_PLAY);
-            (void)al;
-            lv_obj_add_flag(play_mark_[i], LV_OBJ_FLAG_HIDDEN);
-            rows_[i] = r;
-        }
+        if (playing) build_mini();
         paint(); paint_playing();
+        start_thumbs();
+    }
+
+    void build_header()
+    {
+        lv_obj_t* h = lv_obj_create(root_);
+        lv_obj_set_size(h, SCR_W, HDR_H);
+        lv_obj_set_pos(h, 0, 0);
+        lv_obj_set_style_bg_color(h, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+        lv_obj_set_style_border_width(h, 0, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(h, 0, LV_PART_MAIN);
+        lv_obj_remove_flag(h, LV_OBJ_FLAG_SCROLLABLE);
+
+        lbl(h, F20(), C_TEXT, 14, (HDR_H - CJK_LINE_H) / 2, "音乐");
+
+        char n[24];
+        snprintf(n, sizeof(n), "%d", g_state.n_songs);
+        lbl(h, &lv_font_montserrat_14, 0xA3AC98, 62, (HDR_H - 18) / 2, n);
+
+        // 搜索做成标题栏右边的圆钮。轨迹球从第一行再往上就选中它,
+        // 所以键盘用户也够得着(sel_ == -1)。
+        search_row_ = lv_obj_create(h);
+        lv_obj_set_size(search_row_, 30, 30);
+        lv_obj_set_pos(search_row_, SCR_W - 40, 3);
+        lv_obj_set_style_radius(search_row_, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(search_row_, lv_color_hex(0xEDF1E7), LV_PART_MAIN);
+        lv_obj_set_style_border_width(search_row_, 0, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(search_row_, 0, LV_PART_MAIN);
+        lv_obj_remove_flag(search_row_, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(search_row_, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(search_row_, [](lv_event_t* e) {
+            static_cast<MusicApp*>(lv_event_get_user_data(e))->enter_search(0);
+        }, LV_EVENT_CLICKED, this);
+        // LVGL 内建的 FontAwesome 子集里【没有放大镜】,拿 + 号凑会读成"添加"。
+        // 这台机器有实体键盘,用键盘图标反而更准:意思就是"打字搜"。
+        lv_obj_t* si = lbl(search_row_, FICON(), C_ACCENT, 0, 0, LV_SYMBOL_KEYBOARD);
+        lv_obj_center(si);
+
+        // 标题栏和内容之间一条发丝线,滚动时才分得出"栏"和"内容"
+        lv_obj_t* ln = lv_obj_create(root_);
+        lv_obj_set_size(ln, SCR_W, 1);
+        lv_obj_set_pos(ln, 0, HDR_H - 1);
+        lv_obj_set_style_bg_color(ln, lv_color_hex(0xE6EADF), LV_PART_MAIN);
+        lv_obj_set_style_border_width(ln, 0, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(ln, 0, LV_PART_MAIN);
+    }
+
+    void build_row(int i)
+    {
+        lv_obj_t* r = lv_obj_create(list_);
+        lv_obj_set_size(r, CARD_W, CARD_H);
+        lv_obj_set_pos(r, CARD_X, i * (CARD_H + CARD_GAP));
+        lv_obj_set_style_bg_color(r, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+        lv_obj_set_style_radius(r, 14, LV_PART_MAIN);
+        lv_obj_set_style_border_width(r, 0, LV_PART_MAIN);
+        // 投影很轻:浅色底上稍微重一点就会脏。用主题绿而不是黑,
+        // 黑投影在这块偏暖的白底上会发灰。
+        lv_obj_set_style_shadow_width(r, 10, LV_PART_MAIN);
+        lv_obj_set_style_shadow_offset_y(r, 2, LV_PART_MAIN);
+        lv_obj_set_style_shadow_opa(r, LV_OPA_10, LV_PART_MAIN);
+        lv_obj_set_style_shadow_color(r, lv_color_hex(C_ACCENT), LV_PART_MAIN);
+        lv_obj_set_style_pad_all(r, 0, LV_PART_MAIN);
+        lv_obj_remove_flag(r, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_user_data(r, (void*)(intptr_t)i);
+        lv_obj_add_flag(r, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(r, [](lv_event_t* e) {
+            auto* s = static_cast<MusicApp*>(lv_event_get_user_data(e));
+            int idx = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target_obj(e));
+            s->stop_and_play(idx);
+        }, LV_EVENT_CLICKED, this);
+
+        // 封面位先摆一块底色,图抓到了再盖上去。
+        // 留位而不是等图到了再插入,是为了让卡片高度从一开始就定死 ——
+        // 否则图陆续到达时整个列表会一跳一跳地重排。
+        lv_obj_t* ph = lv_obj_create(r);
+        lv_obj_set_size(ph, THUMB_PX, THUMB_PX);
+        lv_obj_set_pos(ph, THUMB_X, (CARD_H - THUMB_PX) / 2);
+        lv_obj_set_style_bg_color(ph, lv_color_hex(0xE8EEE0), LV_PART_MAIN);
+        lv_obj_set_style_radius(ph, 8, LV_PART_MAIN);
+        lv_obj_set_style_border_width(ph, 0, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(ph, 0, LV_PART_MAIN);
+        lv_obj_remove_flag(ph, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_t* nt = lbl(ph, FICON(), 0xB6C2A6, 0, 0, LV_SYMBOL_AUDIO);
+        lv_obj_center(nt);
+        row_ph_[i] = ph;
+
+        lv_obj_t* im = lv_image_create(r);
+        lv_obj_set_pos(im, THUMB_X, (CARD_H - THUMB_PX) / 2);
+        lv_obj_add_flag(im, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_radius(im, 8, LV_PART_MAIN);
+        lv_obj_set_style_clip_corner(im, true, LV_PART_MAIN);
+        row_img_[i] = im;
+
+        const int TW = CARD_W - TEXT_X - 46;
+        lv_obj_t* tl = lbl(r, F16(), C_TEXT, TEXT_X, 5, g_songs[i].title);
+        lv_obj_set_size(tl, TW, CJK_LINE_H);
+        lv_label_set_long_mode(tl, LV_LABEL_LONG_DOT);
+
+        lv_obj_t* al = lbl(r, F16(), 0x9AA48C, TEXT_X, 5 + CJK_LINE_H,
+                           g_songs[i].artist[0] ? g_songs[i].artist : "-");
+        lv_obj_set_size(al, TW, CJK_LINE_H);
+        lv_label_set_long_mode(al, LV_LABEL_LONG_DOT);
+
+        char d[16];
+        snprintf(d, sizeof(d), "%d:%02d", g_songs[i].dur / 60, g_songs[i].dur % 60);
+        lbl(r, &lv_font_montserrat_14, 0xA3AC98, CARD_W - 42, (CARD_H - 18) / 2, d);
+
+        // 正在播的那首:封面右下角一个小三角。绝对定位,不占文字的位置。
+        play_mark_[i] = lbl(r, FICON(), C_ACCENT, THUMB_X + THUMB_PX - 12,
+                            (CARD_H - THUMB_PX) / 2 + THUMB_PX - 16, LV_SYMBOL_PLAY);
+        lv_obj_add_flag(play_mark_[i], LV_OBJ_FLAG_HIDDEN);
+
+        rows_[i] = r;
+        if (g_thumbs[i].ready) apply_thumb(i);
+    }
+
+    // 底部常驻的 mini player。手机音乐 app 的标配:列表里翻歌的时候
+    // 当前这首永远在手边,不用退回播放页。
+    void build_mini()
+    {
+        lv_obj_t* m = lv_obj_create(root_);
+        lv_obj_set_size(m, SCR_W, MINI_H);
+        lv_obj_set_pos(m, 0, SCR_H - MINI_H);
+        lv_obj_set_style_bg_color(m, lv_color_hex(0xF4F7F0), LV_PART_MAIN);
+        lv_obj_set_style_radius(m, 0, LV_PART_MAIN);
+        lv_obj_set_style_border_width(m, 0, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(m, 0, LV_PART_MAIN);
+        lv_obj_remove_flag(m, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(m, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(m, [](lv_event_t* e) {
+            static_cast<MusicApp*>(lv_event_get_user_data(e))->show_now();
+        }, LV_EVENT_CLICKED, this);
+
+        lv_obj_t* ln = lv_obj_create(m);
+        lv_obj_set_size(ln, SCR_W, 1);
+        lv_obj_set_pos(ln, 0, 0);
+        lv_obj_set_style_bg_color(ln, lv_color_hex(0xE0E6D6), LV_PART_MAIN);
+        lv_obj_set_style_border_width(ln, 0, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(ln, 0, LV_PART_MAIN);
+
+        // 用列表那张 46px 缩略图,不用播放页的 120px 大图:
+        // 少缩放一次,清晰度反而更好,而且这张多半已经解码缓存过了。
+        const lv_image_dsc_t* src = nullptr;
+        int src_px = 0;
+        if (playing_idx_ >= 0 && playing_idx_ < MAX_SONGS && g_thumbs[playing_idx_].ready) {
+            src = &g_thumbs[playing_idx_].dsc; src_px = THUMB_PX;
+        } else if (g_cover_buf) {
+            src = &g_cover_dsc; src_px = COVER_PX;
+        }
+        if (src) {
+            const int MP = 34;
+            lv_obj_t* im = lv_image_create(m);
+            lv_image_set_src(im, src);
+            // ⚠️ lv_image_set_scale 是【绕轴心】缩的,轴心默认在图的正中。
+            // 120px 的图摆在 (8,5) 再缩到 28%,画出来的内容会落在
+            // (68,65) 附近 —— 那已经在这条 44px 高的 bar 外面了,整张图
+            // 被裁得一点不剩,看上去就是"没显示",而且不报任何错。
+            // 把轴心挪到左上角,缩放后才还是从 (8,5) 开始画。
+            lv_image_set_pivot(im, 0, 0);
+            lv_image_set_scale(im, 256 * MP / src_px);
+            lv_obj_set_size(im, MP, MP);
+            lv_obj_set_pos(im, 8, (MINI_H - MP) / 2);
+            lv_obj_set_style_radius(im, 5, LV_PART_MAIN);
+            lv_obj_set_style_clip_corner(im, true, LV_PART_MAIN);
+        }
+
+        char line[160];
+        if (g_state.artist[0])
+            snprintf(line, sizeof(line), "%s · %s", g_state.title, g_state.artist);
+        else
+            snprintf(line, sizeof(line), "%s", g_state.title);
+        lv_obj_t* l = lbl(m, F16(), C_TEXT, 50, (MINI_H - CJK_LINE_H) / 2, line);
+        lv_obj_set_size(l, SCR_W - 50 - 46, CJK_LINE_H);
+        lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+
+        lv_obj_t* b = lv_obj_create(m);
+        lv_obj_set_size(b, 32, 32);
+        lv_obj_set_pos(b, SCR_W - 40, (MINI_H - 32) / 2);
+        lv_obj_set_style_radius(b, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(b, lv_color_hex(C_ACCENT), LV_PART_MAIN);
+        lv_obj_set_style_border_width(b, 0, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(b, 0, LV_PART_MAIN);
+        lv_obj_remove_flag(b, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(b, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(b, [](lv_event_t* e) {
+            lv_event_stop_bubbling(e);   // 别连带触发 mini 条的"进播放页"
+            static_cast<MusicApp*>(lv_event_get_user_data(e))->toggle();
+        }, LV_EVENT_CLICKED, this);
+        lv_obj_t* s = lbl(b, FICON(), 0xFFFFFF, 0, 0,
+                          g_state.playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+        lv_obj_center(s);
+        mini_ = m;
+    }
+
+    void apply_thumb(int i)
+    {
+        if (!row_img_[i] || !g_thumbs[i].ready) return;
+        lv_image_set_src(row_img_[i], &g_thumbs[i].dsc);
+        lv_obj_remove_flag(row_img_[i], LV_OBJ_FLAG_HIDDEN);
+        if (row_ph_[i]) lv_obj_add_flag(row_ph_[i], LV_OBJ_FLAG_HIDDEN);
+    }
+
+    void start_thumbs()
+    {
+        if (g_thumb_task) return;          // 已经在抓了
+        g_thumb_stop = false;
+        BaseType_t ok = xTaskCreate([](void*) {
+            uint32_t gen = g_ui_gen;
+            for (int i = 0; i < g_state.n_songs && !g_thumb_stop; i++) {
+                if (!g_thumbs[i].ready) {
+                    int len = 0;
+                    uint8_t* b = fetch_jpeg(g_songs[i].key, THUMB_PX, &len);
+                    if (!b) continue;
+                    g_thumbs[i].buf = b;
+                    fill_dsc(&g_thumbs[i].dsc, b, len, THUMB_PX);
+                    g_thumbs[i].ready = true;
+                }
+                // 回贴到界面上。代数对不上说明界面已经重建过(或者 app
+                // 已经退出),这时候去碰那些 lv_obj_t* 就是野指针。
+                lvgl_port_lock(0);
+                if (self_ && self_->root_ && gen == g_ui_gen &&
+                    self_->view_ == View::Library) {
+                    self_->apply_thumb(i);
+                }
+                lvgl_port_unlock();
+            }
+            g_thumb_task = nullptr;
+            vTaskDelete(nullptr);
+        }, "music_thumb", 8192, nullptr, 3, &g_thumb_task);
+        if (ok != pdPASS) {
+            g_thumb_task = nullptr;
+            ESP_LOGW(TAG, "缩略图任务起不来,内部 RAM 剩 %u",
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        }
     }
 
     void stop_and_play(int i)
@@ -902,16 +1130,20 @@ private:
     {
         if (search_row_) {
             bool on = (sel_ < 0);
-            lv_obj_set_style_border_color(search_row_,
-                lv_color_hex(on ? 0x55853A : 0xD2DAC4), LV_PART_MAIN);
-            lv_obj_set_style_border_width(search_row_, on ? 2 : 1, LV_PART_MAIN);
+            lv_obj_set_style_bg_color(search_row_,
+                lv_color_hex(on ? C_ACCENT : 0xEDF1E7), LV_PART_MAIN);
+            lv_obj_t* s = lv_obj_get_child(search_row_, 0);
+            if (s) lv_obj_set_style_text_color(s,
+                lv_color_hex(on ? 0xFFFFFF : C_ACCENT), LV_PART_MAIN);
         }
+        // 卡片的选中态用描边 + 更实的投影,而不是换底色:
+        // 底色一变,卡片和背景的对比就散了,反而看不出"浮起来的那张是哪张"。
         for (int i = 0; i < g_state.n_songs; i++) {
             if (!rows_[i]) continue;
             bool on = (i == sel_);
-            lv_obj_set_style_border_color(rows_[i],
-                lv_color_hex(on ? 0x55853A : 0xE0E5D8), LV_PART_MAIN);
-            lv_obj_set_style_border_width(rows_[i], on ? 2 : 1, LV_PART_MAIN);
+            lv_obj_set_style_border_width(rows_[i], on ? 2 : 0, LV_PART_MAIN);
+            lv_obj_set_style_border_color(rows_[i], lv_color_hex(C_ACCENT), LV_PART_MAIN);
+            lv_obj_set_style_shadow_opa(rows_[i], on ? LV_OPA_30 : LV_OPA_10, LV_PART_MAIN);
         }
         if (sel_ >= 0 && g_state.n_songs && rows_[sel_])
             lv_obj_scroll_to_view(rows_[sel_], LV_ANIM_ON);
@@ -1004,6 +1236,9 @@ private:
     lv_obj_t* cover_ = nullptr, *title_ = nullptr, *artist_ = nullptr;
     lv_obj_t* bar_fill_ = nullptr, *t_cur_ = nullptr, *t_tot_ = nullptr, *btn_play_ = nullptr;
     lv_obj_t* rows_[MAX_SONGS] = {};
+    lv_obj_t* row_img_[MAX_SONGS] = {};
+    lv_obj_t* row_ph_[MAX_SONGS]  = {};
+    lv_obj_t* mini_ = nullptr;
     lv_obj_t* play_mark_[MAX_SONGS] = {};
     lv_timer_t* tick_ = nullptr;
     char q_[128] = {};
