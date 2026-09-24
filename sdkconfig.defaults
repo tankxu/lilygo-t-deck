@@ -33,6 +33,8 @@ CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
 
 # ── C++ ──
 CONFIG_COMPILER_CXX_EXCEPTIONS=y
+# 小智的 audio_service 用 dynamic_cast 区分 codec 子类,必须开 RTTI
+CONFIG_COMPILER_CXX_RTTI=y
 
 # ── LVGL ──
 # 字体:bring-up 阶段够用。中文要另配 CJK 字体子集(放 storage 分区),后面再说。

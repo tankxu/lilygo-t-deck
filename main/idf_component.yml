@@ -13,3 +13,13 @@ dependencies:
   # Opus/MP3 解码(小智同款,音乐播放器和将来的小智共用)
   espressif/esp_audio_codec:
     version: "^2.4.0"
+  # 小智核心要的两个:esp-ml307 提供 http/websocket/mqtt/udp 的统一抽象
+  # (它的 Http/WebSocket 接口被 protocols 层直接用),esp-sr 提供 AFE 和
+  # 唤醒词模型的路径解析(model_path.h)。
+  # 重采样(audio_service 用 esp_ae_rate_cvt)
+  espressif/esp_audio_effects:
+    version: "*"
+  # 2.3.x —— afe_audio_processor 用的是 2.x 的 API(afe_config_init / AFE_TYPE_VC)。
+  # 别被小智 lock 里的 1.7.0 误导,那是传递依赖不是直接依赖。
+  espressif/esp-sr:
+    version: "~2.3.0"
