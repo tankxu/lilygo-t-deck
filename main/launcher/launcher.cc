@@ -12,6 +12,7 @@
 
 #include "app.h"
 #include "avatar.h"
+#include "sys/volume.h"
 #include "wx_icon.h"
 #include "tdeck_bsp.h"
 
@@ -456,7 +457,7 @@ private:
         lv_obj_remove_flag(sc_, LV_OBJ_FLAG_SCROLLABLE);
 
         lv_obj_t* box = lv_obj_create(sc_);
-        lv_obj_set_size(box, 268, 192);
+        lv_obj_set_size(box, 268, 206);
         lv_obj_center(box);
         lv_obj_set_style_radius(box, 18, LV_PART_MAIN);
         lv_obj_set_style_bg_color(box, lv_color_hex(C_CARD), LV_PART_MAIN);
@@ -475,8 +476,9 @@ private:
             { "y / click",  "open" },
             { "n / b",      "back" },
             { "q",          "quit to home" },
+            { "o / i",      "volume + / -" },
+            { "0",          "talk to XIAOZHI" },
             { "s",          "this list" },
-            { "hold click", "talk to XIAOZHI" },
         };
         int y = 48;
         for (auto& r : rows) {
@@ -550,6 +552,11 @@ private:
                     open(xiaozhi_idx_);
                 }
                 lvgl_port_unlock(); return;
+            // 音量。BBQ10 键盘上 I / O 的副标就印着 - 和 +,所以这两个键
+            // 归系统管:不管当前在哪个 app 都能调,和手机侧边音量键一个意思。
+            // 正在打字的 app(wants_raw_keys)在上面已经 return 了,不受影响。
+            case 'o': case 'O': tdeck::volume::step(+1); lvgl_port_unlock(); return;
+            case 'i': case 'I': tdeck::volume::step(-1); lvgl_port_unlock(); return;
             case 's': case 'S': toggle_shortcuts(); lvgl_port_unlock(); return;
             case 'q': case 'Q':
                 if (sc_)      { toggle_shortcuts(); lvgl_port_unlock(); return; }

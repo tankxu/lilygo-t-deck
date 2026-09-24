@@ -17,6 +17,7 @@
 //
 // ⚠️ 这是开发期工具,没有任何鉴权。发布前用 Kconfig 关掉。
 
+#include "sys/volume.h"
 #include "debug_server.h"
 #include "tdeck_bsp.h"
 #include "tdeck_pins.h"
@@ -72,6 +73,41 @@ esp_err_t h_shot(httpd_req_t* req)
 {
     lvgl_port_lock(0);
     lv_draw_buf_t* snap = lv_snapshot_take(lv_screen_active(), LV_COLOR_FORMAT_RGB565);
+
+    // ⚠️ lv_screen_active() 【不包含】lv_layer_top()。音量 HUD、快捷键浮层、
+    // 以后小智的悬浮窗都建在 top layer 上 —— 只拍 active screen 的话它们在
+    // 截图里根本不存在,而屏幕上明明看得见。这会让人把"浮层没弹出来"和
+    // "浮层弹了但截图看不到"搞混,白白查半天。
+    // 所以这里把 top layer 单独拍成 ARGB8888,再按 alpha 合上去。
+    if (snap) {
+        lv_obj_t* top = lv_layer_top();
+        if (lv_obj_get_child_count(top) > 0) {
+            lv_draw_buf_t* ov = lv_snapshot_take(top, LV_COLOR_FORMAT_ARGB8888);
+            if (ov) {
+                int w = (int)snap->header.w, h = (int)snap->header.h;
+                if ((int)ov->header.w == w && (int)ov->header.h == h) {
+                    for (int y = 0; y < h; y++) {
+                        uint16_t* d = (uint16_t*)(snap->data + y * snap->header.stride);
+                        uint8_t*  s = ov->data + y * ov->header.stride;
+                        for (int x = 0; x < w; x++, s += 4) {
+                            uint8_t a = s[3];
+                            if (!a) continue;
+                            uint8_t sb = s[0], sg = s[1], sr = s[2];
+                            uint16_t p = d[x];
+                            uint8_t dr = ((p >> 11) & 0x1F) << 3;
+                            uint8_t dg = ((p >> 5)  & 0x3F) << 2;
+                            uint8_t db = ( p        & 0x1F) << 3;
+                            uint8_t r = (uint8_t)((sr * a + dr * (255 - a)) / 255);
+                            uint8_t g = (uint8_t)((sg * a + dg * (255 - a)) / 255);
+                            uint8_t b = (uint8_t)((sb * a + db * (255 - a)) / 255);
+                            d[x] = (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+                        }
+                    }
+                }
+                lv_draw_buf_destroy(ov);
+            }
+        }
+    }
     lvgl_port_unlock();
 
     if (!snap) {
@@ -176,12 +212,12 @@ esp_err_t h_info(httpd_req_t* req)
     snprintf(buf, sizeof(buf),
              "{\"uptime_s\":%lld,"
              "\"heap_internal\":%u,\"heap_psram\":%u,\"heap_min\":%u,"
-             "\"battery_mv\":%d}\n",
+             "\"battery_mv\":%d,\"volume\":%d}\n",
              esp_timer_get_time() / 1000000,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
              (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
-             tdeck_battery_mv());
+             tdeck_battery_mv(), tdeck::volume::get());
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, buf);
     return ESP_OK;

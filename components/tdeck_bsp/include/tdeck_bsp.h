@@ -86,7 +86,10 @@ void tdeck_set_voice_key_handler(tdeck_voice_key_cb_t cb, void* user);
 
 // ── 音频 ──────────────────────────────────────────────────
 // 输入:ES7210(I2C 配置 + 独立 I2S)。输出:I2S 直推 class-D 功放,无输出 codec。
-esp_err_t tdeck_audio_init(uint32_t sample_rate);
+// 采样率和声道数要用【解码器报的真实值】。写死会导致播放速度不对
+// (Opus 内部按 48kHz 工作,标称 24kHz 的流也可能解出 48kHz)。
+// 格式变了会自动重建 I2S 通道。
+esp_err_t tdeck_audio_init(uint32_t sample_rate, uint8_t channels);
 
 // 阻塞读录音。返回实际读到的字节数,失败返回负数。
 int tdeck_mic_read(int16_t* buf, size_t samples, uint32_t timeout_ms);

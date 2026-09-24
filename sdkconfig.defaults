@@ -73,3 +73,10 @@ CONFIG_LV_USE_DEMO_BENCHMARK=n
 CONFIG_LV_USE_DEMO_STRESS=n
 CONFIG_LV_USE_DEMO_MUSIC=n
 CONFIG_LV_USE_DEMO_KEYPAD_AND_ENCODER=n
+
+# LVGL 的 TJPGD 解码器要解【内存里】的 JPEG(我们的专辑封面是 HTTP 拉下来的,
+# 不落盘),必须开 MEMFS —— 它把内存缓冲包装成 lv_fs 路径喂给解码器。
+# 不开的话 lv_image_set_src 不报错,只是画不出来,是个静默失败。
+# LETTER 默认 0 表示禁用,必须给个真盘符;'M' = 77,和现有的盘符都不冲突。
+CONFIG_LV_USE_FS_MEMFS=y
+CONFIG_LV_FS_MEMFS_LETTER=77

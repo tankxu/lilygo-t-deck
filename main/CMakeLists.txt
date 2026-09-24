@@ -6,6 +6,7 @@ idf_component_register(
         "launcher/avatar.cc"
         "launcher/wx_icon.cc"
         "net/net.cc"
+        "sys/volume.cc"
         "debug/debug_server.cc"
         "ui/fonts.cc"
         "ui/cbin_font.c"

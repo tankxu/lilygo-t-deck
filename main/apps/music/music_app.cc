@@ -19,6 +19,8 @@
 #include <esp_http_client.h>
 #include <esp_log.h>
 #include <esp_timer.h>
+#include <inttypes.h>
+#include "sys/volume.h"
 #include <esp_lvgl_port.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -176,7 +178,7 @@ void play_task(void* arg)
         }
         ESP_LOGI(TAG, "开始播放:%s", g_play_url);
 
-        tdeck_audio_init(SAMPLE_RATE);
+        // 先不配 I2S —— 等解出第一帧,拿解码器报的真实格式再配(见下)
         g_state.playing = true;
         g_state.pos_s = 0;
 
@@ -186,6 +188,8 @@ void play_task(void* arg)
         int64_t t_log = esp_timer_get_time();
         bool first_pcm = true;
         int empty_reads = 0;
+        uint32_t out_rate = SAMPLE_RATE;
+        uint8_t  out_ch = 1;
 
         while (!g_stop_req) {
             int n = esp_http_client_read(cli, (char*)in + pending, IN_CAP - pending);
@@ -219,11 +223,26 @@ void play_task(void* arg)
                 if (o.decoded_size > 0) {
                     if (first_pcm) {
                         first_pcm = false;
-                        ESP_LOGI(TAG, "首帧 PCM:%u 字节", (unsigned)o.decoded_size);
+                        // 问解码器要真实格式。服务端标称 24kHz 单声道,但 Opus
+                        // 内部按 48kHz 工作,解出来未必是标称值 —— 按标称值配
+                        // I2S 的话声音会被拉慢,而且不报任何错。
+                        esp_audio_simple_dec_info_t di = {};
+                        uint32_t rate = SAMPLE_RATE; uint8_t ch = 1;
+                        if (esp_audio_simple_dec_get_info(dec, &di) == ESP_AUDIO_ERR_OK
+                                && di.sample_rate > 0) {
+                            rate = di.sample_rate;
+                            ch   = di.channel ? di.channel : 1;
+                        }
+                        ESP_LOGI(TAG, "解码格式:%" PRIu32 "Hz %d 声道 %d bit,首帧 %u 字节",
+                                 rate, ch, di.bits_per_sample, (unsigned)o.decoded_size);
+                        tdeck_audio_init(rate, ch);
+                        out_rate = rate; out_ch = ch;
                     }
                     tdeck_speaker_write((int16_t*)out, o.decoded_size / 2, 1000);
-                    samples_out += o.decoded_size / 2;
-                    g_state.pos_s = (int)(samples_out / SAMPLE_RATE);
+                    // 进度按【每声道的帧数】算,立体声时 decoded_size 里
+                    // 装的是两个声道交织的样本,直接除 2 会让进度快一倍
+                    samples_out += o.decoded_size / 2 / out_ch;
+                    g_state.pos_s = (int)(samples_out / out_rate);
                 }
                 if (raw.consumed == 0) break;   // 数据不够拼一帧,回去再拉
                 raw.buffer += raw.consumed;
@@ -475,6 +494,7 @@ private:
     {
         list_ = search_row_ = q_lbl_ = sr_ = nullptr;
         cover_ = title_ = artist_ = bar_fill_ = t_cur_ = t_tot_ = btn_play_ = nullptr;
+
         for (auto& r : rows_) r = nullptr;
         for (auto& m : play_mark_) m = nullptr;
     }
@@ -554,23 +574,75 @@ private:
         t_cur_ = lbl(root_, &lv_font_montserrat_14, 0x6A7360, RX, 144, "0:00");
         t_tot_ = lbl(root_, &lv_font_montserrat_14, 0x6A7360, RX + RW - 34, 144, "0:00");
 
-        // 传输控件。做成真按钮而不是标签 —— 触摸能点,不用非得走轨迹球
-        btn_play_ = mk_btn(120, 178, 56, LV_SYMBOL_PAUSE, [](lv_event_t* e) {
-            auto* s = static_cast<MusicApp*>(lv_event_get_user_data(e));
-            s->toggle();
-        });
-        mk_btn(56,  182, 44, LV_SYMBOL_PREV, [](lv_event_t* e) {
+        // ── 底部控制条 ────────────────────────────────────
+        // 封面占到 y=164,所有按钮必须整体落在它【下面】。之前按钮 cy 是
+        // 178/182、直径 56,上沿到 150,被封面压住了一半 —— 一行统一 cy=196,
+        // 最大的那颗上沿也只到 168,不会再撞。
+        //
+        // 右上角【不放东西】:那一角是背光漏光最重的地方(见 docs/hardware.md),
+        // 浅色内容摆上去会被红光吃掉。所以回曲库的入口放在这一行最右边。
+        constexpr int ROW_Y = 196;
+        mk_vol_pill(40, ROW_Y);
+        mk_btn(108, ROW_Y, 44, LV_SYMBOL_PREV, [](lv_event_t* e) {
             static_cast<MusicApp*>(lv_event_get_user_data(e))->skip(-1);
         });
-        mk_btn(204, 182, 44, LV_SYMBOL_NEXT, [](lv_event_t* e) {
+        btn_play_ = mk_btn(160, ROW_Y, 56, LV_SYMBOL_PAUSE, [](lv_event_t* e) {
+            static_cast<MusicApp*>(lv_event_get_user_data(e))->toggle();
+        });
+        mk_btn(212, ROW_Y, 44, LV_SYMBOL_NEXT, [](lv_event_t* e) {
             static_cast<MusicApp*>(lv_event_get_user_data(e))->skip(1);
         });
-        mk_btn(272, 182, 40, LV_SYMBOL_LIST, [](lv_event_t* e) {
+        mk_btn(290, ROW_Y, 38, LV_SYMBOL_LIST, [](lv_event_t* e) {
             static_cast<MusicApp*>(lv_event_get_user_data(e))->show_library();
         });
 
         lbl(root_, &lv_font_montserrat_14, 0x8A9480, 16, 14, "NOW PLAYING");
         on_tick();
+    }
+
+    // 音量做成一颗胶囊,左右各一半:− 和 + 是一对,分成两颗独立圆钮会让它们
+    // 看起来和 prev/next 同级,实际不是。中间一道细分隔线提示"这里可以按两边"。
+    void mk_vol_pill(int cx, int cy)
+    {
+        constexpr int PW = 68, PH = 38;
+        lv_obj_t* pill = lv_obj_create(root_);
+        lv_obj_set_size(pill, PW, PH);
+        lv_obj_set_pos(pill, cx - PW / 2, cy - PH / 2);
+        lv_obj_set_style_radius(pill, PH / 2, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(pill, lv_color_hex(0xEDF1E7), LV_PART_MAIN);
+        lv_obj_set_style_border_width(pill, 0, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(pill, 0, LV_PART_MAIN);
+        lv_obj_remove_flag(pill, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t* div = lv_obj_create(pill);
+        lv_obj_set_size(div, 1, 18);
+        lv_obj_set_pos(div, PW / 2, (PH - 18) / 2);
+        lv_obj_set_style_bg_color(div, lv_color_hex(0xD3DBC8), LV_PART_MAIN);
+        lv_obj_set_style_border_width(div, 0, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(div, 0, LV_PART_MAIN);
+
+        auto half = [&](int x, const char* sym, int delta) {
+            lv_obj_t* h = lv_obj_create(pill);
+            lv_obj_set_size(h, PW / 2, PH);
+            lv_obj_set_pos(h, x, 0);
+            lv_obj_set_style_bg_opa(h, LV_OPA_TRANSP, LV_PART_MAIN);
+            lv_obj_set_style_border_width(h, 0, LV_PART_MAIN);
+            lv_obj_set_style_pad_all(h, 0, LV_PART_MAIN);
+            lv_obj_remove_flag(h, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(h, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_set_user_data(h, (void*)(intptr_t)delta);
+            lv_obj_add_event_cb(h, [](lv_event_t* e) {
+                int d = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target_obj(e));
+                tdeck::volume::step(d);
+            }, LV_EVENT_CLICKED, nullptr);
+            lv_obj_t* l = lv_label_create(h);
+            lv_obj_set_style_text_font(l, &lv_font_montserrat_16, LV_PART_MAIN);
+            lv_obj_set_style_text_color(l, lv_color_hex(0x55853A), LV_PART_MAIN);
+            lv_label_set_text(l, sym);
+            lv_obj_center(l);
+        };
+        half(0,      LV_SYMBOL_MINUS, -1);
+        half(PW / 2, LV_SYMBOL_PLUS,  +1);
     }
 
     lv_obj_t* mk_btn(int cx, int cy, int d, const char* sym, lv_event_cb_t cb)
@@ -712,10 +784,14 @@ private:
                 s->stop_and_play(idx);
             }, LV_EVENT_CLICKED, this);
 
-            lv_obj_t* tl = lbl(r, F16(), 0x1B2117, 10, 2, g_songs[i].title);
-            lv_label_set_long_mode(tl, LV_LABEL_LONG_DOT); lv_obj_set_width(tl, 220);
-            lv_obj_t* al = lbl(r, F16(), 0x8A9480, 10, 21, g_songs[i].artist);
-            lv_label_set_long_mode(al, LV_LABEL_LONG_DOT); lv_obj_set_width(al, 220);
+            // LV_LABEL_LONG_DOT 是按【高度】截的:只设宽度,长标题会换到第二行,
+            // 正好盖住下面固定 y 的歌手名。必须把高度也钉成一行。
+            lv_obj_t* tl = lbl(r, F16(), 0x1B2117, 10, 3, g_songs[i].title);
+            lv_obj_set_size(tl, 210, 18);
+            lv_label_set_long_mode(tl, LV_LABEL_LONG_DOT);
+            lv_obj_t* al = lbl(r, F16(), 0x8A9480, 10, 22, g_songs[i].artist);
+            lv_obj_set_size(al, 210, 18);
+            lv_label_set_long_mode(al, LV_LABEL_LONG_DOT);
             char d[16];
             snprintf(d, sizeof(d), "%d:%02d", g_songs[i].dur / 60, g_songs[i].dur % 60);
             lbl(r, &lv_font_montserrat_14, 0x8A9480, SCR_W - 66, 12, d);

@@ -5,6 +5,7 @@
 
 #include "app.h"
 #include "net/net.h"
+#include "sys/volume.h"
 #include "ui/fonts.h"
 #include "tdeck_bsp.h"
 #include "tdeck_pins.h"
@@ -71,6 +72,8 @@ extern "C" void app_main(void)
     if (apps.empty()) {
         ESP_LOGE(TAG, "注册表是空的 —— 检查 main/CMakeLists.txt 有没有 WHOLE_ARCHIVE");
     }
+
+    tdeck::volume::init();   // 读回上次的音量,任何人放声音之前
 
     lvgl_port_lock(0);
     tdeck::fonts_init();   // launcher 建 UI 之前要先有字体

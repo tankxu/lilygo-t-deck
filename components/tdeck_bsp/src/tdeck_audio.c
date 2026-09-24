@@ -12,6 +12,11 @@
 //    若板上是别的型号可能要 32bit —— 症状是【完全没声或刺耳噪声】,
 //    而不是"声音小",据此可以快速判断。
 //
+// ⚠️ 采样率【必须】用解码器报的真实值,不能按源流的标称值写死。
+// Opus 内部一律按 48kHz 工作,即使源流标称 24kHz,解码器也可能输出 48kHz;
+// 声道数同理。写死 24kHz 单声道去播 48kHz 的 PCM,声音会慢一倍 ——
+// 这种错不会报任何错误,只是听起来"被拉长了"。
+//
 // 麦克风(ES7210)不在这里 —— 它要经 I2C 配置,等小智集成时和它的
 // codec 层一起做,避免两套实现抢同一颗芯片。
 
@@ -29,10 +34,21 @@ static i2s_chan_handle_t s_tx;
 static uint32_t          s_rate;
 static uint8_t           s_volume = 70;
 
-esp_err_t tdeck_audio_init(uint32_t sample_rate)
+static uint8_t s_ch = 1;
+
+esp_err_t tdeck_audio_init(uint32_t sample_rate, uint8_t channels)
 {
-    if (s_tx) return ESP_OK;
+    if (channels == 0) channels = 1;
+    // 格式没变就不动。变了必须整个重建通道 —— i2s_channel_reconfig_std_clock
+    // 只能改时钟,改不了声道模式,而声道数变了 slot 布局也要跟着变。
+    if (s_tx && s_rate == sample_rate && s_ch == channels) return ESP_OK;
+    if (s_tx) {
+        i2s_channel_disable(s_tx);
+        i2s_del_channel(s_tx);
+        s_tx = NULL;
+    }
     s_rate = sample_rate;
+    s_ch   = channels;
 
     i2s_chan_config_t chan = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     chan.auto_clear = true;   // 没数据时自动填 0,否则停止播放会拖出一段噪声
@@ -41,7 +57,7 @@ esp_err_t tdeck_audio_init(uint32_t sample_rate)
     i2s_std_config_t std = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
         .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
-                                                    I2S_SLOT_MODE_MONO),
+                        channels >= 2 ? I2S_SLOT_MODE_STEREO : I2S_SLOT_MODE_MONO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,          // 功放不要 MCLK
             .bclk = TDECK_PIN_I2S_BCK,
@@ -51,13 +67,14 @@ esp_err_t tdeck_audio_init(uint32_t sample_rate)
             .invert_flags = { false, false, false },
         },
     };
-    std.slot_cfg.slot_mask = I2S_STD_SLOT_BOTH;   // 见文件头注释 1
+    if (channels < 2) std.slot_cfg.slot_mask = I2S_STD_SLOT_BOTH;   // 见文件头注释 1
 
     ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(s_tx, &std), TAG, "I2S 标准模式配置失败");
     ESP_RETURN_ON_ERROR(i2s_channel_enable(s_tx), TAG, "I2S 使能失败");
 
-    ESP_LOGI(TAG, "音频输出就绪 %" PRIu32 "Hz 单声道  BCK=%d WS=%d DOUT=%d",
-             sample_rate, TDECK_PIN_I2S_BCK, TDECK_PIN_I2S_WS, TDECK_PIN_I2S_DOUT);
+    ESP_LOGI(TAG, "音频输出就绪 %" PRIu32 "Hz %s  BCK=%d WS=%d DOUT=%d",
+             sample_rate, channels >= 2 ? "立体声" : "单声道",
+             TDECK_PIN_I2S_BCK, TDECK_PIN_I2S_WS, TDECK_PIN_I2S_DOUT);
     return ESP_OK;
 }
 
