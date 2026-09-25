@@ -8,6 +8,7 @@
 // 两个接口都用 ?key=<token> 鉴权,token 在 secrets.h 里(不进版本库)。
 
 #include "app.h"
+#include <math.h>
 #include "secrets.h"
 #include "tdeck_bsp.h"
 #include "ui/fonts.h"
@@ -1062,7 +1063,8 @@ private:
     // 再小就撑不起"封面墙"的样子。一屏正好看到一个完整分区加下一个的标题,
     // 和手机上滚动的节奏是一样的。
     static constexpr int HDR_H     = 34;
-    static constexpr int SEC_TTL_H = 28;              // 分区标题
+    static constexpr int SEC_TTL_H = 30;              // 分区标题
+    static constexpr int SEC_GAP   = 16;              // 分区之间的呼吸
     static constexpr int COVER     = 88;
     static constexpr int TILE_GAP  = 2;
     // 格子四周都比封面大出 TILE_PAD:选中时的 outline 画在封面【外侧】,
@@ -1071,7 +1073,7 @@ private:
     static constexpr int TILE_PAD  = 3;   // 刚好容下 3px 的选中框
     static constexpr int TILE_W    = COVER + TILE_PAD * 2;
     int tile_h() const { return TILE_PAD + COVER + 4 + SMALL_LH() * 2; }
-    int section_h() const { return SEC_TTL_H + tile_h(); }
+    int section_h() const { return SEC_TTL_H + tile_h() + SEC_GAP; }
     static constexpr int SIDE      = 12;              // 左右留白
     static constexpr int MINI_H    = 48;
 
@@ -1644,6 +1646,49 @@ private:
 
 MusicApp* MusicApp::self_ = nullptr;
 
+// 把快照四角抹成背景色,做出圆角。
+//
+// ⚠️ 不用 LVGL 的 radius + clip_corner:clip_corner 裁的是【子对象】,
+// 图片本身是画在对象自己身上的,裁不到 —— 实测只有选中那张看着是圆角,
+// 那其实是外面那圈 outline 的圆角造成的错觉,图还是方的。
+// 快照是 RGB565、没有 alpha,所以直接把角上的像素写成背景色(白),
+// 页面底色也是白,看起来就是圆角。边缘做一档半透混合,免得锯齿太硬。
+void round_corners(lv_draw_buf_t* buf, int r, uint16_t bg)
+{
+    if (!buf || r <= 0) return;
+    const int w = (int)buf->header.w, h = (int)buf->header.h;
+    const int stride = (int)buf->header.stride;
+    uint8_t* base = buf->data;
+    const int bg_r = (bg >> 11) & 31, bg_g = (bg >> 5) & 63, bg_b = bg & 31;
+
+    for (int cy = 0; cy < 2; cy++) {
+        for (int cx = 0; cx < 2; cx++) {
+            int ox = cx ? w - r : 0;          // 这个角的外接方块
+            int oy = cy ? h - r : 0;
+            float fx = cx ? (float)(w - r) : (float)r;   // 圆心
+            float fy = cy ? (float)(h - r) : (float)r;
+            for (int y = 0; y < r; y++) {
+                if (oy + y < 0 || oy + y >= h) continue;
+                uint16_t* row = (uint16_t*)(base + (size_t)(oy + y) * stride);
+                for (int x = 0; x < r; x++) {
+                    if (ox + x < 0 || ox + x >= w) continue;
+                    float dx = (ox + x) + 0.5f - fx;
+                    float dy = (oy + y) + 0.5f - fy;
+                    float d  = sqrtf(dx * dx + dy * dy);
+                    if (d <= r - 0.5f) continue;                 // 圆内,保留
+                    uint16_t* px = &row[ox + x];
+                    if (d >= r + 0.5f) { *px = bg; continue; }   // 圆外,涂背景
+                    // 边界一档混合
+                    int pr = (*px >> 11) & 31, pg = (*px >> 5) & 63, pb = *px & 31;
+                    *px = (uint16_t)((((pr + bg_r) / 2) << 11) |
+                                     (((pg + bg_g) / 2) << 5)  |
+                                      ((pb + bg_b) / 2));
+                }
+            }
+        }
+    }
+}
+
 // 在 LVGL 任务里把 JPEG 解成 RGB565(声明见文件上方)
 void decode_thumb(int i)
 {
@@ -1662,8 +1707,7 @@ void decode_thumb(int i)
     // 和页面背景一致,角上就看不出来。
     lv_obj_set_style_bg_color(box, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
     lv_obj_set_style_border_width(box, 0, LV_PART_MAIN);
-    lv_obj_set_style_radius(box, COVER_R, LV_PART_MAIN);
-    lv_obj_set_style_clip_corner(box, true, LV_PART_MAIN);
+    lv_obj_set_style_radius(box, 0, LV_PART_MAIN);   // 圆角在 round_corners 里做
     lv_obj_set_style_pad_all(box, 0, LV_PART_MAIN);
     lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -1682,6 +1726,7 @@ void decode_thumb(int i)
     g_thumbs[i].buf = nullptr;
     g_thumbs[i].dsc = {};
     if (!rgb) return;
+    round_corners(rgb, COVER_R, 0xFFFF);      // 白色 = 页面底色
     g_thumbs[i].rgb = rgb;
     g_thumbs[i].ready = true;
     MusicApp::notify_thumb(i);

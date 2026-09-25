@@ -14,7 +14,9 @@ namespace {
 constexpr const char* TAG     = "volume";
 constexpr const char* NVS_NS  = "tdecksys";
 constexpr const char* NVS_KEY = "vol";
-constexpr int DEFAULT_VOL = 70;
+// 开机默认音量。70 在这个小喇叭上已经相当吵了,对齐手机的习惯取 40 ——
+// 用户嫌大随手调,嫌小也随手调,但"一开机吓一跳"是要避免的。
+constexpr int DEFAULT_VOL = 40;
 
 int s_vol = DEFAULT_VOL;
 
