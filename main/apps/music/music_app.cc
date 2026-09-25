@@ -71,12 +71,19 @@ constexpr int SEC_N       = 3;
 constexpr int SEC_CAP     = 8;    // 每排 8 首:再多就是内部堆里的对象数在涨
 constexpr int COVER_PX    = 120;   // 播放页大图
 constexpr int THUMB_PX    = 88;    // 封面墙上的方形封面
+constexpr int COVER_R     = 8;     // 封面圆角。占位块、图片、选中框共用一个值,
+                                   // 三者半径不一致的话选中框会和图错开一圈
 constexpr int SAMPLE_RATE = 24000;
 
 struct Song {
     char key[40];
     char title[64];
     char artist[48];
+    // 服务端给的封面地址,【不能自己按 key 拼】。
+    // 已缓存的歌是 /cover?f=<key>.jpg,而"热门新歌"这类还没落盘的歌
+    // 走的是 /thumb?u=<远程地址>&w=... —— 对后者拼 /cover?f=key.jpg 会 404,
+    // 结果就是整排封面都是占位图。
+    char cover[144];
     int  dur;
 };
 
@@ -181,6 +188,9 @@ void fetch_list()
             strncpy(g_songs[n].artist,
                     cJSON_IsString(a) ? a->valuestring : "", sizeof(g_songs[n].artist) - 1);
             g_songs[n].dur = cJSON_IsNumber(d) ? d->valueint : 0;
+            cJSON* cv = cJSON_GetObjectItem(it, "cover");
+            strncpy(g_songs[n].cover,
+                    cJSON_IsString(cv) ? cv->valuestring : "", sizeof(g_songs[n].cover) - 1);
             n++;
             g_sec[si].count++;
         }
@@ -214,6 +224,9 @@ void fetch_list()
                     strncpy(g_songs[n].artist,
                             cJSON_IsString(a) ? a->valuestring : "", sizeof(g_songs[n].artist) - 1);
                     g_songs[n].dur = cJSON_IsNumber(d) ? d->valueint : 0;
+                    cJSON* cv = cJSON_GetObjectItem(it, "cover");
+                    strncpy(g_songs[n].cover,
+                            cJSON_IsString(cv) ? cv->valuestring : "", sizeof(g_songs[n].cover) - 1);
                     n++; g_sec[SI].count++;
                 }
                 cJSON_Delete(nr);
@@ -448,11 +461,43 @@ lv_image_dsc_t g_cover_dsc;
 
 // 下载一张封面 JPEG。px 是服务端裁好的边长。
 // 成功返回 PSRAM 上的缓冲(调用方 free),*out_len 是长度。
-uint8_t* fetch_jpeg(const char* key, int px, int* out_len)
+// cover 是服务端给的地址:可能是绝对 URL,也可能是 "/thumb?..." 这样的相对路径。
+// 空的时候退回按 key 拼(老路径,对已缓存的歌有效)。
+// 把 URL 里已有的 w=/h= 参数改成我们要的边长。
+// 服务端给的地址自带尺寸(/cover 是 160,/thumb 是 50),直接用的话
+// 拿回来的图不是我们要的大小,还得在客户端缩放 —— 不如一开始就要对。
+void rewrite_size(char* url, int px)
 {
-    char url[400];
-    snprintf(url, sizeof(url),
-             MUSIC_BASE_URL "/cover?f=%s.jpg&w=%d&h=%d&key=" MUSIC_TOKEN, key, px, px);
+    for (const char* k : { "w=", "h=" }) {
+        char* q = url;
+        while ((q = strstr(q, k))) {
+            // 必须是参数开头(前面是 ? 或 &),不能匹配到别的词里
+            if (q != url && q[-1] != '?' && q[-1] != '&') { q += 2; continue; }
+            char* v = q + 2;
+            char* e = v;
+            while (*e >= '0' && *e <= '9') e++;
+            if (e == v) { q = v; continue; }
+            char tail[420];
+            snprintf(tail, sizeof(tail), "%s", e);
+            int n = snprintf(v, 420 - (v - url), "%d%s", px, tail);
+            q = v + (n > 0 ? n : 0);
+        }
+    }
+}
+
+uint8_t* fetch_jpeg_url(const char* cover, const char* key, int px, int* out_len)
+{
+    char url[420];
+    if (cover && cover[0] == '/') {
+        snprintf(url, sizeof(url), MUSIC_BASE_URL "%s&key=" MUSIC_TOKEN, cover);
+        rewrite_size(url, px);
+    } else if (cover && cover[0]) {
+        snprintf(url, sizeof(url), "%s", cover);
+        rewrite_size(url, px);
+    } else {
+        snprintf(url, sizeof(url),
+                 MUSIC_BASE_URL "/cover?f=%s.jpg&w=%d&h=%d&key=" MUSIC_TOKEN, key, px, px);
+    }
 
     esp_http_client_config_t cfg = {};
     cfg.url = url; cfg.timeout_ms = 8000;
@@ -506,13 +551,41 @@ uint8_t* fetch_jpeg(const char* key, int px, int* out_len)
     return buf;
 }
 
+// 从 JPEG 头里读真实尺寸(扫到 SOFn 段)。
+//
+// ⚠️ 必须读,不能想当然。lv_image_dsc_t 的 header.w/h 是【我们告诉 LVGL 的】,
+// LVGL 对 RAW 源完全信任这两个值(lv_tjpgd.c 的 decoder_info 直接照抄)。
+// 之前这里写死成请求的边长,而服务端给的是 160 —— LVGL 以为图是 88x88,
+// 于是只画了左上角那一块,看起来就是封面被放大裁掉了边。
+bool jpeg_size(const uint8_t* d, int len, int* w, int* h)
+{
+    int i = 2;                                   // 跳过 SOI
+    while (i + 9 < len) {
+        if (d[i] != 0xFF) { i++; continue; }
+        uint8_t m = d[i + 1];
+        if (m == 0xD8 || m == 0x01 || (m >= 0xD0 && m <= 0xD7)) { i += 2; continue; }
+        int seg = (d[i + 2] << 8) | d[i + 3];
+        // SOFn:C0~CF,但 C4(DHT)/C8/CC 不是
+        if (m >= 0xC0 && m <= 0xCF && m != 0xC4 && m != 0xC8 && m != 0xCC) {
+            *h = (d[i + 5] << 8) | d[i + 6];
+            *w = (d[i + 7] << 8) | d[i + 8];
+            return *w > 0 && *h > 0;
+        }
+        if (seg <= 0) return false;
+        i += 2 + seg;
+    }
+    return false;
+}
+
 void fill_dsc(lv_image_dsc_t* d, uint8_t* buf, int len, int px)
 {
     *d = {};
     d->header.magic = LV_IMAGE_HEADER_MAGIC;
     d->header.cf    = LV_COLOR_FORMAT_RAW;   // 让解码器链去认格式
-    d->header.w     = px;
-    d->header.h     = px;
+    int jw = px, jh = px;
+    jpeg_size(buf, len, &jw, &jh);      // 读不出来就退回调用方给的边长
+    d->header.w     = jw;
+    d->header.h     = jh;
     d->data         = buf;
     d->data_size    = len;
 }
@@ -521,7 +594,7 @@ void fill_dsc(lv_image_dsc_t* d, uint8_t* buf, int len, int px)
 bool fetch_cover(const char* key)
 {
     int len = 0;
-    uint8_t* buf = fetch_jpeg(key, COVER_PX, &len);
+    uint8_t* buf = fetch_jpeg_url(nullptr, key, COVER_PX, &len);
     if (!buf) return false;
     if (g_cover_buf) free(g_cover_buf);
     g_cover_buf = buf;
@@ -992,11 +1065,12 @@ private:
     static constexpr int SEC_TTL_H = 28;              // 分区标题
     static constexpr int COVER     = 88;
     static constexpr int TILE_GAP  = 2;
-    // 格子比封面宽 8px:选中时的 outline 画在封面【外侧】,
-    // 格子要是正好等于封面宽,这一圈就被父容器裁掉了,看着像没选中。
-    static constexpr int TILE_PAD  = 4;
+    // 格子四周都比封面大出 TILE_PAD:选中时的 outline 画在封面【外侧】,
+    // 格子要是正好贴着封面,这一圈就被父容器裁掉。
+    // ⚠️ 上边也要留 —— 只留左右的话,封面【上方】那一段边框照样没了。
+    static constexpr int TILE_PAD  = 3;   // 刚好容下 3px 的选中框
     static constexpr int TILE_W    = COVER + TILE_PAD * 2;
-    int tile_h() const { return COVER + 4 + SMALL_LH() * 2; }
+    int tile_h() const { return TILE_PAD + COVER + 4 + SMALL_LH() * 2; }
     int section_h() const { return SEC_TTL_H + tile_h(); }
     static constexpr int SIDE      = 12;              // 左右留白
     static constexpr int MINI_H    = 48;
@@ -1101,13 +1175,20 @@ private:
         lv_obj_set_style_bg_opa(shelf, LV_OPA_TRANSP, LV_PART_MAIN);
         lv_obj_set_style_border_width(shelf, 0, LV_PART_MAIN);
         lv_obj_set_style_radius(shelf, 0, LV_PART_MAIN);
+        // ⚠️ 左右留白要做成【容器的 padding】,不能靠"第一个格子往右挪一点"。
+        // 挪格子的话这段留白属于内容,一横向滚动就跟着滚没了,
+        // 而下面没滚过的那排还留着 —— 两排左边对不齐,很明显。
+        // 做成 padding 之后它不属于内容,滚到头始终留得住。
+        // 减掉 TILE_PAD 是为了让封面(格子里再内缩 TILE_PAD)和分区标题左对齐。
         lv_obj_set_style_pad_all(shelf, 0, LV_PART_MAIN);
+        lv_obj_set_style_pad_left(shelf, SIDE - TILE_PAD, LV_PART_MAIN);
+        lv_obj_set_style_pad_right(shelf, SIDE - TILE_PAD, LV_PART_MAIN);
         lv_obj_set_scroll_dir(shelf, LV_DIR_HOR);
         lv_obj_set_scrollbar_mode(shelf, LV_SCROLLBAR_MODE_OFF);
         shelf_[si] = shelf;
 
         for (int j = 0; j < g_sec[si].count; j++)
-            build_tile(shelf, g_sec[si].start + j, SIDE + j * (TILE_W + TILE_GAP));
+            build_tile(shelf, g_sec[si].start + j, j * (TILE_W + TILE_GAP));
     }
 
     void build_tile(lv_obj_t* shelf, int i, int x)
@@ -1133,9 +1214,9 @@ private:
         // 免得图陆续到达时整排一跳一跳地重排。
         lv_obj_t* ph = lv_obj_create(c);
         lv_obj_set_size(ph, COVER, COVER);
-        lv_obj_set_pos(ph, TILE_PAD, 0);
+        lv_obj_set_pos(ph, TILE_PAD, TILE_PAD);
         lv_obj_set_style_bg_color(ph, lv_color_hex(0xE8EEE0), LV_PART_MAIN);
-        lv_obj_set_style_radius(ph, 8, LV_PART_MAIN);
+        lv_obj_set_style_radius(ph, COVER_R, LV_PART_MAIN);
         lv_obj_set_style_border_width(ph, 0, LV_PART_MAIN);
         lv_obj_set_style_pad_all(ph, 0, LV_PART_MAIN);
         lv_obj_remove_flag(ph, LV_OBJ_FLAG_SCROLLABLE);
@@ -1144,21 +1225,20 @@ private:
         row_ph_[i] = ph;
 
         lv_obj_t* im = lv_image_create(c);
-        lv_obj_set_pos(im, TILE_PAD, 0);
+        lv_obj_set_pos(im, TILE_PAD, TILE_PAD);
         lv_obj_add_flag(im, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_set_style_radius(im, 8, LV_PART_MAIN);
-        lv_obj_set_style_clip_corner(im, true, LV_PART_MAIN);
+        lv_obj_set_style_radius(im, COVER_R, LV_PART_MAIN);   // outline 跟着这个半径走
         row_img_[i] = im;
 
         // 正在播的那首:封面右下角压一个小三角
-        play_mark_[i] = lbl(c, FICON(), 0xFFFFFF, TILE_PAD + COVER - 18, COVER - 20, LV_SYMBOL_PLAY);
+        play_mark_[i] = lbl(c, FICON(), 0xFFFFFF, TILE_PAD + COVER - 18, TILE_PAD + COVER - 20, LV_SYMBOL_PLAY);
         lv_obj_add_flag(play_mark_[i], LV_OBJ_FLAG_HIDDEN);
 
-        lv_obj_t* tl = lbl(c, FS(), C_TEXT, 0, COVER + 4, g_songs[i].title);
+        lv_obj_t* tl = lbl(c, FS(), C_TEXT, 0, TILE_PAD + COVER + 4, g_songs[i].title);
         lv_obj_set_size(tl, TILE_W, SMALL_LH());
         lv_label_set_long_mode(tl, LV_LABEL_LONG_DOT);
 
-        lv_obj_t* al = lbl(c, FS(), 0x9AA48C, 0, COVER + 4 + SMALL_LH(),
+        lv_obj_t* al = lbl(c, FS(), 0x9AA48C, 0, TILE_PAD + COVER + 4 + SMALL_LH(),
                            g_songs[i].artist[0] ? g_songs[i].artist : "-");
         lv_obj_set_size(al, TILE_W, SMALL_LH());
         lv_label_set_long_mode(al, LV_LABEL_LONG_DOT);
@@ -1270,7 +1350,7 @@ private:
                         g_thumbs[i].ready = true;
                     } else {
                         int len = 0;
-                        uint8_t* b = fetch_jpeg(g_songs[i].key, THUMB_PX, &len);
+                        uint8_t* b = fetch_jpeg_url(g_songs[i].cover, g_songs[i].key, THUMB_PX, &len);
                         if (!b) continue;
                         fill_dsc(&g_thumbs[i].dsc, b, len, THUMB_PX);
                         g_thumbs[i].buf = b;
@@ -1412,11 +1492,14 @@ private:
             for (lv_obj_t* o : { row_ph_[i], row_img_[i] }) {
                 if (!o) continue;
                 lv_obj_set_style_outline_width(o, on ? 3 : 0, LV_PART_MAIN);
-                lv_obj_set_style_outline_pad(o, 2, LV_PART_MAIN);
+                lv_obj_set_style_outline_pad(o, 0, LV_PART_MAIN);  // 贴着封面,不留缝
                 lv_obj_set_style_outline_color(o, lv_color_hex(C_ACCENT), LV_PART_MAIN);
             }
         }
-        if (sel_ >= 0 && rows_[sel_]) lv_obj_scroll_to_view(rows_[sel_], LV_ANIM_ON);
+        // ⚠️ 必须用 recursive 版本。lv_obj_scroll_to_view 只滚对象的【直接父容器】,
+        // 而这里是两层:格子在横向的"排"里,排又在竖向的列表里。只滚一层的话
+        // 横向能跟上、竖向不动 —— 轨迹球往下选到第二排就跑到屏幕外面看不见了。
+        if (sel_ >= 0 && rows_[sel_]) lv_obj_scroll_to_view_recursive(rows_[sel_], LV_ANIM_ON);
     }
 
     void paint_playing()
@@ -1568,12 +1651,32 @@ void decode_thumb(int i)
 
     // 解码就是"把这张图画一遍"再把结果拍下来。off-screen 建一个 image,
     // 摆到屏幕外,snapshot 成 RGB565,然后删掉。
-    lv_obj_t* tmp = lv_image_create(lv_layer_top());
+    // 套一个固定 THUMB_PX 见方的盒子再拍 —— 封面尺寸【不受我们控制】:
+    // 已缓存的歌可以 /cover?w=&h= 指定,但"热门新歌"走的 /thumb 自带 w=50、
+    // 也不保证是正方形。不归一化的话每张图大小不一,整排会参差不齐。
+    lv_obj_t* box = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(box, THUMB_PX, THUMB_PX);
+    lv_obj_set_pos(box, -4 * THUMB_PX, -4 * THUMB_PX);
+    // 圆角【烘进图里】,和选中框的圆角对上。
+    // 快照是 RGB565、没有 alpha,所以四个角会是盒子的底色 —— 底色取白,
+    // 和页面背景一致,角上就看不出来。
+    lv_obj_set_style_bg_color(box, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+    lv_obj_set_style_border_width(box, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(box, COVER_R, LV_PART_MAIN);
+    lv_obj_set_style_clip_corner(box, true, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(box, 0, LV_PART_MAIN);
+    lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+
+    // 尺寸在请求时就要对了(rewrite_size),这里【不缩放】——
+    // lv_image_set_scale 是绕轴心缩的,和居中一起用很容易把内容推出可见区,
+    // 实测拍出来一片空白。非正方形的图靠居中 + 裁切处理。
+    lv_obj_t* tmp = lv_image_create(box);
     lv_image_set_src(tmp, &g_thumbs[i].dsc);
-    lv_obj_set_pos(tmp, -4 * THUMB_PX, -4 * THUMB_PX);
     lv_obj_update_layout(tmp);
-    lv_draw_buf_t* rgb = lv_snapshot_take(tmp, LV_COLOR_FORMAT_RGB565);
-    lv_obj_delete(tmp);
+    lv_obj_center(tmp);
+    lv_obj_update_layout(box);
+    lv_draw_buf_t* rgb = lv_snapshot_take(box, LV_COLOR_FORMAT_RGB565);
+    lv_obj_delete(box);
 
     free(g_thumbs[i].buf);          // JPEG 用完就扔
     g_thumbs[i].buf = nullptr;
