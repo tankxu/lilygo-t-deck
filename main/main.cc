@@ -34,6 +34,20 @@ extern "C" void app_main(void)
     lvgl_port_display_cfg_t disp_cfg = {
         .io_handle     = tdeck_get_panel_io(),
         .panel_handle  = tdeck_get_panel(),
+        // 滑动时卡片竖边上的"锯齿",根子在【一帧被拆成几条横带分别送出去】:
+        // 每条带渲染+发送的时刻不同,而画面在移动,于是相邻带之间错开几像素,
+        // 竖直边就被切成一段段台阶。带越多,台阶越多。
+        //
+        // 整屏一块是最彻底的解法,但 320x240x2 = 150KB,内部 RAM 放不下;
+        // 放 PSRAM 试过 —— buff_spiram 无论配不配 DMA 标志,SPI 传输都完不成,
+        // LVGL 卡死在等刷屏上(现象是开机走到联网就不动、且没有任何错误日志)。
+        //
+        // 半屏单缓冲也试过:接缝确实从 5 道减到 1 道,但失去了渲染/传输重叠,
+        // 刷屏从 3ms 变成阻塞的 16ms,帧率反而从 35 掉到 26,
+        // 而且内部 RAM 只剩 24K(小智还要用)。不划算。
+        //
+        // 所以维持 40 行双缓冲:实测 25ms/帧、35 FPS、内部 RAM 还剩 ~71K,
+        // 是量下来最好的一组。锯齿是这块内存预算下的固有代价。
         .buffer_size   = TDECK_LCD_H_RES * 40,
         .double_buffer = true,
         .hres          = TDECK_LCD_H_RES,
@@ -53,6 +67,10 @@ extern "C" void app_main(void)
             // 缓冲必须放内部 RAM 且具备 DMA 能力。放 PSRAM 会花屏:
             // esp_lcd 的 SPI 通道要对缓冲做 DMA,而 ESP32-S3 的 SPI DMA 读 PSRAM
             // 有对齐和 cache 同步的约束。双缓冲共 50KB,内部 RAM 放得下。
+            // ⚠️ 缓冲必须在内部 RAM 且可 DMA。放 PSRAM 试过两种标志组合,
+            // SPI 传输都完不成,LVGL 就卡死在等 on_color_trans_done 上,
+            // 而且一条错误日志都没有 —— 表现是开机走到联网那一步就不动了
+            // (联网回调要拿 LVGL 锁,被一起堵住)。
             .buff_dma    = true,
             .buff_spiram = false,
             // SPI 屏收的是大端 RGB565,LVGL 渲染出来是小端,必须翻字节序。

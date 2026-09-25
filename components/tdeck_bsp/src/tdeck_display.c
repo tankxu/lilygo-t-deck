@@ -27,7 +27,14 @@
 static const char* TAG = "tdeck_display";
 
 #define TDECK_LCD_SPI_HOST      SPI2_HOST
-#define TDECK_LCD_PIXEL_CLOCK   (40 * 1000 * 1000)   // 40MHz，ST7789 稳定跑得动
+// ⚠️ 这个值直接决定滑动的帧率上限。
+// 整屏 320x240 RGB565 = 153600 字节,40MHz 下光传输就要 30.7ms,
+// 也就是不管渲染多快,整屏重画都过不了 ~32 FPS。
+// 换上 Xtensa 汇编把渲染压到 22ms 之后,SPI 就成了新的瓶颈。
+//
+// 一开始我看 LVGL 性能监视器里"刷屏只占 5ms"就排除了 SPI —— 那是误读:
+// 那 5ms 只是排 DMA 的【CPU 时间】,真正的传输在后台异步跑,不计在里面。
+#define TDECK_LCD_PIXEL_CLOCK   (80 * 1000 * 1000)   // 80MHz
 #define TDECK_LCD_CMD_BITS      8
 #define TDECK_LCD_PARAM_BITS    8
 

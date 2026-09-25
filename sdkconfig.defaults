@@ -132,3 +132,9 @@ CONFIG_LV_DRAW_SW_ASM_CUSTOM_INCLUDE="esp_lvgl_port_lv_blend.h"
 # 实测 41ms → 45ms,而且内部 RAM 从 100K 掉到 63K。保持单单元。
 CONFIG_LV_OS_NONE=y
 CONFIG_LV_DRAW_SW_DRAW_UNIT_CNT=1
+
+# LVGL 的刷新周期,默认 33ms —— 那是【30 FPS 的硬上限】,不是性能指标。
+# 优化到 27ms/帧 之后量出来 28 FPS,其实是顶着这个上限,不是真实水平。
+# 放到 16ms 才能看出实际能跑多少。这个值同时也是输入设备的轮询周期,
+# 调小手感也更跟手。
+CONFIG_LV_DEF_REFR_PERIOD=16
