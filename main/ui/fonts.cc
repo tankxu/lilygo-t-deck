@@ -25,11 +25,14 @@
 
 extern "C" const uint8_t puhui_start[] asm("_binary_font_puhui_common_20_4_bin_start");
 extern "C" const uint8_t puhui_end[]   asm("_binary_font_puhui_common_20_4_bin_end");
+extern "C" const uint8_t puhui16_start[] asm("_binary_font_puhui_common_16_4_bin_start");
+extern "C" const uint8_t puhui16_end[]   asm("_binary_font_puhui_common_16_4_bin_end");
 
 namespace tdeck {
 namespace {
 const char* TAG = "fonts";
 lv_font_t* s_cjk = nullptr;
+lv_font_t* s_cjk_s = nullptr;
 }
 
 void fonts_init()
@@ -64,8 +67,28 @@ void fonts_init()
     } else {
         ESP_LOGE(TAG, "中文字体加载失败(%u 字节)", (unsigned)sz);
     }
+
+    // ── 16px 小号 ────────────────────────────────────────
+    // 列表里的歌名/歌手用它。20px 当正文在 320 宽的屏上一行放不下几个字。
+    // 同样要用汉字自检 —— 字符集比 20px 那套小,而且 LARGE 布局是否一致
+    // 只能实测,不能靠文件大小推断。查不到就返回空,调用方回落到 20px。
+    {
+        uint32_t sz16 = (uint32_t)(puhui16_end - puhui16_start);
+        s_cjk_s = cbin_font_create((uint8_t*)puhui16_start);
+        if (s_cjk_s) {
+            lv_font_glyph_dsc_t g = {};
+            if (lv_font_get_glyph_dsc(s_cjk_s, &g, 0x4F60, 0) && g.box_w > 0) {
+                ESP_LOGI(TAG, "中文小号字体已加载(%u 字节,行高 %d)",
+                         (unsigned)sz16, (int)s_cjk_s->line_height);
+            } else {
+                ESP_LOGW(TAG, "中文小号字体查不到字形,次要文字回落到 20px");
+                s_cjk_s = nullptr;
+            }
+        }
+    }
 }
 
 const lv_font_t* font_cjk() { return s_cjk; }
+const lv_font_t* font_cjk_small() { return s_cjk_s ? s_cjk_s : s_cjk; }
 
 }  // namespace tdeck

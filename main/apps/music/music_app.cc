@@ -51,6 +51,10 @@ inline const lv_font_t* F20() { auto* f = tdeck::font_cjk(); return f ? f : &lv_
 // 图标(LV_SYMBOL_*)是 FontAwesome 的私用区码位,中文字库里【没有】,
 // 用 F16() 画会变成缺字形方框。图标一律用 Montserrat。
 inline const lv_font_t* FICON() { return &lv_font_montserrat_16; }
+// 16px 中文。列表里的歌名/歌手这类次要信息用它 —— 20px 当正文太大,
+// 320 宽的屏上一行放不下几个字。拿不到就回落 20px(fonts.cc 里自检)。
+inline const lv_font_t* FS()    { auto* f = tdeck::font_cjk_small(); return f ? f : F16(); }
+inline int SMALL_LH() { return FS()->line_height; }
 
 
 
@@ -64,7 +68,7 @@ constexpr int ROW_H = 34;      // 一行文字(26)+ 上下留白
 
 constexpr int MAX_SONGS   = 30;    // 三个分区各取 10 首
 constexpr int SEC_N       = 3;
-constexpr int SEC_CAP     = 10;
+constexpr int SEC_CAP     = 8;    // 每排 8 首:再多就是内部堆里的对象数在涨
 constexpr int COVER_PX    = 120;   // 播放页大图
 constexpr int THUMB_PX    = 88;    // 封面墙上的方形封面
 constexpr int SAMPLE_RATE = 24000;
@@ -96,10 +100,15 @@ struct Section {
     int         start;      // 在 g_songs 里的起点
     int         count;
 };
+// "已缓存"这个分区名有歧义 —— 缓存是实现细节,不是一种听歌的理由,
+// 而且它和前两个分区大量重叠(听过的自然就被缓存了)。换成三个语义不重叠的:
+//   最近播放 ← mine.recent
+//   最常播放 ← mine.most   服务端【没有】真正的收藏列表,播放次数最多是最接近的
+//   热门新歌 ← new.items   另一个 kind,来源是网易云的新歌榜
 Section g_sec[SEC_N] = {
     { "最近播放", "recent", 0, 0 },
     { "最常播放", "most",   0, 0 },
-    { "已缓存",   "cached", 0, 0 },
+    { "热门新歌", "items",  0, 0 },   // 来自 /api/reco?kind=new
 };
 volatile bool g_stop_req = false;
 TaskHandle_t  g_play_task = nullptr;
@@ -154,7 +163,7 @@ void fetch_list()
     // 这里取前三个歌曲分区,每个最多 10 首,平铺进同一个 g_songs 池,
     // 分区只记录区间。
     int n = 0;
-    for (int si = 0; si < SEC_N; si++) {
+    for (int si = 0; si < SEC_N - 1; si++) {
         g_sec[si].start = n;
         g_sec[si].count = 0;
         cJSON* arr = cJSON_GetObjectItem(root, g_sec[si].json_key);
@@ -180,6 +189,40 @@ void fetch_list()
     g_state.n_songs = n;
 
     cJSON_Delete(root);
+    // 第三个分区在另一个 kind 里。单独发一次请求,失败就少一排,不影响前两排。
+    {
+        const int SI = SEC_N - 1;
+        g_sec[SI].start = n;
+        g_sec[SI].count = 0;
+        snprintf(url, sizeof(url), MUSIC_BASE_URL "/api/reco?kind=new&key=" MUSIC_TOKEN);
+        char* nb = http_get(url, 64 * 1024);
+        if (nb) {
+            cJSON* nr = cJSON_Parse(nb);
+            free(nb);
+            if (nr) {
+                cJSON* arr = cJSON_GetObjectItem(nr, "items");
+                cJSON* it;
+                if (cJSON_IsArray(arr)) cJSON_ArrayForEach(it, arr) {
+                    if (n >= MAX_SONGS || g_sec[SI].count >= SEC_CAP) break;
+                    cJSON* k  = cJSON_GetObjectItem(it, "key");
+                    cJSON* tt = cJSON_GetObjectItem(it, "title");
+                    cJSON* a  = cJSON_GetObjectItem(it, "artist");
+                    cJSON* d  = cJSON_GetObjectItem(it, "dur");
+                    if (!cJSON_IsString(k) || !cJSON_IsString(tt)) continue;
+                    strncpy(g_songs[n].key,   k->valuestring,  sizeof(g_songs[n].key) - 1);
+                    strncpy(g_songs[n].title, tt->valuestring, sizeof(g_songs[n].title) - 1);
+                    strncpy(g_songs[n].artist,
+                            cJSON_IsString(a) ? a->valuestring : "", sizeof(g_songs[n].artist) - 1);
+                    g_songs[n].dur = cJSON_IsNumber(d) ? d->valueint : 0;
+                    n++; g_sec[SI].count++;
+                }
+                cJSON_Delete(nr);
+            }
+        }
+        ESP_LOGI(TAG, "分区 %s:%d 首", g_sec[SI].title, g_sec[SI].count);
+        g_state.n_songs = n;
+    }
+
 }
 
 // ── 播放 ──────────────────────────────────────────────────
@@ -390,6 +433,7 @@ bool search_and_play(const char* query)
                    cJSON_IsString(ar) ? ar->valuestring : "", 0, nullptr);
     }
     cJSON_Delete(root);
+
     return ok;
 }
 
@@ -492,17 +536,29 @@ bool fetch_cover(const char* key)
 // 抓取放后台任务里逐张来:一次 24 个 HTTP 请求会把界面卡死,而且顺序抓
 // 正好是从上往下,用户看到的就是"图一张张浮出来",和手机上一样。
 struct Thumb {
-    uint8_t*       buf = nullptr;
+    uint8_t*       buf = nullptr;   // 原始 JPEG(转完就释放)
     lv_image_dsc_t dsc{};
+    lv_draw_buf_t* rgb = nullptr;   // 解好的 RGB565,真正拿去画的是它
     bool           ready = false;
 };
 Thumb g_thumbs[MAX_SONGS];
+
+// 把抓到的 JPEG 解成 RGB565,存回缓存。【必须在 LVGL 任务里调】。
+//
+// 为什么不直接把 JPEG 交给 lv_image:LVGL 每次重绘都会重解一遍,而且
+// TJPGD 解出来是 RGB888,还要再混一道到 RGB565 缓冲 —— 封面墙上十几张图,
+// 滑动时每帧全解一遍,卡得没法看。图片缓存也救不了:88x88 RGB888 一张 23KB,
+// 三十张 700KB,超出缓存就开始颠簸。
+// 解一次存成 RGB565,之后每帧只是整行 memcpy,正好走 Xtensa 汇编那条快路。
+void decode_thumb(int i);
 
 TaskHandle_t   g_thumb_task = nullptr;
 volatile bool  g_thumb_stop = false;
 // UI 重建代数。后台抓完图要回贴到行上,但那时界面可能已经被重建甚至拆掉了。
 // 拿代数对一下,过期的更新直接丢掉,不去碰野指针。
 volatile uint32_t g_ui_gen = 0;
+
+// 实现见文件末尾(要用到 MusicApp::apply_thumb)
 
 // ── UI ────────────────────────────────────────────────────
 lv_obj_t* mk(lv_obj_t* p, const lv_font_t* f, uint32_t c, int x, int y, const char* s)
@@ -517,7 +573,7 @@ lv_obj_t* mk(lv_obj_t* p, const lv_font_t* f, uint32_t c, int x, int y, const ch
 
 // 三个界面。默认进曲库;一旦开始播放就切到正在播放页 ——
 // 音乐 app 的主界面本来就该是"现在在放什么",列表是去找歌时才用的。
-enum class View { Library, NowPlaying, Search };
+enum class View { Library, NowPlaying, Search, Queue };
 
 class MusicApp : public tdeck::App {
 public:
@@ -538,17 +594,22 @@ public:
         static const tdeck::Shortcut now[] = {
             { "y / click", "play / pause" },
             { "ball L/R",  "prev / next" },
-            { "ball down", "back to list" },
+            { "ball down", "back to library" },
         };
         static const tdeck::Shortcut sea[] = {
             { "type",      "song name" },
             { "enter",     "search and play" },
             { "esc",       "back to list" },
         };
+        static const tdeck::Shortcut que[] = {
+            { "y / click", "play this one" },
+            { "n / b",     "back to player" },
+        };
         switch (view_) {
         case View::Library:    *out = lib; return 2;
         case View::NowPlaying: *out = now; return 3;
         case View::Search:     *out = sea; return 3;
+        case View::Queue:      *out = que; return 2;
         }
         return 0;
     }
@@ -617,10 +678,18 @@ public:
     {
         switch (view_) {
         case View::Search:     return search_input(ev);
+        case View::Queue:      return queue_input(ev);
         case View::NowPlaying: return now_input(ev);
         case View::Library:    return lib_input(ev);
         }
         return false;
+    }
+
+    // 给 decode_thumb 用:解好之后把图贴到界面上(如果界面还在)。
+    // 放在 public 段 —— 它是文件作用域函数的回调入口,不是内部实现细节。
+    static void notify_thumb(int i)
+    {
+        if (self_ && self_->root_ && self_->view_ == View::Library) self_->apply_thumb(i);
     }
 
 private:
@@ -687,10 +756,10 @@ private:
         // 长标题会一路长下去把艺术家和进度条压在底下。
         lv_obj_set_height(title_, CJK_LINE_H * 2);   // 恰好两行
 
-        artist_ = lbl(root_, F16(), 0x6A7360, RX, 104, g_state.artist);
+        artist_ = lbl(root_, FS(), 0x6A7360, RX, 106, g_state.artist);
         lv_label_set_long_mode(artist_, LV_LABEL_LONG_DOT);
         lv_obj_set_width(artist_, RW);
-        lv_obj_set_height(artist_, CJK_LINE_H);
+        lv_obj_set_height(artist_, SMALL_LH());
 
         lv_obj_t* track = lv_obj_create(root_);
         lv_obj_set_size(track, RW, 4);
@@ -715,11 +784,15 @@ private:
         // ── 左上角:返回 / 曲库 ────────────────────────────
         // 右上角【不放东西】:那一角背光漏光最重(见 docs/hardware.md),
         // 浅色内容摆上去会被红光吃掉。
-        mk_pill(12, 10, LV_SYMBOL_LEFT, "Back", [](lv_event_t* e) {
-            (void)e; tdeck::launcher_back();
-        });
-        mk_pill(88, 10, LV_SYMBOL_LIST, "Playlist", [](lv_event_t* e) {
+        // ⚠️「返回」回【曲库】,不是退出整个 app。
+        // 之前这里调的是 launcher_back(),一按就直接跳回桌面 ——
+        // 从播放页出来本该退一层,不是退到底。
+        mk_pill(12, 10, LV_SYMBOL_LEFT, "返回", [](lv_event_t* e) {
             static_cast<MusicApp*>(lv_event_get_user_data(e))->show_library();
+        });
+        // 「播放列表」= 接下来会播的队列,和"回到曲库"是两码事。
+        mk_pill(80, 10, LV_SYMBOL_LIST, "播放列表", [](lv_event_t* e) {
+            static_cast<MusicApp*>(lv_event_get_user_data(e))->show_queue();
         });
 
         // ── 底部控制条 ────────────────────────────────────
@@ -730,15 +803,18 @@ private:
         // 音量胶囊靠左,传输键组在【剩下的空间里】居中(不是全屏居中):
         // 胶囊右沿 76,屏宽 320,所以组心在 198,左右各留 48。全屏居中的话
         // 右边会空出 86px,看着像掉了一个按钮。
+        // 三颗传输键的【中心距】原来只有 52,而直径是 44 和 56 ——
+        // 边缘只剩 2px,看着像挤在一起。拉到 64:56/2 + 44/2 = 50,留 14px 空隙。
         constexpr int ROW_Y = 196;
-        mk_vol_pill(42, ROW_Y);
-        mk_btn(146, ROW_Y, 44, LV_SYMBOL_PREV, [](lv_event_t* e) {
+        constexpr int GAP   = 64;
+        mk_vol_pill(40, ROW_Y);
+        mk_btn(SCR_W / 2 + 30 - GAP, ROW_Y, 44, LV_SYMBOL_PREV, [](lv_event_t* e) {
             static_cast<MusicApp*>(lv_event_get_user_data(e))->skip(-1);
         });
-        btn_play_ = mk_btn(198, ROW_Y, 56, LV_SYMBOL_PAUSE, [](lv_event_t* e) {
+        btn_play_ = mk_btn(SCR_W / 2 + 30, ROW_Y, 56, LV_SYMBOL_PAUSE, [](lv_event_t* e) {
             static_cast<MusicApp*>(lv_event_get_user_data(e))->toggle();
         });
-        mk_btn(250, ROW_Y, 44, LV_SYMBOL_NEXT, [](lv_event_t* e) {
+        mk_btn(SCR_W / 2 + 30 + GAP, ROW_Y, 44, LV_SYMBOL_NEXT, [](lv_event_t* e) {
             static_cast<MusicApp*>(lv_event_get_user_data(e))->skip(1);
         });
 
@@ -773,8 +849,11 @@ private:
         lv_obj_set_style_text_color(i, lv_color_hex(0x55853A), LV_PART_MAIN);
         lv_label_set_text(i, sym);
 
+        // ⚠️ 文字用中文字体,不能用 Montserrat —— 药丸上写的是"返回""播放列表",
+        // Montserrat 没有汉字字形,出来是一排方框(图标那一层仍然是 Montserrat,
+        // 因为 LV_SYMBOL_* 是 FontAwesome 私用区码位,中文字库里没有)。
         lv_obj_t* l = lv_label_create(b);
-        lv_obj_set_style_text_font(l, &lv_font_montserrat_14, LV_PART_MAIN);
+        lv_obj_set_style_text_font(l, FS(), LV_PART_MAIN);
         lv_obj_set_style_text_color(l, lv_color_hex(0x3D4636), LV_PART_MAIN);
         lv_label_set_text(l, text);
         return b;
@@ -912,10 +991,13 @@ private:
     static constexpr int HDR_H     = 34;
     static constexpr int SEC_TTL_H = 28;              // 分区标题
     static constexpr int COVER     = 88;
-    static constexpr int TILE_GAP  = 8;
-    static constexpr int TILE_W    = COVER;
-    static constexpr int TILE_H    = COVER + 4 + CJK_LINE_H * 2;
-    static constexpr int SECTION_H = SEC_TTL_H + TILE_H;
+    static constexpr int TILE_GAP  = 2;
+    // 格子比封面宽 8px:选中时的 outline 画在封面【外侧】,
+    // 格子要是正好等于封面宽,这一圈就被父容器裁掉了,看着像没选中。
+    static constexpr int TILE_PAD  = 4;
+    static constexpr int TILE_W    = COVER + TILE_PAD * 2;
+    int tile_h() const { return COVER + 4 + SMALL_LH() * 2; }
+    int section_h() const { return SEC_TTL_H + tile_h(); }
     static constexpr int SIDE      = 12;              // 左右留白
     static constexpr int MINI_H    = 48;
 
@@ -941,7 +1023,7 @@ private:
         for (int si = 0; si < SEC_N; si++) {
             if (g_sec[si].count == 0) continue;
             build_section(si, y);
-            y += SECTION_H;
+            y += section_h();
         }
         // 底部留出浮层 mini player 的高度,免得最后一个分区被压住
         if (g_state.playing) {
@@ -984,8 +1066,27 @@ private:
         lv_obj_add_event_cb(search_row_, [](lv_event_t* e) {
             static_cast<MusicApp*>(lv_event_get_user_data(e))->enter_search(0);
         }, LV_EVENT_CLICKED, this);
-        lv_obj_t* si = lbl(search_row_, FICON(), C_ACCENT, 0, 0, LV_SYMBOL_KEYBOARD);
-        lv_obj_center(si);
+        // LVGL 内建的 FontAwesome 子集里【没有放大镜】。之前拿键盘图标顶替,
+        // 但那读起来是"打字"不是"搜索"。这里用两个基本图元拼一个:
+        // 一个只有描边的圆 + 一条斜线手柄。lv_line 可以直接给两点,
+        // 不需要旋转变换(9.1 里旋转属性的名字和后来版本不一样,少碰为妙)。
+        lv_obj_t* ring = lv_obj_create(search_row_);
+        lv_obj_set_size(ring, 13, 13);
+        lv_obj_set_pos(ring, 5, 5);
+        lv_obj_set_style_radius(ring, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(ring, LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_set_style_border_width(ring, 2, LV_PART_MAIN);
+        lv_obj_set_style_border_color(ring, lv_color_hex(C_ACCENT), LV_PART_MAIN);
+        lv_obj_set_style_pad_all(ring, 0, LV_PART_MAIN);
+        lv_obj_remove_flag(ring, LV_OBJ_FLAG_SCROLLABLE);
+
+        static const lv_point_precise_t handle[] = { {0, 0}, {5, 5} };
+        lv_obj_t* ln = lv_line_create(search_row_);
+        lv_line_set_points(ln, handle, 2);
+        lv_obj_set_pos(ln, 17, 17);
+        lv_obj_set_style_line_width(ln, 2, LV_PART_MAIN);
+        lv_obj_set_style_line_color(ln, lv_color_hex(C_ACCENT), LV_PART_MAIN);
+        lv_obj_set_style_line_rounded(ln, true, LV_PART_MAIN);
     }
 
     void build_section(int si, int y)
@@ -995,7 +1096,7 @@ private:
         // 横向滚动的封面排。每个分区一个独立的滚动容器,
         // 互不影响 —— 和手机上一样,滑哪一排动哪一排。
         lv_obj_t* shelf = lv_obj_create(list_);
-        lv_obj_set_size(shelf, SCR_W, TILE_H);
+        lv_obj_set_size(shelf, SCR_W, tile_h());
         lv_obj_set_pos(shelf, 0, y + SEC_TTL_H);
         lv_obj_set_style_bg_opa(shelf, LV_OPA_TRANSP, LV_PART_MAIN);
         lv_obj_set_style_border_width(shelf, 0, LV_PART_MAIN);
@@ -1012,7 +1113,7 @@ private:
     void build_tile(lv_obj_t* shelf, int i, int x)
     {
         lv_obj_t* c = lv_obj_create(shelf);
-        lv_obj_set_size(c, TILE_W, TILE_H);
+        lv_obj_set_size(c, TILE_W, tile_h());
         lv_obj_set_pos(c, x, 0);
         lv_obj_set_style_bg_opa(c, LV_OPA_TRANSP, LV_PART_MAIN);
         lv_obj_set_style_border_width(c, 0, LV_PART_MAIN);
@@ -1032,7 +1133,7 @@ private:
         // 免得图陆续到达时整排一跳一跳地重排。
         lv_obj_t* ph = lv_obj_create(c);
         lv_obj_set_size(ph, COVER, COVER);
-        lv_obj_set_pos(ph, 0, 0);
+        lv_obj_set_pos(ph, TILE_PAD, 0);
         lv_obj_set_style_bg_color(ph, lv_color_hex(0xE8EEE0), LV_PART_MAIN);
         lv_obj_set_style_radius(ph, 8, LV_PART_MAIN);
         lv_obj_set_style_border_width(ph, 0, LV_PART_MAIN);
@@ -1043,23 +1144,23 @@ private:
         row_ph_[i] = ph;
 
         lv_obj_t* im = lv_image_create(c);
-        lv_obj_set_pos(im, 0, 0);
+        lv_obj_set_pos(im, TILE_PAD, 0);
         lv_obj_add_flag(im, LV_OBJ_FLAG_HIDDEN);
         lv_obj_set_style_radius(im, 8, LV_PART_MAIN);
         lv_obj_set_style_clip_corner(im, true, LV_PART_MAIN);
         row_img_[i] = im;
 
         // 正在播的那首:封面右下角压一个小三角
-        play_mark_[i] = lbl(c, FICON(), 0xFFFFFF, COVER - 18, COVER - 20, LV_SYMBOL_PLAY);
+        play_mark_[i] = lbl(c, FICON(), 0xFFFFFF, TILE_PAD + COVER - 18, COVER - 20, LV_SYMBOL_PLAY);
         lv_obj_add_flag(play_mark_[i], LV_OBJ_FLAG_HIDDEN);
 
-        lv_obj_t* tl = lbl(c, F16(), C_TEXT, 0, COVER + 4, g_songs[i].title);
-        lv_obj_set_size(tl, TILE_W, CJK_LINE_H);
+        lv_obj_t* tl = lbl(c, FS(), C_TEXT, 0, COVER + 4, g_songs[i].title);
+        lv_obj_set_size(tl, TILE_W, SMALL_LH());
         lv_label_set_long_mode(tl, LV_LABEL_LONG_DOT);
 
-        lv_obj_t* al = lbl(c, F16(), 0x9AA48C, 0, COVER + 4 + CJK_LINE_H,
+        lv_obj_t* al = lbl(c, FS(), 0x9AA48C, 0, COVER + 4 + SMALL_LH(),
                            g_songs[i].artist[0] ? g_songs[i].artist : "-");
-        lv_obj_set_size(al, TILE_W, CJK_LINE_H);
+        lv_obj_set_size(al, TILE_W, SMALL_LH());
         lv_label_set_long_mode(al, LV_LABEL_LONG_DOT);
 
         rows_[i] = c;
@@ -1086,15 +1187,27 @@ private:
             static_cast<MusicApp*>(lv_event_get_user_data(e))->show_now();
         }, LV_EVENT_CLICKED, this);
 
+        // 封面:优先用列表那张解好的缩略图;没有就退回播放页那张 120px 大图
+        // (start_play 一定会抓它)。从搜索直接播的歌不在歌曲池里、
+        // playing_idx_ 是 -1,只有这条退路能显示封面 —— 之前少了它,
+        // 悬浮框就是空的。
         const int MP = 30;
+        const void* mini_src = nullptr;
+        int mini_px = THUMB_PX;
         if (playing_idx_ >= 0 && playing_idx_ < MAX_SONGS && g_thumbs[playing_idx_].ready) {
+            mini_src = g_thumbs[playing_idx_].rgb;
+        } else if (g_cover_buf) {
+            mini_src = &g_cover_dsc;
+            mini_px  = COVER_PX;
+        }
+        if (mini_src) {
             lv_obj_t* im = lv_image_create(m);
-            lv_image_set_src(im, &g_thumbs[playing_idx_].dsc);
+            lv_image_set_src(im, mini_src);
             // ⚠️ lv_image_set_scale 是【绕轴心】缩的,轴心默认在图正中。
             // 不把轴心挪到左上角的话,缩完内容会落到控件外面被裁光,
             // 看上去就是"图没显示",而且不报错。
             lv_image_set_pivot(im, 0, 0);
-            lv_image_set_scale(im, 256 * MP / THUMB_PX);
+            lv_image_set_scale(im, 256 * MP / mini_px);
             lv_obj_set_size(im, MP, MP);
             lv_obj_set_pos(im, 5, (MINI_H - 8 - MP) / 2);
             lv_obj_set_style_radius(im, 5, LV_PART_MAIN);
@@ -1132,7 +1245,7 @@ private:
     void apply_thumb(int i)
     {
         if (!row_img_[i] || !g_thumbs[i].ready) return;
-        lv_image_set_src(row_img_[i], &g_thumbs[i].dsc);
+        lv_image_set_src(row_img_[i], g_thumbs[i].rgb);
         lv_obj_remove_flag(row_img_[i], LV_OBJ_FLAG_HIDDEN);
         if (row_ph_[i]) lv_obj_add_flag(row_ph_[i], LV_OBJ_FLAG_HIDDEN);
     }
@@ -1152,35 +1265,122 @@ private:
                     for (int j = 0; j < i; j++)
                         if (g_thumbs[j].ready && !strcmp(g_songs[j].key, g_songs[i].key)) { dup = j; break; }
                     if (dup >= 0) {
-                        g_thumbs[i].dsc = g_thumbs[dup].dsc;   // 共用同一块 PSRAM
+                        g_thumbs[i].rgb = g_thumbs[dup].rgb;   // 共用同一块解好的位图
                         g_thumbs[i].buf = nullptr;             // 不是所有者,别 free
                         g_thumbs[i].ready = true;
                     } else {
                         int len = 0;
                         uint8_t* b = fetch_jpeg(g_songs[i].key, THUMB_PX, &len);
                         if (!b) continue;
-                        g_thumbs[i].buf = b;
                         fill_dsc(&g_thumbs[i].dsc, b, len, THUMB_PX);
-                        g_thumbs[i].ready = true;
+                        g_thumbs[i].buf = b;
+
+                        // ⚠️ 解码【交给 LVGL 任务做】,不在这个任务里做。
+                        //
+                        // 解 JPEG 要走 LVGL 的绘制管线,栈很深(16K 起)。
+                        // 如果在抓取任务里做,这个任务就得也开 16K,而它和
+                        // 20K 的播放任务同时活着 —— 内部 RAM 实测被压到只剩
+                        // 6.5KB,一崩一个准。
+                        // lv_async_call 把活儿排到 LVGL 任务上,那边本来就有 16K。
+                        lv_async_call([](void* arg) {
+                            int idx = (int)(intptr_t)arg;
+                            decode_thumb(idx);
+                        }, (void*)(intptr_t)i);
                     }
                 }
                 // 回贴到界面上。代数对不上说明界面已经重建过(或者 app
                 // 已经退出),这时候去碰那些 lv_obj_t* 就是野指针。
-                lvgl_port_lock(0);
-                if (self_ && self_->root_ && gen == g_ui_gen &&
-                    self_->view_ == View::Library) {
-                    self_->apply_thumb(i);
-                }
-                lvgl_port_unlock();
+                // 贴图这一步由 decode_thumb 解完后自己做(它就在 LVGL 任务里),
+                // 这里只负责把 JPEG 抓回来。
+                (void)gen;
             }
             g_thumb_task = nullptr;
             vTaskDelete(nullptr);
-        }, "music_thumb", 8192, nullptr, 3, &g_thumb_task);
+        }, "music_thumb", 6144, nullptr, 3, &g_thumb_task);   // 只做 HTTP,解码在 LVGL 任务里
         if (ok != pdPASS) {
             g_thumb_task = nullptr;
             ESP_LOGW(TAG, "缩略图任务起不来,内部 RAM 剩 %u",
                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
         }
+    }
+
+    // ── 播放列表(接下来播放)────────────────────────────
+    //
+    // 这和"回到曲库"是两码事:曲库是【你去挑】,播放列表是【系统排好接下来放什么】。
+    // 现在的排法就是当前这首往后顺着走 —— skip(+1) 走的也是这条线,
+    // 两者必须一致,否则"下一首"按钮和这张表会对不上。
+    // (以后要做随机/循环,改这里和 skip() 同一处即可。)
+    void show_queue()
+    {
+        view_ = View::Queue;
+        lv_obj_clean(root_); clear_refs();
+        g_ui_gen++;
+
+        mk_pill(12, 10, LV_SYMBOL_LEFT, "返回", [](lv_event_t* e) {
+            static_cast<MusicApp*>(lv_event_get_user_data(e))->show_now();
+        });
+        lbl(root_, F20(), C_TEXT, 96, 10, "接下来播放");
+
+        lv_obj_t* box = lv_obj_create(root_);
+        lv_obj_set_size(box, SCR_W, SCR_H - 46);
+        lv_obj_set_pos(box, 0, 46);
+        lv_obj_set_style_bg_opa(box, LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_set_style_border_width(box, 0, LV_PART_MAIN);
+        lv_obj_set_style_radius(box, 0, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(box, 0, LV_PART_MAIN);
+        lv_obj_set_scroll_dir(box, LV_DIR_VER);
+        lv_obj_set_scrollbar_mode(box, LV_SCROLLBAR_MODE_OFF);
+        list_ = box;
+
+        const int RH = 44, TH = 34;
+        int row = 0;
+        for (int i = playing_idx_ + 1; i < g_state.n_songs && row < 12; i++, row++) {
+            lv_obj_t* r = lv_obj_create(box);
+            lv_obj_set_size(r, SCR_W, RH);
+            lv_obj_set_pos(r, 0, row * RH);
+            lv_obj_set_style_bg_opa(r, LV_OPA_TRANSP, LV_PART_MAIN);
+            lv_obj_set_style_border_width(r, 0, LV_PART_MAIN);
+            lv_obj_set_style_radius(r, 0, LV_PART_MAIN);
+            lv_obj_set_style_pad_all(r, 0, LV_PART_MAIN);
+            lv_obj_remove_flag(r, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_set_user_data(r, (void*)(intptr_t)i);
+            lv_obj_add_flag(r, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_flag(r, LV_OBJ_FLAG_EVENT_BUBBLE);
+            lv_obj_add_event_cb(r, [](lv_event_t* e) {
+                auto* s = static_cast<MusicApp*>(lv_event_get_user_data(e));
+                int idx = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target_obj(e));
+                s->stop_and_play(idx);
+            }, LV_EVENT_CLICKED, this);
+
+            // 队列里的封面用已有的缩略图缩一下,不额外下载
+            if (g_thumbs[i].ready) {
+                lv_obj_t* im = lv_image_create(r);
+                lv_image_set_src(im, g_thumbs[i].rgb);
+                lv_image_set_pivot(im, 0, 0);      // 见 build_mini 里的说明
+                lv_image_set_scale(im, 256 * TH / THUMB_PX);
+                lv_obj_set_size(im, TH, TH);
+                lv_obj_set_pos(im, 12, (RH - TH) / 2);
+                lv_obj_set_style_radius(im, 5, LV_PART_MAIN);
+                lv_obj_set_style_clip_corner(im, true, LV_PART_MAIN);
+            }
+
+            char line[160];
+            if (g_songs[i].artist[0])
+                snprintf(line, sizeof(line), "%s · %s", g_songs[i].title, g_songs[i].artist);
+            else
+                snprintf(line, sizeof(line), "%s", g_songs[i].title);
+            lv_obj_t* l = lbl(r, FS(), C_TEXT, 56, (RH - SMALL_LH()) / 2, line);
+            lv_obj_set_size(l, SCR_W - 56 - 14, SMALL_LH());
+            lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+        }
+        if (row == 0)
+            lbl(root_, FS(), C_MUTE, 14, 70, "后面没有了");
+    }
+
+    bool queue_input(const tdeck::InputEvent& ev)
+    {
+        if (ev.key == tdeck::Key::Back) { show_now(); return true; }
+        return false;
     }
 
     void stop_and_play(int i)
@@ -1196,18 +1396,24 @@ private:
             bool on = (sel_ < 0);
             lv_obj_set_style_bg_color(search_row_,
                 lv_color_hex(on ? C_ACCENT : 0xEDF1E7), LV_PART_MAIN);
-            lv_obj_t* s = lv_obj_get_child(search_row_, 0);
-            if (s) lv_obj_set_style_text_color(s,
-                lv_color_hex(on ? 0xFFFFFF : C_ACCENT), LV_PART_MAIN);
+            // 放大镜是圆环 + 线两个对象,选中时一起翻成白色
+            uint32_t fg = on ? 0xFFFFFF : C_ACCENT;
+            if (lv_obj_t* ring = lv_obj_get_child(search_row_, 0))
+                lv_obj_set_style_border_color(ring, lv_color_hex(fg), LV_PART_MAIN);
+            if (lv_obj_t* ln = lv_obj_get_child(search_row_, 1))
+                lv_obj_set_style_line_color(ln, lv_color_hex(fg), LV_PART_MAIN);
         }
-        // 选中态画在【封面】上:一圈主题色描边。封面墙里标题是次要信息,
-        // 描在整块 tile 上反而看不出选的是哪张图。
+        // 选中态用 【outline】 而不是 border。
+        // border 是画在对象【内部】的,一加上去内容就被挤进来、封面整个位移,
+        // 选中/取消之间图会跳一下,很难看。outline 画在对象外侧,
+        // 不参与布局也不影响内容,只是外面多一圈。
         for (int i = 0; i < g_state.n_songs; i++) {
             bool on = (i == sel_);
             for (lv_obj_t* o : { row_ph_[i], row_img_[i] }) {
                 if (!o) continue;
-                lv_obj_set_style_border_width(o, on ? 3 : 0, LV_PART_MAIN);
-                lv_obj_set_style_border_color(o, lv_color_hex(C_ACCENT), LV_PART_MAIN);
+                lv_obj_set_style_outline_width(o, on ? 3 : 0, LV_PART_MAIN);
+                lv_obj_set_style_outline_pad(o, 2, LV_PART_MAIN);
+                lv_obj_set_style_outline_color(o, lv_color_hex(C_ACCENT), LV_PART_MAIN);
             }
         }
         if (sel_ >= 0 && rows_[sel_]) lv_obj_scroll_to_view(rows_[sel_], LV_ANIM_ON);
@@ -1354,6 +1560,30 @@ private:
 };
 
 MusicApp* MusicApp::self_ = nullptr;
+
+// 在 LVGL 任务里把 JPEG 解成 RGB565(声明见文件上方)
+void decode_thumb(int i)
+{
+    if (i < 0 || i >= MAX_SONGS || !g_thumbs[i].buf) return;
+
+    // 解码就是"把这张图画一遍"再把结果拍下来。off-screen 建一个 image,
+    // 摆到屏幕外,snapshot 成 RGB565,然后删掉。
+    lv_obj_t* tmp = lv_image_create(lv_layer_top());
+    lv_image_set_src(tmp, &g_thumbs[i].dsc);
+    lv_obj_set_pos(tmp, -4 * THUMB_PX, -4 * THUMB_PX);
+    lv_obj_update_layout(tmp);
+    lv_draw_buf_t* rgb = lv_snapshot_take(tmp, LV_COLOR_FORMAT_RGB565);
+    lv_obj_delete(tmp);
+
+    free(g_thumbs[i].buf);          // JPEG 用完就扔
+    g_thumbs[i].buf = nullptr;
+    g_thumbs[i].dsc = {};
+    if (!rgb) return;
+    g_thumbs[i].rgb = rgb;
+    g_thumbs[i].ready = true;
+    MusicApp::notify_thumb(i);
+}
+
 
 }  // namespace
 

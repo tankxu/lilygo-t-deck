@@ -114,8 +114,9 @@ void wifi_start()
 }
 
 // TLS 握手实测峰值约 10KB(12288 的栈只剩 2.2KB 余量,太紧)。
-// 16KB 留出余量:证书链长度、mbedTLS 配置、以后加的 HTTPS 调用都会吃栈。
-constexpr int NET_TASK_STACK = 16384;
+// 开了 MBEDTLS_EXTERNAL_MEM_ALLOC 之后大块走 PSRAM,实测峰值只剩 3.6KB,
+// 10KB 余量充足 —— 内部 RAM 很紧张,不能按最坏情况乱留。
+constexpr int NET_TASK_STACK = 10240;
 
 // ── 天气 ──
 void fetch_weather()
