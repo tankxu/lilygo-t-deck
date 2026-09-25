@@ -1,18 +1,34 @@
 dependencies:
   idf:
     version: ">=5.4"
-  # ⚠️ LVGL 必须【钉死 9.5】,不能让 esp_lvgl_port 传递依赖去解到 9.6。
+  # ⚠️ LVGL 钉死在 9.1.x —— 这是【唯一有 Xtensa SIMD】的版本。
   #
-  # 中文字库 font_puhui_common_20_4.bin 来自 78/xiaozhi-fonts,那是个
-  # 【结构体裸 dump】格式(cbin),不是 LVGL 官方的 binfont —— 加载时直接把
-  # 文件头当 lv_font_t 用。9.6 改了 lv_font_t 的字段顺序(dsc 从偏移 24 挪到
-  # 了 0,还新增了 cap_height / x_height),dump 就对不上了。
-  # 症状极其隐蔽:cbin_font_create 返回非 NULL,一个字都渲染不出来,不报错。
+  # LVGL 自带的汇编加速只有 neon / helium / riscv_v / arm2d,没有 Xtensa。
+  # ESP32-S3 的手写汇编在 esp_lvgl_port 里(src/lvgl9/simd/*_esp32s3.S),
+  # 而它的 CMakeLists 把编译条件写死成
+  #     if((lvgl_ver >= "9.1.0") AND (lvgl_ver < "9.2.0"))
+  # LVGL 9.2 改了 blend 的内部 API,Espressif 之后就没再跟。
+  #
+  # 这几个汇编加速的正是我们的瓶颈:整屏贴图走的 lv_color_blend_to_rgb565 和
+  # lv_rgb565_blend_normal_to_rgb565。纯 C 路径实测约 60~90 周期/像素,
+  # 滑动时整屏重画要 35~45ms,肉眼就是"有锯齿感"。
+  #
+  # 配套要开(见 sdkconfig.defaults):
+  #     CONFIG_LV_DRAW_SW_ASM_CUSTOM=y
+  #     CONFIG_LV_USE_DRAW_SW_ASM=255
+  #     CONFIG_LV_DRAW_SW_ASM_CUSTOM_INCLUDE="esp_lvgl_port_lv_blend.h"
+  #
+  # ⚠️ 退版本的代价:9.2 之后改过名的 API 在 9.1 里都是老名字
+  # (lv_obj_remove_flag → lv_obj_clear_flag 等),全仓库要跟着改。
+  # 另外中文字库是结构体裸 dump,换版本必须重新验证(见 docs/hardware.md)。
   lvgl/lvgl:
-    version: "~9.5.0"
+    version: "~9.1.0"
   # LVGL 9 + Espressif 的移植层(负责 flush 回调、indev、LVGL 任务)
+  # ⚠️ esp_lvgl_port 也得跟着退。2.9.0 用了 LV_COLOR_FORMAT_RGB565_SWAPPED,
+  # 那是 LVGL 9.2+ 才有的枚举 —— 它 manifest 里写的 "lvgl >=8,<10" 是假的。
+  # 2.4.x 是和 LVGL 9.1 同期的版本,而且带着 simd/*_esp32s3.S。
   espressif/esp_lvgl_port:
-    version: "^2.9.0"
+    version: "~2.4.0"
   # 触摸 GT911
   espressif/esp_lcd_touch_gt911:
     version: "^1.2.1"

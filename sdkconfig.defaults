@@ -120,3 +120,15 @@ CONFIG_LV_IMAGE_HEADER_CACHE_DEF_CNT=32
 # 注意 LV_USE_PERF_MONITOR 依赖 LV_USE_SYSMON,要一起开。
 # CONFIG_LV_USE_SYSMON=y
 # CONFIG_LV_USE_PERF_MONITOR=y
+
+# ── Xtensa SIMD 渲染加速 ──────────────────────────────────
+# esp_lvgl_port 为 ESP32-S3 手写了 blend 汇编,靠这三项挂进 LVGL。
+# 只在 LVGL 9.1.x 上可用(见 main/idf_component.yml 的说明)。
+CONFIG_LV_DRAW_SW_ASM_CUSTOM=y
+CONFIG_LV_USE_DRAW_SW_ASM=255
+CONFIG_LV_DRAW_SW_ASM_CUSTOM_INCLUDE="esp_lvgl_port_lv_blend.h"
+
+# 双核渲染试过了,【更慢】:两个 draw unit 在抢内存带宽,同步开销盖过收益,
+# 实测 41ms → 45ms,而且内部 RAM 从 100K 掉到 63K。保持单单元。
+CONFIG_LV_OS_NONE=y
+CONFIG_LV_DRAW_SW_DRAW_UNIT_CNT=1

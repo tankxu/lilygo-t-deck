@@ -62,9 +62,11 @@ constexpr uint32_t C_CARD   = 0xffffff;
 constexpr int SCR_W = 320, SCR_H = 240;
 constexpr int ROW_H = 34;      // 一行文字(26)+ 上下留白
 
-constexpr int MAX_SONGS   = 24;
+constexpr int MAX_SONGS   = 30;    // 三个分区各取 10 首
+constexpr int SEC_N       = 3;
+constexpr int SEC_CAP     = 10;
 constexpr int COVER_PX    = 120;   // 播放页大图
-constexpr int THUMB_PX    = 46;    // 列表行缩略图
+constexpr int THUMB_PX    = 88;    // 封面墙上的方形封面
 constexpr int SAMPLE_RATE = 24000;
 
 struct Song {
@@ -85,6 +87,20 @@ struct {
 } g_state;
 
 Song  g_songs[MAX_SONGS];
+
+// 分区只是【歌曲池上的一段区间】,不另存一份歌。
+// 这样 play_index()/搜索/正在播放高亮这些按下标走的逻辑全都不用动。
+struct Section {
+    const char* title;
+    const char* json_key;   // 服务端 /api/reco?kind=mine 里的字段名
+    int         start;      // 在 g_songs 里的起点
+    int         count;
+};
+Section g_sec[SEC_N] = {
+    { "最近播放", "recent", 0, 0 },
+    { "最常播放", "most",   0, 0 },
+    { "已缓存",   "cached", 0, 0 },
+};
 volatile bool g_stop_req = false;
 TaskHandle_t  g_play_task = nullptr;
 
@@ -133,29 +149,37 @@ void fetch_list()
     free(body);
     if (!root) { ESP_LOGW(TAG, "歌单 JSON 解析失败"); return; }
 
+    // 服务端一次就把 Apple Music 那种分区结构给全了:
+    //   recent / most / cached / playlists / kids_recent / kids_most
+    // 这里取前三个歌曲分区,每个最多 10 首,平铺进同一个 g_songs 池,
+    // 分区只记录区间。
     int n = 0;
-    // 服务端把最近播放放在 recent 里
-    cJSON* arr = cJSON_GetObjectItem(root, "recent");
-    if (cJSON_IsArray(arr)) {
+    for (int si = 0; si < SEC_N; si++) {
+        g_sec[si].start = n;
+        g_sec[si].count = 0;
+        cJSON* arr = cJSON_GetObjectItem(root, g_sec[si].json_key);
+        if (!cJSON_IsArray(arr)) continue;
         cJSON* it;
         cJSON_ArrayForEach(it, arr) {
-            if (n >= MAX_SONGS) break;
+            if (n >= MAX_SONGS || g_sec[si].count >= SEC_CAP) break;
             cJSON* k = cJSON_GetObjectItem(it, "key");
-            cJSON* t = cJSON_GetObjectItem(it, "title");
+            cJSON* tt = cJSON_GetObjectItem(it, "title");
             cJSON* a = cJSON_GetObjectItem(it, "artist");
             cJSON* d = cJSON_GetObjectItem(it, "dur");
-            if (!cJSON_IsString(k) || !cJSON_IsString(t)) continue;
-            strncpy(g_songs[n].key,   k->valuestring, sizeof(g_songs[n].key) - 1);
-            strncpy(g_songs[n].title, t->valuestring, sizeof(g_songs[n].title) - 1);
+            if (!cJSON_IsString(k) || !cJSON_IsString(tt)) continue;
+            strncpy(g_songs[n].key,   k->valuestring,  sizeof(g_songs[n].key) - 1);
+            strncpy(g_songs[n].title, tt->valuestring, sizeof(g_songs[n].title) - 1);
             strncpy(g_songs[n].artist,
                     cJSON_IsString(a) ? a->valuestring : "", sizeof(g_songs[n].artist) - 1);
             g_songs[n].dur = cJSON_IsNumber(d) ? d->valueint : 0;
             n++;
+            g_sec[si].count++;
         }
+        ESP_LOGI(TAG, "分区 %s:%d 首", g_sec[si].title, g_sec[si].count);
     }
-    cJSON_Delete(root);
     g_state.n_songs = n;
-    ESP_LOGI(TAG, "歌单 %d 首", n);
+
+    cJSON_Delete(root);
 }
 
 // ── 播放 ──────────────────────────────────────────────────
@@ -609,6 +633,7 @@ private:
         for (auto& m : play_mark_) m = nullptr;
         for (auto& x : row_img_) x = nullptr;
         for (auto& x : row_ph_)  x = nullptr;
+        for (auto& x : shelf_)   x = nullptr;
         mini_ = nullptr;
     }
 
@@ -874,51 +899,60 @@ private:
         }
     }
 
-    // ── 曲库 ──────────────────────────────────────────────
-    // ── 首页:曲库 ────────────────────────────────────────
+    // ── 首页:封面墙 ──────────────────────────────────────
     //
-    // 排版照手机音乐 app 来:顶部标题栏,下面是通栏的列表,每行左边一张
-    // 封面、右边两行字(歌名 / 歌手)和时长,底部在播放时浮一条 mini player。
+    // 照手机音乐 app 的首页来:竖着滚分区,每个分区里横着滚一排方形封面,
+    // 封面下面两行字(歌名 / 歌手)。服务端 /api/reco?kind=mine 一次就把
+    // 分区结构给全了(recent / most / cached),不用我们自己攒。
     //
-    // 几个尺寸不是随手定的:
-    //  · 中文字库只有 20px 一个字号,行高【26】。两行字就是 52,所以行高
-    //    定 58,封面 46 正好塞得下并且左右留白对称。
-    //  · 240 高的屏幕,标题栏 36 + mini 44 之后只剩 160,看得到不到三行。
-    //    这就是这块屏的真实容量,与其把字压小到看不清,不如老老实实滚动。
-    //  · 每首歌是一张独立圆角卡片,不是通栏的长条。卡片之间靠留白分隔,
-    //    不用发丝线 —— 留白比线更干净,而且卡片有自己的投影,层次是"浮起来"
-    //    的而不是"划出来"的。代价是同屏看到的条数更少,这块屏就这么大。
-    static constexpr int HDR_H  = 36;
-    static constexpr int MINI_H = 44;
-    static constexpr int CARD_X = 12;                 // 卡片左右留白
-    static constexpr int CARD_W = SCR_W - CARD_X * 2;
-    static constexpr int CARD_H = 62;
-    static constexpr int CARD_GAP = 8;
-    static constexpr int THUMB_X = 8, TEXT_X = 64;
+    // 尺寸是被这块屏逼出来的:中文字库只有 20px 一个字号、行高 26,
+    // 两行字就要 52px。封面取 88 —— 再大的话一屏连一个分区都放不下,
+    // 再小就撑不起"封面墙"的样子。一屏正好看到一个完整分区加下一个的标题,
+    // 和手机上滚动的节奏是一样的。
+    static constexpr int HDR_H     = 34;
+    static constexpr int SEC_TTL_H = 28;              // 分区标题
+    static constexpr int COVER     = 88;
+    static constexpr int TILE_GAP  = 8;
+    static constexpr int TILE_W    = COVER;
+    static constexpr int TILE_H    = COVER + 4 + CJK_LINE_H * 2;
+    static constexpr int SECTION_H = SEC_TTL_H + TILE_H;
+    static constexpr int SIDE      = 12;              // 左右留白
+    static constexpr int MINI_H    = 48;
 
     void show_library()
     {
         view_ = View::Library;
         lv_obj_clean(root_); clear_refs();
-        g_ui_gen++;                       // 之前那批回贴作废
+        g_ui_gen++;                       // 之前那批封面回贴作废
 
         build_header();
 
-        bool playing = g_state.playing;
-        int  list_h  = SCR_H - HDR_H - (playing ? MINI_H : 0);
-
         list_ = lv_obj_create(root_);
-        lv_obj_set_size(list_, SCR_W, list_h);
+        lv_obj_set_size(list_, SCR_W, SCR_H - HDR_H);
         lv_obj_set_pos(list_, 0, HDR_H);
         lv_obj_set_style_bg_opa(list_, LV_OPA_TRANSP, LV_PART_MAIN);
         lv_obj_set_style_border_width(list_, 0, LV_PART_MAIN);
+        lv_obj_set_style_radius(list_, 0, LV_PART_MAIN);
         lv_obj_set_style_pad_all(list_, 0, LV_PART_MAIN);
         lv_obj_set_scroll_dir(list_, LV_DIR_VER);
         lv_obj_set_scrollbar_mode(list_, LV_SCROLLBAR_MODE_OFF);
 
-        for (int i = 0; i < g_state.n_songs; i++) build_row(i);
+        int y = 0;
+        for (int si = 0; si < SEC_N; si++) {
+            if (g_sec[si].count == 0) continue;
+            build_section(si, y);
+            y += SECTION_H;
+        }
+        // 底部留出浮层 mini player 的高度,免得最后一个分区被压住
+        if (g_state.playing) {
+            lv_obj_t* pad = lv_obj_create(list_);
+            lv_obj_set_size(pad, 2, MINI_H);
+            lv_obj_set_pos(pad, 0, y);
+            lv_obj_set_style_bg_opa(pad, LV_OPA_TRANSP, LV_PART_MAIN);
+            lv_obj_set_style_border_width(pad, 0, LV_PART_MAIN);
+        }
 
-        if (playing) build_mini();
+        if (g_state.playing) build_mini();
         paint(); paint_playing();
         start_thumbs();
     }
@@ -930,19 +964,16 @@ private:
         lv_obj_set_pos(h, 0, 0);
         lv_obj_set_style_bg_color(h, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
         lv_obj_set_style_border_width(h, 0, LV_PART_MAIN);
+        lv_obj_set_style_radius(h, 0, LV_PART_MAIN);
         lv_obj_set_style_pad_all(h, 0, LV_PART_MAIN);
         lv_obj_remove_flag(h, LV_OBJ_FLAG_SCROLLABLE);
 
-        lbl(h, F20(), C_TEXT, 14, (HDR_H - CJK_LINE_H) / 2, "音乐");
+        lbl(h, F20(), C_TEXT, SIDE, (HDR_H - CJK_LINE_H) / 2, "音乐");
 
-        char n[24];
-        snprintf(n, sizeof(n), "%d", g_state.n_songs);
-        lbl(h, &lv_font_montserrat_14, 0xA3AC98, 62, (HDR_H - 18) / 2, n);
-
-        // 搜索做成标题栏右边的圆钮。轨迹球从第一行再往上就选中它,
-        // 所以键盘用户也够得着(sel_ == -1)。
+        // 搜索:LVGL 内建的 FontAwesome 子集里没有放大镜,拿加号凑会读成"添加"。
+        // 这台机器有实体键盘,键盘图标反而更准 —— 意思就是"打字搜"。
         search_row_ = lv_obj_create(h);
-        lv_obj_set_size(search_row_, 30, 30);
+        lv_obj_set_size(search_row_, 28, 28);
         lv_obj_set_pos(search_row_, SCR_W - 40, 3);
         lv_obj_set_style_radius(search_row_, LV_RADIUS_CIRCLE, LV_PART_MAIN);
         lv_obj_set_style_bg_color(search_row_, lv_color_hex(0xEDF1E7), LV_PART_MAIN);
@@ -953,50 +984,55 @@ private:
         lv_obj_add_event_cb(search_row_, [](lv_event_t* e) {
             static_cast<MusicApp*>(lv_event_get_user_data(e))->enter_search(0);
         }, LV_EVENT_CLICKED, this);
-        // LVGL 内建的 FontAwesome 子集里【没有放大镜】,拿 + 号凑会读成"添加"。
-        // 这台机器有实体键盘,用键盘图标反而更准:意思就是"打字搜"。
         lv_obj_t* si = lbl(search_row_, FICON(), C_ACCENT, 0, 0, LV_SYMBOL_KEYBOARD);
         lv_obj_center(si);
-
-        // 标题栏和内容之间一条发丝线,滚动时才分得出"栏"和"内容"
-        lv_obj_t* ln = lv_obj_create(root_);
-        lv_obj_set_size(ln, SCR_W, 1);
-        lv_obj_set_pos(ln, 0, HDR_H - 1);
-        lv_obj_set_style_bg_color(ln, lv_color_hex(0xE6EADF), LV_PART_MAIN);
-        lv_obj_set_style_border_width(ln, 0, LV_PART_MAIN);
-        lv_obj_set_style_pad_all(ln, 0, LV_PART_MAIN);
     }
 
-    void build_row(int i)
+    void build_section(int si, int y)
     {
-        lv_obj_t* r = lv_obj_create(list_);
-        lv_obj_set_size(r, CARD_W, CARD_H);
-        lv_obj_set_pos(r, CARD_X, i * (CARD_H + CARD_GAP));
-        lv_obj_set_style_bg_color(r, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
-        lv_obj_set_style_radius(r, 14, LV_PART_MAIN);
-        lv_obj_set_style_border_width(r, 0, LV_PART_MAIN);
-        // 投影很轻:浅色底上稍微重一点就会脏。用主题绿而不是黑,
-        // 黑投影在这块偏暖的白底上会发灰。
-        lv_obj_set_style_shadow_width(r, 10, LV_PART_MAIN);
-        lv_obj_set_style_shadow_offset_y(r, 2, LV_PART_MAIN);
-        lv_obj_set_style_shadow_opa(r, LV_OPA_10, LV_PART_MAIN);
-        lv_obj_set_style_shadow_color(r, lv_color_hex(C_ACCENT), LV_PART_MAIN);
-        lv_obj_set_style_pad_all(r, 0, LV_PART_MAIN);
-        lv_obj_remove_flag(r, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_user_data(r, (void*)(intptr_t)i);
-        lv_obj_add_flag(r, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(r, [](lv_event_t* e) {
+        lbl(list_, F20(), C_TEXT, SIDE, y + (SEC_TTL_H - CJK_LINE_H) / 2, g_sec[si].title);
+
+        // 横向滚动的封面排。每个分区一个独立的滚动容器,
+        // 互不影响 —— 和手机上一样,滑哪一排动哪一排。
+        lv_obj_t* shelf = lv_obj_create(list_);
+        lv_obj_set_size(shelf, SCR_W, TILE_H);
+        lv_obj_set_pos(shelf, 0, y + SEC_TTL_H);
+        lv_obj_set_style_bg_opa(shelf, LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_set_style_border_width(shelf, 0, LV_PART_MAIN);
+        lv_obj_set_style_radius(shelf, 0, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(shelf, 0, LV_PART_MAIN);
+        lv_obj_set_scroll_dir(shelf, LV_DIR_HOR);
+        lv_obj_set_scrollbar_mode(shelf, LV_SCROLLBAR_MODE_OFF);
+        shelf_[si] = shelf;
+
+        for (int j = 0; j < g_sec[si].count; j++)
+            build_tile(shelf, g_sec[si].start + j, SIDE + j * (TILE_W + TILE_GAP));
+    }
+
+    void build_tile(lv_obj_t* shelf, int i, int x)
+    {
+        lv_obj_t* c = lv_obj_create(shelf);
+        lv_obj_set_size(c, TILE_W, TILE_H);
+        lv_obj_set_pos(c, x, 0);
+        lv_obj_set_style_bg_opa(c, LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_set_style_border_width(c, 0, LV_PART_MAIN);
+        lv_obj_set_style_radius(c, 0, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(c, 0, LV_PART_MAIN);
+        lv_obj_remove_flag(c, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_user_data(c, (void*)(intptr_t)i);
+        lv_obj_add_flag(c, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(c, LV_OBJ_FLAG_EVENT_BUBBLE);   // 横滑手势要能穿过去
+        lv_obj_add_event_cb(c, [](lv_event_t* e) {
             auto* s = static_cast<MusicApp*>(lv_event_get_user_data(e));
             int idx = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target_obj(e));
             s->stop_and_play(idx);
         }, LV_EVENT_CLICKED, this);
 
-        // 封面位先摆一块底色,图抓到了再盖上去。
-        // 留位而不是等图到了再插入,是为了让卡片高度从一开始就定死 ——
-        // 否则图陆续到达时整个列表会一跳一跳地重排。
-        lv_obj_t* ph = lv_obj_create(r);
-        lv_obj_set_size(ph, THUMB_PX, THUMB_PX);
-        lv_obj_set_pos(ph, THUMB_X, (CARD_H - THUMB_PX) / 2);
+        // 封面位先摆底色,图抓到了再盖上去 —— 尺寸从一开始就定死,
+        // 免得图陆续到达时整排一跳一跳地重排。
+        lv_obj_t* ph = lv_obj_create(c);
+        lv_obj_set_size(ph, COVER, COVER);
+        lv_obj_set_pos(ph, 0, 0);
         lv_obj_set_style_bg_color(ph, lv_color_hex(0xE8EEE0), LV_PART_MAIN);
         lv_obj_set_style_radius(ph, 8, LV_PART_MAIN);
         lv_obj_set_style_border_width(ph, 0, LV_PART_MAIN);
@@ -1006,46 +1042,43 @@ private:
         lv_obj_center(nt);
         row_ph_[i] = ph;
 
-        lv_obj_t* im = lv_image_create(r);
-        lv_obj_set_pos(im, THUMB_X, (CARD_H - THUMB_PX) / 2);
+        lv_obj_t* im = lv_image_create(c);
+        lv_obj_set_pos(im, 0, 0);
         lv_obj_add_flag(im, LV_OBJ_FLAG_HIDDEN);
         lv_obj_set_style_radius(im, 8, LV_PART_MAIN);
         lv_obj_set_style_clip_corner(im, true, LV_PART_MAIN);
         row_img_[i] = im;
 
-        const int TW = CARD_W - TEXT_X - 46;
-        lv_obj_t* tl = lbl(r, F16(), C_TEXT, TEXT_X, 5, g_songs[i].title);
-        lv_obj_set_size(tl, TW, CJK_LINE_H);
-        lv_label_set_long_mode(tl, LV_LABEL_LONG_DOT);
-
-        lv_obj_t* al = lbl(r, F16(), 0x9AA48C, TEXT_X, 5 + CJK_LINE_H,
-                           g_songs[i].artist[0] ? g_songs[i].artist : "-");
-        lv_obj_set_size(al, TW, CJK_LINE_H);
-        lv_label_set_long_mode(al, LV_LABEL_LONG_DOT);
-
-        char d[16];
-        snprintf(d, sizeof(d), "%d:%02d", g_songs[i].dur / 60, g_songs[i].dur % 60);
-        lbl(r, &lv_font_montserrat_14, 0xA3AC98, CARD_W - 42, (CARD_H - 18) / 2, d);
-
-        // 正在播的那首:封面右下角一个小三角。绝对定位,不占文字的位置。
-        play_mark_[i] = lbl(r, FICON(), C_ACCENT, THUMB_X + THUMB_PX - 12,
-                            (CARD_H - THUMB_PX) / 2 + THUMB_PX - 16, LV_SYMBOL_PLAY);
+        // 正在播的那首:封面右下角压一个小三角
+        play_mark_[i] = lbl(c, FICON(), 0xFFFFFF, COVER - 18, COVER - 20, LV_SYMBOL_PLAY);
         lv_obj_add_flag(play_mark_[i], LV_OBJ_FLAG_HIDDEN);
 
-        rows_[i] = r;
+        lv_obj_t* tl = lbl(c, F16(), C_TEXT, 0, COVER + 4, g_songs[i].title);
+        lv_obj_set_size(tl, TILE_W, CJK_LINE_H);
+        lv_label_set_long_mode(tl, LV_LABEL_LONG_DOT);
+
+        lv_obj_t* al = lbl(c, F16(), 0x9AA48C, 0, COVER + 4 + CJK_LINE_H,
+                           g_songs[i].artist[0] ? g_songs[i].artist : "-");
+        lv_obj_set_size(al, TILE_W, CJK_LINE_H);
+        lv_label_set_long_mode(al, LV_LABEL_LONG_DOT);
+
+        rows_[i] = c;
         if (g_thumbs[i].ready) apply_thumb(i);
     }
 
-    // 底部常驻的 mini player。手机音乐 app 的标配:列表里翻歌的时候
-    // 当前这首永远在手边,不用退回播放页。
+    // 底部浮着的 mini player。手机音乐 app 的标配:翻歌的时候当前这首
+    // 永远在手边,不用退回播放页。做成【浮层】压在内容上,不占版面高度。
     void build_mini()
     {
         lv_obj_t* m = lv_obj_create(root_);
-        lv_obj_set_size(m, SCR_W, MINI_H);
-        lv_obj_set_pos(m, 0, SCR_H - MINI_H);
+        lv_obj_set_size(m, SCR_W - SIDE * 2, MINI_H - 8);
+        lv_obj_set_pos(m, SIDE, SCR_H - MINI_H);
         lv_obj_set_style_bg_color(m, lv_color_hex(0xF4F7F0), LV_PART_MAIN);
-        lv_obj_set_style_radius(m, 0, LV_PART_MAIN);
+        lv_obj_set_style_radius(m, (MINI_H - 8) / 2, LV_PART_MAIN);   // 胶囊
         lv_obj_set_style_border_width(m, 0, LV_PART_MAIN);
+        lv_obj_set_style_shadow_width(m, 10, LV_PART_MAIN);
+        lv_obj_set_style_shadow_opa(m, LV_OPA_20, LV_PART_MAIN);
+        lv_obj_set_style_shadow_color(m, lv_color_hex(C_ACCENT), LV_PART_MAIN);
         lv_obj_set_style_pad_all(m, 0, LV_PART_MAIN);
         lv_obj_remove_flag(m, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_flag(m, LV_OBJ_FLAG_CLICKABLE);
@@ -1053,35 +1086,17 @@ private:
             static_cast<MusicApp*>(lv_event_get_user_data(e))->show_now();
         }, LV_EVENT_CLICKED, this);
 
-        lv_obj_t* ln = lv_obj_create(m);
-        lv_obj_set_size(ln, SCR_W, 1);
-        lv_obj_set_pos(ln, 0, 0);
-        lv_obj_set_style_bg_color(ln, lv_color_hex(0xE0E6D6), LV_PART_MAIN);
-        lv_obj_set_style_border_width(ln, 0, LV_PART_MAIN);
-        lv_obj_set_style_pad_all(ln, 0, LV_PART_MAIN);
-
-        // 用列表那张 46px 缩略图,不用播放页的 120px 大图:
-        // 少缩放一次,清晰度反而更好,而且这张多半已经解码缓存过了。
-        const lv_image_dsc_t* src = nullptr;
-        int src_px = 0;
+        const int MP = 30;
         if (playing_idx_ >= 0 && playing_idx_ < MAX_SONGS && g_thumbs[playing_idx_].ready) {
-            src = &g_thumbs[playing_idx_].dsc; src_px = THUMB_PX;
-        } else if (g_cover_buf) {
-            src = &g_cover_dsc; src_px = COVER_PX;
-        }
-        if (src) {
-            const int MP = 34;
             lv_obj_t* im = lv_image_create(m);
-            lv_image_set_src(im, src);
-            // ⚠️ lv_image_set_scale 是【绕轴心】缩的,轴心默认在图的正中。
-            // 120px 的图摆在 (8,5) 再缩到 28%,画出来的内容会落在
-            // (68,65) 附近 —— 那已经在这条 44px 高的 bar 外面了,整张图
-            // 被裁得一点不剩,看上去就是"没显示",而且不报任何错。
-            // 把轴心挪到左上角,缩放后才还是从 (8,5) 开始画。
+            lv_image_set_src(im, &g_thumbs[playing_idx_].dsc);
+            // ⚠️ lv_image_set_scale 是【绕轴心】缩的,轴心默认在图正中。
+            // 不把轴心挪到左上角的话,缩完内容会落到控件外面被裁光,
+            // 看上去就是"图没显示",而且不报错。
             lv_image_set_pivot(im, 0, 0);
-            lv_image_set_scale(im, 256 * MP / src_px);
+            lv_image_set_scale(im, 256 * MP / THUMB_PX);
             lv_obj_set_size(im, MP, MP);
-            lv_obj_set_pos(im, 8, (MINI_H - MP) / 2);
+            lv_obj_set_pos(im, 5, (MINI_H - 8 - MP) / 2);
             lv_obj_set_style_radius(im, 5, LV_PART_MAIN);
             lv_obj_set_style_clip_corner(im, true, LV_PART_MAIN);
         }
@@ -1091,13 +1106,13 @@ private:
             snprintf(line, sizeof(line), "%s · %s", g_state.title, g_state.artist);
         else
             snprintf(line, sizeof(line), "%s", g_state.title);
-        lv_obj_t* l = lbl(m, F16(), C_TEXT, 50, (MINI_H - CJK_LINE_H) / 2, line);
-        lv_obj_set_size(l, SCR_W - 50 - 46, CJK_LINE_H);
+        lv_obj_t* l = lbl(m, F16(), C_TEXT, 42, (MINI_H - 8 - CJK_LINE_H) / 2, line);
+        lv_obj_set_size(l, SCR_W - SIDE * 2 - 42 - 44, CJK_LINE_H);
         lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
 
         lv_obj_t* b = lv_obj_create(m);
-        lv_obj_set_size(b, 32, 32);
-        lv_obj_set_pos(b, SCR_W - 40, (MINI_H - 32) / 2);
+        lv_obj_set_size(b, 30, 30);
+        lv_obj_set_pos(b, SCR_W - SIDE * 2 - 36, (MINI_H - 8 - 30) / 2);
         lv_obj_set_style_radius(b, LV_RADIUS_CIRCLE, LV_PART_MAIN);
         lv_obj_set_style_bg_color(b, lv_color_hex(C_ACCENT), LV_PART_MAIN);
         lv_obj_set_style_border_width(b, 0, LV_PART_MAIN);
@@ -1130,12 +1145,24 @@ private:
             uint32_t gen = g_ui_gen;
             for (int i = 0; i < g_state.n_songs && !g_thumb_stop; i++) {
                 if (!g_thumbs[i].ready) {
-                    int len = 0;
-                    uint8_t* b = fetch_jpeg(g_songs[i].key, THUMB_PX, &len);
-                    if (!b) continue;
-                    g_thumbs[i].buf = b;
-                    fill_dsc(&g_thumbs[i].dsc, b, len, THUMB_PX);
-                    g_thumbs[i].ready = true;
+                    // 同一首歌会同时出现在"最近播放"和"已缓存"里。
+                    // 先在前面找有没有抓过同一个 key,有就直接共用,
+                    // 省掉一次 HTTP 和一份 PSRAM。
+                    int dup = -1;
+                    for (int j = 0; j < i; j++)
+                        if (g_thumbs[j].ready && !strcmp(g_songs[j].key, g_songs[i].key)) { dup = j; break; }
+                    if (dup >= 0) {
+                        g_thumbs[i].dsc = g_thumbs[dup].dsc;   // 共用同一块 PSRAM
+                        g_thumbs[i].buf = nullptr;             // 不是所有者,别 free
+                        g_thumbs[i].ready = true;
+                    } else {
+                        int len = 0;
+                        uint8_t* b = fetch_jpeg(g_songs[i].key, THUMB_PX, &len);
+                        if (!b) continue;
+                        g_thumbs[i].buf = b;
+                        fill_dsc(&g_thumbs[i].dsc, b, len, THUMB_PX);
+                        g_thumbs[i].ready = true;
+                    }
                 }
                 // 回贴到界面上。代数对不上说明界面已经重建过(或者 app
                 // 已经退出),这时候去碰那些 lv_obj_t* 就是野指针。
@@ -1173,17 +1200,17 @@ private:
             if (s) lv_obj_set_style_text_color(s,
                 lv_color_hex(on ? 0xFFFFFF : C_ACCENT), LV_PART_MAIN);
         }
-        // 卡片的选中态用描边 + 更实的投影,而不是换底色:
-        // 底色一变,卡片和背景的对比就散了,反而看不出"浮起来的那张是哪张"。
+        // 选中态画在【封面】上:一圈主题色描边。封面墙里标题是次要信息,
+        // 描在整块 tile 上反而看不出选的是哪张图。
         for (int i = 0; i < g_state.n_songs; i++) {
-            if (!rows_[i]) continue;
             bool on = (i == sel_);
-            lv_obj_set_style_border_width(rows_[i], on ? 2 : 0, LV_PART_MAIN);
-            lv_obj_set_style_border_color(rows_[i], lv_color_hex(C_ACCENT), LV_PART_MAIN);
-            lv_obj_set_style_shadow_opa(rows_[i], on ? LV_OPA_30 : LV_OPA_10, LV_PART_MAIN);
+            for (lv_obj_t* o : { row_ph_[i], row_img_[i] }) {
+                if (!o) continue;
+                lv_obj_set_style_border_width(o, on ? 3 : 0, LV_PART_MAIN);
+                lv_obj_set_style_border_color(o, lv_color_hex(C_ACCENT), LV_PART_MAIN);
+            }
         }
-        if (sel_ >= 0 && g_state.n_songs && rows_[sel_])
-            lv_obj_scroll_to_view(rows_[sel_], LV_ANIM_ON);
+        if (sel_ >= 0 && rows_[sel_]) lv_obj_scroll_to_view(rows_[sel_], LV_ANIM_ON);
     }
 
     void paint_playing()
@@ -1196,15 +1223,56 @@ private:
         }
     }
 
+    // 选中的歌在哪个分区、是该分区的第几个
+    void sel_pos(int idx, int* sec, int* off) const
+    {
+        for (int si = 0; si < SEC_N; si++) {
+            if (idx >= g_sec[si].start && idx < g_sec[si].start + g_sec[si].count) {
+                *sec = si; *off = idx - g_sec[si].start; return;
+            }
+        }
+        *sec = 0; *off = 0;
+    }
+
     bool lib_input(const tdeck::InputEvent& ev)
     {
         if (g_state.n_songs == 0) {
             if (ev.key == tdeck::Key::Enter) { enter_search(0); return true; }
             return false;
         }
+        // 封面墙是二维的:左右在同一排里走,上下换排 —— 和手机上一样。
+        // sel_ 仍然是"歌曲池里的下标",换排时按【当前排的位置】映射到
+        // 目标排的同一位置,越界就贴到那一排的末尾。
+        int sec = 0, off = 0;
+        sel_pos(sel_ < 0 ? 0 : sel_, &sec, &off);
+
+        auto goto_sec = [&](int ns) {
+            while (ns >= 0 && ns < SEC_N && g_sec[ns].count == 0) ns += (ns > sec ? 1 : -1);
+            if (ns < 0 || ns >= SEC_N) return;
+            int o = off < g_sec[ns].count ? off : g_sec[ns].count - 1;
+            sel_ = g_sec[ns].start + o;
+            paint();
+        };
+
         switch (ev.key) {
-        case tdeck::Key::Up:   if (sel_ > -1) { sel_--; paint(); } return true;
-        case tdeck::Key::Down: if (sel_ < g_state.n_songs - 1) { sel_++; paint(); } return true;
+        case tdeck::Key::Left:
+            if (sel_ < 0) return true;
+            if (off > 0) { sel_--; paint(); }
+            return true;
+        case tdeck::Key::Right:
+            if (sel_ < 0) { sel_ = 0; paint(); return true; }
+            if (off < g_sec[sec].count - 1) { sel_++; paint(); }
+            return true;
+        case tdeck::Key::Up:
+            // 第一排再往上就选到标题栏的搜索钮
+            if (sel_ < 0) return true;
+            if (sec == 0) { sel_ = -1; paint(); }
+            else          goto_sec(sec - 1);
+            return true;
+        case tdeck::Key::Down:
+            if (sel_ < 0) { sel_ = g_sec[0].start; paint(); return true; }
+            goto_sec(sec + 1);
+            return true;
         case tdeck::Key::Enter:
             if (sel_ < 0) { enter_search(0); return true; }
             stop_and_play(sel_);
@@ -1275,6 +1343,7 @@ private:
     lv_obj_t* rows_[MAX_SONGS] = {};
     lv_obj_t* row_img_[MAX_SONGS] = {};
     lv_obj_t* row_ph_[MAX_SONGS]  = {};
+    lv_obj_t* shelf_[SEC_N] = {};
     lv_obj_t* mini_ = nullptr;
     lv_obj_t* play_mark_[MAX_SONGS] = {};
     lv_timer_t* tick_ = nullptr;

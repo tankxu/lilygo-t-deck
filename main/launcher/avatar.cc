@@ -145,7 +145,7 @@ void Avatar::on_blink(lv_timer_t* t)
     lv_anim_set_exec_cb(&a, Avatar::eye_h_cb);
     lv_anim_set_values(&a, s->eye_h_, 2);
     lv_anim_set_duration(&a, 90);
-    lv_anim_set_reverse_duration(&a, 170);
+    lv_anim_set_playback_duration(&a, 170);
     lv_anim_start(&a);
     lv_timer_set_period(t, rnd(2600, 5400));
 }
