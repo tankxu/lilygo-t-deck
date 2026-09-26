@@ -8,9 +8,14 @@ CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 
-# ── 分区表:自定义,不做 OTA(ADR-005)──
+# ── 分区表:自定义,双槽 OTA ──
+# 推固件走 WiFi(tools/ota.sh),不用再拔插 USB。详见 partitions.csv 抬头。
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+# 回滚:新固件先以 PENDING_VERIFY 启动,必须自己声明"我起来了"才作数。
+# 声明点在 debug_server 启动处 —— 判据是"WiFi 通了、还能再推一版"。
+# 推了个起不来的固件,板子自己退回上一版,不用拔线救砖。
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 
 # ── PSRAM:N16R8 是八线 ──
 CONFIG_SPIRAM=y

@@ -7,9 +7,10 @@
 //   GET /shot                                   截图,裸 RGB565(320*240*2 字节)
 //   GET /tap?x=&y=                              在坐标点一下
 //   GET /swipe?x1=&y1=&x2=&y2=&ms=              划一下
-//   GET /key?c=q                                注入键盘字符
+//   GET /key?c=q | /key?code=13                 注入键盘字符(code 用于控制字符)
 //   GET /ball?d=left|right|up|down|click        注入轨迹球
 //   GET /info                                   堆/运行时长等状态
+//   POST /ota  (body = tdeck-os.bin)            WiFi 推固件,写另一个槽后重启
 //
 // 点击和滑动走【虚拟指针 indev】注册进 LVGL,和真手指完全同一条路径。
 // 绕过输入层直接给对象发事件的话,滚动、手势、点击判定都不会被验证到 ——
@@ -22,7 +23,10 @@
 #include "tdeck_bsp.h"
 #include "tdeck_pins.h"
 
+#include <esp_app_desc.h>
 #include <esp_http_server.h>
+#include <esp_ota_ops.h>
+#include <esp_system.h>
 #include <esp_lvgl_port.h>
 #include <esp_log.h>
 #include <esp_timer.h>
@@ -174,13 +178,21 @@ esp_err_t h_swipe(httpd_req_t* req)
 // ── /key ─────────────────────────────────────────────────
 esp_err_t h_key(httpd_req_t* req)
 {
-    char c[8] = {};
-    if (!qs_str(req, "c", c, sizeof(c))) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "need ?c=<char>");
-        return ESP_FAIL;
+    // ?c=<字符> 打可见字符;?code=<十进制> 打控制字符。
+    // 两个都要:httpd_query_key_value 【不做 URL 解码】,所以 ?c=%0D 拿到的
+    // 是字面量 '%' 而不是回车 —— 回车(13)、退格(8)、ESC(27) 这些键
+    // 只能用 code 注入。踩过一次:搜索框里打出来一串 "bhey%jude%"。
+    int code = qs_int(req, "code", -1);
+    if (code < 0) {
+        char c[8] = {};
+        if (!qs_str(req, "c", c, sizeof(c))) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "need ?c=<char> or ?code=<n>");
+            return ESP_FAIL;
+        }
+        code = (unsigned char)c[0];
     }
-    tdeck_input_inject(TDECK_INPUT_KEYBOARD, (unsigned char)c[0]);
-    char msg[32]; snprintf(msg, sizeof(msg), "key '%c'\n", c[0]);
+    tdeck_input_inject(TDECK_INPUT_KEYBOARD, (unsigned char)code);
+    char msg[40]; snprintf(msg, sizeof(msg), "key %d\n", code);
     httpd_resp_sendstr(req, msg);
     return ESP_OK;
 }
@@ -212,20 +224,104 @@ esp_err_t h_ball(httpd_req_t* req)
 // ── /info ────────────────────────────────────────────────
 esp_err_t h_info(httpd_req_t* req)
 {
-    char buf[320];
+    // 带上当前跑在哪个槽、以及 ELF 的 SHA:推完固件一眼就能确认是不是新的那份
+    // (只看 uptime 归零分不清"推成功了"和"崩溃重启了")。
+    // ⚠️ 不要用 esp_app_desc 里的 date/time —— 那是 __DATE__/__TIME__,
+    // 只有全量重编时才会刷新,增量构建推上去还是旧时间戳,反而骗人。
+    // ELF 的 SHA 每次构建必变,这才是可靠的"新旧"判据。
+    const esp_partition_t* run = esp_ota_get_running_partition();
+    char sha[17] = {};
+    esp_app_get_elf_sha256(sha, sizeof(sha));
+    char buf[420];
     snprintf(buf, sizeof(buf),
              "{\"uptime_s\":%lld,"
              "\"heap_internal\":%u,\"heap_psram\":%u,\"heap_min\":%u,"
-             "\"battery_mv\":%d,\"volume\":%d}\n",
+             "\"battery_mv\":%d,\"volume\":%d,"
+             "\"part\":\"%s\",\"sha\":\"%s\"}\n",
              esp_timer_get_time() / 1000000,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
              (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
-             tdeck_battery_mv(), tdeck::volume::get());
+             tdeck_battery_mv(), tdeck::volume::get(),
+             run ? run->label : "?", sha);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, buf);
     return ESP_OK;
 }
+// ── OTA ───────────────────────────────────────────────────
+//
+// 为什么自己写而不用 esp_https_ota:那套是【设备去拉】,得先有个服务器、
+// 先把固件放上去、再想办法告诉设备去拉。开发期要的是反过来 —— 我这边
+// 一条命令就推过去。所以这里是设备【被推】,body 就是裸的 tdeck-os.bin。
+//
+// 写的是 esp_ota_get_next_update_partition() 给的【另一个槽】,正在跑的
+// 那个一个字节都不动。所以传到一半断网、或者推了个根本起不来的固件,
+// 最坏也只是这次白推,板子还是老固件 —— 这正是双槽存在的意义。
+//
+// OTA_WITH_SEQUENTIAL_WRITES:我们是顺序写到底的,告诉它这一点就能边写边擦,
+// 不用一开始把 6MB 全擦一遍(那要十几秒,而且 HTTP 那头会先超时)。
+esp_err_t h_ota(httpd_req_t* req)
+{
+    const esp_partition_t* part = esp_ota_get_next_update_partition(nullptr);
+    if (!part) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no ota partition");
+        return ESP_FAIL;
+    }
+    int total = req->content_len;
+    if (total <= 0 || (size_t)total > part->size) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad size");
+        return ESP_FAIL;
+    }
+    ESP_LOGW(TAG, "OTA 开始:%d 字节 -> %s @0x%" PRIx32, total, part->label, part->address);
+
+    esp_ota_handle_t h = 0;
+    esp_err_t err = esp_ota_begin(part, OTA_WITH_SEQUENTIAL_WRITES, &h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_begin 失败:%s", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
+        return ESP_FAIL;
+    }
+
+    // 缓冲放堆上:HTTP 服务任务栈只有 8K,4K 的局部数组会顶掉大半。
+    char* buf = (char*)malloc(4096);
+    if (!buf) { esp_ota_abort(h); httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom"); return ESP_FAIL; }
+
+    int got = 0, last_pct = -10;
+    while (got < total) {
+        int n = httpd_req_recv(req, buf, total - got > 4096 ? 4096 : total - got);
+        if (n == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (n <= 0) { ESP_LOGE(TAG, "OTA 收数据中断于 %d/%d", got, total); break; }
+        if (esp_ota_write(h, buf, n) != ESP_OK) { ESP_LOGE(TAG, "OTA 写失败"); got = -1; break; }
+        got += n;
+        int pct = got * 100 / total;
+        if (pct >= last_pct + 10) { last_pct = pct; ESP_LOGI(TAG, "OTA %d%%", pct); }
+    }
+    free(buf);
+
+    if (got != total) {
+        esp_ota_abort(h);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "incomplete");
+        return ESP_FAIL;
+    }
+    // esp_ota_end 会校验镜像头和 SHA256 —— 推错文件(比如 bootloader.bin)
+    // 在这一步就被挡住,不会写进启动分区。
+    err = esp_ota_end(h);
+    if (err == ESP_OK) err = esp_ota_set_boot_partition(part);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA 收尾失败:%s", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
+        return ESP_FAIL;
+    }
+
+    httpd_resp_sendstr(req, "ok, rebooting\n");
+    ESP_LOGW(TAG, "OTA 完成,1 秒后重启到 %s", part->label);
+    // 延后重启,让上面这个响应先发出去 —— 直接 restart 的话客户端看到的是
+    // 连接被重置,分不清是成功了还是崩了。
+    xTaskCreate([](void*) { vTaskDelay(pdMS_TO_TICKS(1000)); esp_restart(); },
+                "ota_reboot", 2048, nullptr, 5, nullptr);
+    return ESP_OK;
+}
+
 
 }  // namespace
 
@@ -251,16 +347,29 @@ void debug_server_start()
     }
     // 用指定初始化:httpd_uri_t 在不同 IDF 版本里字段数会变,
     // 位置初始化会随升级而编译失败
-    struct { const char* uri; esp_err_t (*fn)(httpd_req_t*); } routes[] = {
-        { "/shot",  h_shot  }, { "/tap",  h_tap  }, { "/swipe", h_swipe },
-        { "/key",   h_key   }, { "/ball", h_ball }, { "/info",  h_info  },
+    struct { const char* uri; httpd_method_t m; esp_err_t (*fn)(httpd_req_t*); } routes[] = {
+        { "/shot",  HTTP_GET,  h_shot  }, { "/tap",  HTTP_GET, h_tap  },
+        { "/swipe", HTTP_GET,  h_swipe }, { "/key",  HTTP_GET, h_key  },
+        { "/ball",  HTTP_GET,  h_ball  }, { "/info", HTTP_GET, h_info },
+        { "/ota",   HTTP_POST, h_ota   },
     };
     for (auto& r : routes) {
         httpd_uri_t u = {};
-        u.uri = r.uri; u.method = HTTP_GET; u.handler = r.fn;
+        u.uri = r.uri; u.method = r.m; u.handler = r.fn;
         httpd_register_uri_handler(srv, &u);
     }
-    ESP_LOGW(TAG, "调试接口已启动:/shot /tap /swipe /key /ball /info");
+
+    // 走到这里说明:WiFi 通了、HTTP 服务起来了 —— 也就是【还能再推一版】。
+    // 这正是"这个固件可用"的判据,所以在这里销掉回滚。
+    // 在此之前如果崩溃重启,bootloader 会自动退回上一个槽。
+    esp_ota_img_states_t st;
+    const esp_partition_t* run = esp_ota_get_running_partition();
+    if (esp_ota_get_state_partition(run, &st) == ESP_OK && st == ESP_OTA_IMG_PENDING_VERIFY) {
+        esp_ota_mark_app_valid_cancel_rollback();
+        ESP_LOGW(TAG, "新固件已确认可用(%s),取消回滚", run->label);
+    }
+    ESP_LOGW(TAG, "调试接口已启动:/shot /tap /swipe /key /ball /info /ota (运行于 %s)",
+             run->label);
 }
 
 }  // namespace tdeck

@@ -1,0 +1,46 @@
+#!/bin/bash
+# 通过 WiFi 把 build/tdeck-os.bin 推到板子上。
+#
+#   tools/ota.sh              # 用 $TDECK_IP 或默认 IP
+#   tools/ota.sh 192.168.1.42
+#
+# 写的是另一个 OTA 槽,正在跑的那个不动 —— 推挂了最坏就是白推一次。
+# 新固件起来后要自己声明可用(见 debug_server.cc),否则 bootloader 自动回滚。
+set -e
+IP=${1:-${TDECK_IP:-192.168.1.136}}
+BIN=$(cd "$(dirname "$0")/.." && pwd)/build/tdeck-os.bin
+[ -f "$BIN" ] || { echo "没有 $BIN,先 idf.py build"; exit 1; }
+
+SZ=$(stat -f%z "$BIN")
+# 镜像里 esp_app_desc 的 app_elf_sha256 字段:24 字节镜像头 + 8 字节段头 = 0x20,
+# 再跳过 magic/secure_ver/reserv/version/project/time/date/idf_ver 共 144 字节 -> 0xB0。
+# 拿它和板子 /info 报的 sha 对一下,就能确认"跑着的确实是我刚推的那份"。
+WANT=$(xxd -p -s 176 -l 16 "$BIN")
+echo "推 $(( SZ / 1024 )) KB 到 $IP  (sha $WANT)"
+echo "  推之前:$(curl -s --max-time 5 "http://$IP/info" || true)"
+
+curl -f --max-time 300 --progress-bar \
+     -H 'Content-Type: application/octet-stream' \
+     --data-binary "@$BIN" "http://$IP/ota" || { echo "推送失败"; exit 1; }
+
+echo "等板子重启..."
+for i in $(seq 1 40); do
+    sleep 3
+    OUT=$(curl -s --max-time 3 "http://$IP/info" || true)
+    case "$OUT" in
+        *uptime_s*)
+            echo "  起来了:$OUT"
+            # ⚠️ 前缀比对,不能求相等 —— esp_app_get_elf_sha256 按缓冲区大小
+            # 截断,板子报的是 SHA 的头几位(现在是 9 位),不是全长。
+            GOT=$(echo "$OUT" | sed -n 's/.*"sha":"\([0-9a-f]*\)".*/\1/p')
+            case "$WANT" in
+                "$GOT"*) [ -n "$GOT" ] && echo "✅ sha 前缀对得上($GOT),跑的就是刚推的这份" ;;
+                *) echo "⚠️  sha 对不上(板子 $GOT / 镜像 $WANT),可能回滚了"; exit 1 ;;
+            esac
+            exit 0 ;;
+    esac
+    printf '.'
+done
+echo
+echo "⚠️  40 次都没连上。板子应该已经自动回滚到上一版了,插 USB 看串口。"
+exit 1

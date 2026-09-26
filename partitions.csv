@@ -1,20 +1,32 @@
-# T-Deck 16MB 分区表 —— 不做 OTA,空间最大化(ADR-005)
+# T-Deck 16MB 分区表 —— 双槽 OTA
 #
-# assets 是【小智必须的】:字体、表情、提示音、唤醒词模型都放这里,而且名字必须叫
+# 原本是 factory 单槽(ADR-005:"不做 OTA,空间最大化")。改成双槽是因为
+# 每次改一行 UI 都要拔插 USB-C、按住 BOOT、跑 40 秒烧录 —— 板子在手上
+# 调界面的时候这条链路才是真正的瓶颈。现在推固件走 WiFi(见 tools/ota.sh)。
+#
+# 空间从哪来:原来的 storage(FAT,7MB)从头到尾没被挂载过,是死空间 ——
+# 全仓库搜 esp_vfs_fat / wl_mount 一处都没有。删掉它之后两个槽各 6.375MB,
+# 比原来单槽的 6MB 还宽裕(当前固件 5.03MB,余量 27%)。
+#
+# assets 是【小智必须的】:字体、表情、提示音都放这里,而且名字必须叫
 # assets —— 小智的 main/CMakeLists.txt 里
 #     partition_table_get_partition_info(--partition-name assets ...)
 # 找不到就【静默跳过】整段资源生成,编译照样通过,运行时满屏豆腐块。
 #
+# ⚠️ app 分区偏移必须 64KB 对齐,所以 otadata 结束(0x12000)到 ota_0
+# 起点(0x20000)之间有 56KB 空着 —— 这是对齐要求,不是算错了。
+#
 # Name,     Type, SubType,  Offset,    Size,      Flags
 nvs,        data, nvs,      0x9000,    0x6000,
-phy_init,   data, phy,      0xf000,    0x1000,
-factory,    app,  factory,  0x10000,   0x600000,
-assets,     data, spiffs,   0x610000,  0x200000,
+phy_init,   data, phy,      0xF000,    0x1000,
+otadata,    data, ota,      0x10000,   0x2000,
+ota_0,      app,  ota_0,    0x20000,   0x660000,
+ota_1,      app,  ota_1,    0x680000,  0x660000,
+assets,     data, spiffs,   0xCE0000,  0x200000,
 # 唤醒词模型。CONFIG_MODEL_IN_FLASH=y 时 esp-sr 会把 srmodels.bin 烧进一个
 # 【必须叫 model】的分区 —— 它的 CMakeLists 里是
 #     partition_table_get_partition_info(size "--partition-name model" "size")
 # 没有这个分区就配不出来。"你好小智"(wn9s_nihaoxiaozhi)只有 132KB,
 # 给 1MB 是留着以后换更大的模型(wn9_nihaoxiaozhi 是 292KB)。
-model,      data, spiffs,   0x810000,  0x100000,
-storage,    data, fat,      0x910000,  0x6E0000,
+model,      data, spiffs,   0xEE0000,  0x100000,
 coredump,   data, coredump, 0xFF0000,  0x10000,
