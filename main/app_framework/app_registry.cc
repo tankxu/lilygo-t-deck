@@ -8,24 +8,6 @@
 
 namespace tdeck {
 
-// 兜底卡片:居中的图标 + 名称。
-// 任何一个 app 只要自己实现了 render_card,就不会走到这里 ——
-// 这个实现存在的意义是"新 app 没画卡片时也不至于是个空白框"。
-void App::render_card(lv_obj_t* card)
-{
-    lv_obj_t* ic = lv_label_create(card);
-    lv_obj_set_style_text_font(ic, &lv_font_montserrat_28, LV_PART_MAIN);
-    lv_obj_set_style_text_color(ic, lv_color_hex(accent()), LV_PART_MAIN);
-    lv_label_set_text(ic, icon());
-    lv_obj_align(ic, LV_ALIGN_CENTER, 0, -10);
-
-    lv_obj_t* nm = lv_label_create(card);
-    lv_obj_set_style_text_font(nm, &lv_font_montserrat_16, LV_PART_MAIN);
-    lv_obj_set_style_text_color(nm, lv_color_hex(0x1b2117), LV_PART_MAIN);
-    lv_label_set_text(nm, name());
-    lv_obj_align(nm, LV_ALIGN_CENTER, 0, 22);
-}
-
 AppRegistry& AppRegistry::instance()
 {
     // 函数内 static:保证在第一个 registrar 的构造函数调用它时已经初始化好,

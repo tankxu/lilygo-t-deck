@@ -53,8 +53,16 @@ constexpr int CX = 18;
 // 看着像没排满。iOS 的状态栏是贴着安全区边缘走的,这里也贴紧。
 constexpr int SB_R = 4;
 
-constexpr int PAGES     = 2;
-constexpr int MAX_APPS  = 4;
+constexpr int PAGES     = 3;          // 首页 + 两屏应用
+// 桌面网格:每屏 2 列 x 2 行,应用占两屏。
+// ⚠️ MAX_APPS 是【容量上限】,不是"当前有几个 app"。注册表按它截断,
+// 装不下的 app 会【静默消失】—— 不报错也不换行。
+// 之前只有一屏 4 格,加了 B站 之后第 5 个(Palette)正好被吃掉,
+// 而且一声不吭。现在超了会 ESP_LOGE,而且两屏共 8 格。
+constexpr int GRID_COLS = 2;
+constexpr int PER_PAGE  = GRID_COLS * 2;          // 每屏 4 个
+constexpr int APP_PAGES = PAGES - 1;              // 首页之外都是应用屏
+constexpr int MAX_APPS  = PER_PAGE * APP_PAGES;   // 8
 
 // 应用卡片 2x2
 constexpr int CM = 12, CG = 10;                       // 外边距 / 卡间距
@@ -80,6 +88,16 @@ const lv_image_dsc_t kWallpaper = {
 // 重贴一遍壁纸和四张卡片配图,这些读会和 CPU 取指令抢同一条 flash 总线,
 // cache 来回颠簸 —— 同样是 RGB565 直贴,放 flash 比放 PSRAM 慢得多。
 // 开机时拷一份到 PSRAM(壁纸 150KB + 四张配图 107KB),之后只读 PSRAM。
+// 朝白色插值。pct=0 原色,pct=100 纯白。
+uint32_t lighten(uint32_t c, int pct)
+{
+    int r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
+    r += (255 - r) * pct / 100;
+    g += (255 - g) * pct / 100;
+    b += (255 - b) * pct / 100;
+    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+}
+
 const lv_image_dsc_t* to_psram(const lv_image_dsc_t* src)
 {
     if (!src) return nullptr;
@@ -145,6 +163,9 @@ public:
         status_t_ = lv_timer_create([](lv_timer_t* t) {
             static_cast<Host*>(lv_timer_get_user_data(t))->refresh_status();
         }, 10000, this);
+        if ((int)all.size() > MAX_APPS)
+            ESP_LOGE(TAG, "注册了 %d 个应用,桌面只有 %d 格 —— 多出来的进不了桌面!",
+                     (int)all.size(), MAX_APPS);
         ESP_LOGI(TAG, "桌面就绪,%d 个应用,%d 屏", n_apps_, PAGES);
     }
 
@@ -226,7 +247,10 @@ private:
             return pg;
         };
         pg_obj_[0] = mk_page();  build_home(pg_obj_[0]);
-        pg_obj_[1] = mk_page();  build_apps(pg_obj_[1]);
+        for (int i = 0; i < APP_PAGES; i++) {
+            pg_obj_[1 + i] = mk_page();
+            build_apps(pg_obj_[1 + i], i * PER_PAGE);
+        }
 
         // 圆点指示器建在 scr_ 上而不是 pages_ 里,切屏时它不跟着走
         for (int i = 0; i < PAGES; i++) {
@@ -371,12 +395,15 @@ private:
         bat_ = mk_label(sb, &lv_font_montserrat_14, C_STATUS, "--");
     }
 
-    void build_apps(lv_obj_t* p)
+    // base 是这一屏的第一个应用下标。卡片索引 cards_[] 是【全局】的,
+    // 跨屏连续 —— 选中态、键盘导航都按全局下标走,不用再做屏内/屏间转换。
+    void build_apps(lv_obj_t* p, int base)
     {
         auto& apps = AppRegistry::instance().apps();
-        for (int i = 0; i < MAX_APPS; i++) {
-            int x = CM + (i % 2) * (CW + CG);
-            int y = (i / 2 == 0) ? CY0 : CY1;
+        for (int k = 0; k < PER_PAGE; k++) {
+            int i = base + k;
+            int x = CM + (k % GRID_COLS) * (CW + CG);
+            int y = (k / GRID_COLS == 0) ? CY0 : CY1;
 
             lv_obj_t* c = lv_obj_create(p);
             lv_obj_set_size(c, CW, CH);
@@ -390,44 +417,41 @@ private:
 
             if (i < n_apps_) {
                 App* a = apps[grid_idx_[i]];
-                lv_obj_set_style_bg_color(c, lv_color_hex(C_CARD), LV_PART_MAIN);
+                const uint32_t bg = a->card_color();
+                lv_obj_set_style_bg_color(c, lv_color_hex(bg), LV_PART_MAIN);
                 lv_obj_set_style_bg_opa(c, LV_OPA_COVER, LV_PART_MAIN);
-                lv_obj_set_style_border_width(c, 1, LV_PART_MAIN);
-                lv_obj_set_style_border_color(c, lv_color_hex(C_LINE), LV_PART_MAIN);
+                // 描边交给 paint_selection 管(未选中是 0,选中是白色粗环)。
+                // ⚠️ 这里设了也没用,paint_selection 每次都会重设一遍。
                 // ⚠️ 卡片【不加阴影】。LVGL 的阴影是软件高斯模糊,
                 // 滑动时整屏每帧重画,实测宽度 6 就要吃掉约 40ms/帧
                 // (89ms → 44ms)。卡片本身是浓郁的彩色配图,不靠阴影也跳得出来。
                 lv_obj_set_style_shadow_width(c, 0, LV_PART_MAIN);
-                // ── 卡片内容 ────────────────────────────────────
+                // ── 卡片内容:右侧大图标 + 左下角标题 ──────────────
                 //
-                // 优先用整幅配图(App::card_art)。这既是为了好看,也是为了快:
-                // 实测(LV_USE_PERF_MONITOR,滑动中)四张卡片的矢量内容
-                // —— 均衡器条、仪表盘圆弧、色带 —— 每帧要重画 75ms,
-                // 而它们一动不动。整幅贴图之后这一项几乎归零。
+                // 滑动性能这一路是量出来的(LV_USE_PERF_MONITOR):
+                //   每张卡自己画矢量内容      152ms/帧   5 FPS
+                //   关阴影                    111ms      8 FPS
+                //   不画卡片内容               36ms     23 FPS
+                // 现在这两个元素都几乎白送:纯色底是整行 memcpy,
+                // 图标是一个字形 —— 和"不画内容"基本同价。
                 //
-                //   原样                     152ms/帧   5 FPS
-                //   关阴影                   111ms      8 FPS
-                //   再不画卡片内容            36ms      23 FPS
-                //
-                // 标题直接压在图上,不加半透明黑条 —— 图的左下角在生成时
-                // 就烘了一层平滑的暗角(tools/gen_card_art.py),白字压上去
-                // 既看得清又不脏。
-                const lv_image_dsc_t* art = a->card_art();
-                if (art) {
-                    // ⚠️ 用【背景图】而不是子 image 控件。
-                    // 配图是方的、卡片是圆角的,子控件要靠 clip_corner 裁角,
-                    // 而 clip_corner 会让 LVGL 为每张卡开一个中间图层再合成 ——
-                    // 实测滑动时 125ms/帧,比不用配图还慢。
-                    // 背景图是在画背景时【顺带】按圆角遮罩的,不开图层,几乎白送。
-                    if (!art_psram_[i]) art_psram_[i] = to_psram(art);
-                    lv_obj_set_style_bg_image_src(c, art_psram_[i], LV_PART_MAIN);
+                // 图标颜色不是另挑的,是把底色朝白色提亮 55% 算出来的。
+                // 这样每张卡的图标都天然和自己的底色同一个色相,
+                // 四张卡并排看是一套;手挑四个"亮色"必然会挑歪。
+                // ⚠️ 图标要【在固定栏位里居中】,不能直接右对齐。
+                // 右对齐对齐的是文本框,而每个 FontAwesome 字形的右侧留白
+                // 各不相同 —— 实测四张卡的右边距是 22/12/17/12,
+                // 打勾那张明显往里缩。给一个定宽栏位再居中,
+                // 字形位置就一致了。
+                lv_obj_t* ic = mk_label(c, &lv_font_montserrat_48,
+                                        lighten(bg, 55), a->icon());
+                lv_obj_set_width(ic, 56);
+                lv_obj_set_style_text_align(ic, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+                lv_obj_align(ic, LV_ALIGN_RIGHT_MID, -6, -6);
 
-                    lv_obj_t* nm = mk_label(c, &lv_font_montserrat_16, 0xFFFFFF,
-                                            a->card_title());
-                    lv_obj_set_pos(nm, 10, CH - 26);
-                } else {
-                    a->render_card(c);
-                }
+                lv_obj_t* nm = mk_label(c, &lv_font_montserrat_16, 0xFFFFFF,
+                                        a->card_title());
+                lv_obj_set_pos(nm, 10, CH - 26);
 
                 lv_obj_set_user_data(c, (void*)(intptr_t)i);
                 lv_obj_add_flag(c, LV_OBJ_FLAG_CLICKABLE);
@@ -451,12 +475,23 @@ private:
     {
         for (int i = 0; i < MAX_APPS; i++) {
             if (!cards_[i] || i >= n_apps_) continue;
-            bool on = (i == sel_ && page_ == 1);
+            bool on = (i == sel_ && page_ == 1 + i / PER_PAGE);
             auto* a = AppRegistry::instance().apps()[grid_idx_[i]];
-            lv_obj_set_style_border_width(cards_[i], on ? 2 : 1, LV_PART_MAIN);
-            lv_obj_set_style_border_color(cards_[i],
-                lv_color_hex(on ? a->accent() : C_LINE), LV_PART_MAIN);
 
+            // 选中 = 白色粗环 + 底色提亮,两个信号一起给。
+            //
+            // 原来是"2px accent 描边 vs 1px 灰描边"。那是给浅色卡片设计的 ——
+            // 卡片换成饱和纯色之后,accent 绿画在紫色/赭色块上跟没画一样,
+            // 而且 2px 和 1px 的差别在 143x94 上根本读不出来。
+            //
+            // 白色是唯一在这四个色相上都跳得出来的颜色(它们都是中深调),
+            // 所以环用白不用 accent。底色再提亮一档是第二道保险:
+            // 光看环的话,余光扫过去还是容易漏。
+            lv_obj_set_style_border_width(cards_[i], on ? 3 : 0, LV_PART_MAIN);
+            lv_obj_set_style_border_color(cards_[i], lv_color_white(), LV_PART_MAIN);
+            lv_obj_set_style_bg_color(cards_[i],
+                lv_color_hex(on ? lighten(a->card_color(), 18) : a->card_color()),
+                LV_PART_MAIN);
         }
     }
 
@@ -505,6 +540,13 @@ private:
         if (p < 0 || p >= PAGES || p == page_) return;
         last_page_ms_ = now;
         page_ = p;
+        // 翻到应用屏时把选中拉到这一屏第一个,否则光标还留在上一屏,
+        // 按回车会打开一个看不见的应用。
+        if (p >= 1) {
+            int first = (p - 1) * PER_PAGE;
+            if (sel_ < first || sel_ >= first + PER_PAGE) sel_ = first;
+            if (sel_ >= n_apps_) sel_ = n_apps_ > 0 ? n_apps_ - 1 : 0;
+        }
         lv_obj_scroll_to_x(pages_, p * SCR_W, LV_ANIM_ON);
         paint_dots();
         paint_selection();
@@ -691,25 +733,32 @@ private:
         // 选择移动也要节流,理由同上:一次拨动会来好几个脉冲,
         // 不拦的话光标一下窜过好几格,根本停不到想要的那个。
         bool move_ok = (lv_tick_get() - last_move_ms_) >= MOVE_COOLDOWN_MS;
-        auto moved = [&]() { last_move_ms_ = lv_tick_get(); paint_selection(); };
+        // 选中跨屏时,画面要跟着翻过去 —— 否则光标跑到看不见的那一屏上。
+        auto moved = [&]() {
+            last_move_ms_ = lv_tick_get();
+            int want = 1 + sel_ / PER_PAGE;
+            if (want != page_) goto_page(want);
+            else paint_selection();
+        };
+        const bool on_apps = (page_ >= 1);
 
         switch (ie.key) {
         case Key::Left:
-            if (page_ == 1 && (sel_ % 2) == 1) { if (move_ok) { sel_--; moved(); } }
+            if (on_apps && (sel_ % GRID_COLS) != 0) { if (move_ok) { sel_--; moved(); } }
             else goto_page(page_ + 1);
             break;
         case Key::Right:
-            if (page_ == 1 && (sel_ % 2) == 0 && sel_ + 1 < n_apps_) { if (move_ok) { sel_++; moved(); } }
+            if (on_apps && (sel_ % GRID_COLS) != GRID_COLS - 1 && sel_ + 1 < n_apps_) { if (move_ok) { sel_++; moved(); } }
             else goto_page(page_ - 1);
             break;
         case Key::Up:
-            if (page_ == 1 && sel_ >= 2 && move_ok) { sel_ -= 2; moved(); }
+            if (on_apps && sel_ >= GRID_COLS && move_ok) { sel_ -= GRID_COLS; moved(); }
             break;
         case Key::Down:
-            if (page_ == 1 && sel_ + 2 < n_apps_ && move_ok) { sel_ += 2; moved(); }
+            if (on_apps && sel_ + GRID_COLS < n_apps_ && move_ok) { sel_ += GRID_COLS; moved(); }
             break;
         case Key::Enter:
-            if (page_ == 1) open(grid_idx_[sel_]); else goto_page(1);
+            if (on_apps) open(grid_idx_[sel_]); else goto_page(1);
             break;
         default: break;
         }
@@ -722,7 +771,6 @@ private:
     lv_obj_t*   cards_[MAX_APPS] = {};
     lv_draw_buf_t* card_snap_[MAX_APPS] = {};   // 卡片内容烘出来的位图
     lv_obj_t*      pg_obj_[PAGES] = {};
-    const lv_image_dsc_t* art_psram_[MAX_APPS] = {};
     lv_obj_t*      snap_img_[PAGES] = {};
     lv_draw_buf_t* snap_buf_[PAGES] = {};
     bool           scrolling_ = false;

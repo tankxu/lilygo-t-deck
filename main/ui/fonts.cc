@@ -27,6 +27,21 @@ extern "C" const uint8_t puhui_start[] asm("_binary_font_puhui_common_20_4_bin_s
 extern "C" const uint8_t puhui_end[]   asm("_binary_font_puhui_common_20_4_bin_end");
 extern "C" const uint8_t puhui16_start[] asm("_binary_font_puhui_common_16_4_bin_start");
 extern "C" const uint8_t puhui16_end[]   asm("_binary_font_puhui_common_16_4_bin_end");
+// 兜底字库:Noto Qwen 14px,18 万个码点,全量。
+//
+// 为什么要它:B站 的标题和 UP 名是用户产生的内容,字符集没有上界。
+// 拿真实列表量过 —— 914 个不同汉字里 puhui_common_16 缺 12 个
+// (冫哔嘤洺炅焗衿铡骜鱿…),puhui_common_20 缺 4 个,而且两套 puhui 的字集
+// 【不是包含关系】(码点数 61262 vs 61151,互有出入),互相回落救不全。
+//
+// ⚠️ 但【不能】直接拿全量字库当正文。试过 noto_qwen_16:行高 27,
+// 比 20px 标题字体(26)还高 —— 一换上去,音乐、设置、B站 所有用小号字的
+// 排版全被撑大,B站 列表的副标题直接被挤出行外。
+// 正确的分工是:正文仍用 puhui16(行高 20,排版一个字没动),
+// 只把全量字库挂成【回落】,生僻字从它那儿取。这套 14px/1bpp 只有 626KB,
+// 比换成 qwen16 还省 510KB。
+extern "C" const uint8_t qfb_start[] asm("_binary_font_noto_qwen_14_1_bin_start");
+extern "C" const uint8_t qfb_end[]   asm("_binary_font_noto_qwen_14_1_bin_end");
 
 namespace tdeck {
 namespace {
@@ -69,9 +84,9 @@ void fonts_init()
     }
 
     // ── 16px 小号 ────────────────────────────────────────
-    // 列表里的歌名/歌手用它。20px 当正文在 320 宽的屏上一行放不下几个字。
-    // 同样要用汉字自检 —— 字符集比 20px 那套小,而且 LARGE 布局是否一致
-    // 只能实测,不能靠文件大小推断。查不到就返回空,调用方回落到 20px。
+    // 列表里的歌名/歌手/视频标题用它。20px 当正文在 320 宽的屏上放不下几个字。
+    // 同样要用汉字自检:LARGE 布局是否一致只能实测,不能靠文件大小推断。
+    // 查不到就返回空,调用方回落到 20px。
     {
         uint32_t sz16 = (uint32_t)(puhui16_end - puhui16_start);
         s_cjk_s = cbin_font_create((uint8_t*)puhui16_start);
@@ -84,6 +99,22 @@ void fonts_init()
                 ESP_LOGW(TAG, "中文小号字体查不到字形,次要文字回落到 20px");
                 s_cjk_s = nullptr;
             }
+        }
+    }
+    // ── 生僻字兜底 ──────────────────────────────────────
+    // 两套 puhui 都是常用字子集,查不到就是方框。挂上全量字库,
+    // 生僻字会小一号(14px vs 16/20px)且没有抗锯齿(1bpp),但读得出来。
+    {
+        lv_font_t* fb = cbin_font_create((uint8_t*)qfb_start);
+        lv_font_glyph_dsc_t g = {};
+        // 用一个【确实不在 puhui 里】的字自检(U+98D3 飓),
+        // 拿"你"验等于没验 —— 那个字两套都有。
+        if (fb && lv_font_get_glyph_dsc(fb, &g, 0x98D3, 0) && g.box_w > 0) {
+            if (s_cjk)   s_cjk->fallback   = fb;
+            if (s_cjk_s) s_cjk_s->fallback = fb;
+            ESP_LOGI(TAG, "生僻字兜底字库已挂(%u 字节)", (unsigned)(qfb_end - qfb_start));
+        } else {
+            ESP_LOGW(TAG, "兜底字库不可用,生僻字仍会显示方框");
         }
     }
 }

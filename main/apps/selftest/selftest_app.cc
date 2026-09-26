@@ -25,18 +25,6 @@
 
 namespace {
 
-// 卡片配图。tools/gen_card_art.py 生成,CMake EMBED_FILES 以二进制嵌入
-// (143x94 RGB565,26884 字节),不走 C 数组。
-extern "C" const uint8_t card_selftest_start[] asm("_binary_card_selftest_rgb565_start");
-const lv_image_dsc_t kCardArt = {
-    .header = { .magic = LV_IMAGE_HEADER_MAGIC, .cf = LV_COLOR_FORMAT_RGB565,
-                .flags = 0, .w = 143, .h = 94, .stride = 143 * 2, .reserved_2 = 0 },
-    .data_size = 143 * 94 * 2,
-    .data      = card_selftest_start,
-};
-
-const char* TAG = "selftest";
-
 constexpr int SCR_W = 320, SCR_H = 240;
 constexpr int CJK_LINE_H = 26;
 
@@ -130,9 +118,9 @@ lv_obj_t* box(lv_obj_t* p, int x, int y, int w, int h, uint32_t bg, int radius)
 class SelfTestApp : public tdeck::App {
 public:
     const char* name() const override   { return "SELFTEST"; }
-    const lv_image_dsc_t* card_art() const override  { return &kCardArt; }
+    uint32_t card_color() const override              { return 0x4F7B2E; }
     const char* card_title() const override           { return "Self Test"; }
-    const char* icon() const override   { return LV_SYMBOL_SETTINGS; }
+    const char* icon() const override   { return LV_SYMBOL_OK; }
     uint32_t    accent() const override { return C_ACCENT; }
 
     // 键盘那一站要收原始字符,别让 launcher 把 q/s/y/n 截走。
@@ -175,37 +163,6 @@ public:
         case ST_LCD:   *out = lcd;   return 3;
         default:       return 0;
         }
-    }
-
-    void render_card(lv_obj_t* card) override
-    {
-        // ⚠️ 卡片尺寸写死 143×94,【不能】用 lv_obj_get_width(card) 去问 ——
-        // render_card 是在卡片刚建出来、布局还没算过的时候调的,那时宽高都是 0,
-        // 算出来的坐标全是负数,画出来就是一张空卡。
-        const int W = 143, H = 94;
-        lv_obj_set_style_bg_color(card, lv_color_hex(0xF3F6EF), LV_PART_MAIN);
-
-        // 一张"检查清单":六格,前四格已完成(实心),后两格待测(描边)。
-        // 不画图标 + 标题 + 说明那一套 —— 卡片是一个内容整体,
-        // 一眼看出"这是逐项打勾的东西"就够了。
-        const int TW = 30, TH = 18, GX = 9, GY = 10;
-        int x0 = (W - (3 * TW + 2 * GX)) / 2;
-        for (int i = 0; i < 6; i++) {
-            bool done = (i < 4);
-            lv_obj_t* b = box(card, x0 + (i % 3) * (TW + GX), 16 + (i / 3) * (TH + GY),
-                              TW, TH, done ? C_ACCENT : 0xFFFFFF, 6);
-            if (!done) {
-                lv_obj_set_style_border_width(b, 2, LV_PART_MAIN);
-                lv_obj_set_style_border_color(b, lv_color_hex(0xC8D3BA), LV_PART_MAIN);
-            }
-            lv_obj_remove_flag(b, LV_OBJ_FLAG_CLICKABLE);
-        }
-
-        lv_obj_t* nm = lv_label_create(card);
-        lv_obj_set_style_text_font(nm, &lv_font_montserrat_16, LV_PART_MAIN);
-        lv_obj_set_style_text_color(nm, lv_color_hex(0x1B2117), LV_PART_MAIN);
-        lv_label_set_text(nm, "Self Test");
-        lv_obj_set_pos(nm, 12, H - 26);
     }
 
     void on_enter(lv_obj_t* root) override

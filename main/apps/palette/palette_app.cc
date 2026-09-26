@@ -15,16 +15,6 @@
 
 namespace {
 
-// 卡片配图。tools/gen_card_art.py 生成,CMake EMBED_FILES 以二进制嵌入
-// (143x94 RGB565,26884 字节),不走 C 数组。
-extern "C" const uint8_t card_palette_start[] asm("_binary_card_palette_rgb565_start");
-const lv_image_dsc_t kCardArt = {
-    .header = { .magic = LV_IMAGE_HEADER_MAGIC, .cf = LV_COLOR_FORMAT_RGB565,
-                .flags = 0, .w = 143, .h = 94, .stride = 143 * 2, .reserved_2 = 0 },
-    .data_size = 143 * 94 * 2,
-    .data      = card_palette_start,
-};
-
 constexpr int COLS = 16, ROWS = 16;
 constexpr int CW = 19, CH = 11;            // 色块尺寸:16*19=304 宽,16*11=176 高
 constexpr int GX = (320 - COLS * CW) / 2;  // = 8,左右各留 8
@@ -65,51 +55,13 @@ inline uint16_t to565(Rgb c)
 class PaletteApp : public tdeck::App {
 public:
     const char* name() const override   { return "Palette"; }
-    const lv_image_dsc_t* card_art() const override  { return &kCardArt; }
+    uint32_t card_color() const override              { return 0xC2410C; }
     const char* card_title() const override           { return "Palette"; }
     const char* icon() const override   { return LV_SYMBOL_IMAGE; }
     uint32_t    accent() const override { return 0x55853A; }
 
     // 卡片就是一片真实的色带 —— 不是"一个调色板图标 + Palette 字样"。
     // 看一眼就知道这个 app 是干什么的,不需要读文字。
-    void render_card(lv_obj_t* card) override
-    {
-        build_colors();
-        const int W = 143, H = 94, BARS = 16;
-
-        // 每列一个色相,取该列中段的饱和色(rows 6~9 是最鲜艳的一段)
-        for (int i = 0; i < BARS; i++) {
-            lv_obj_t* bar = lv_obj_create(card);
-            lv_obj_set_size(bar, (W + BARS - 1) / BARS, H);
-            lv_obj_set_pos(bar, i * W / BARS, 0);
-            lv_obj_set_style_bg_color(bar, lv_color_hex(rgb_[7 * COLS + i]), LV_PART_MAIN);
-            lv_obj_set_style_radius(bar, 0, LV_PART_MAIN);
-            lv_obj_set_style_border_width(bar, 0, LV_PART_MAIN);
-            lv_obj_set_style_pad_all(bar, 0, LV_PART_MAIN);
-            lv_obj_remove_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
-            lv_obj_remove_flag(bar, LV_OBJ_FLAG_CLICKABLE);
-        }
-
-        // 底部压一条半透明深色带,白字才在任何色相上都读得出来 ——
-        // 直接把文字放在彩色条上,遇到黄色那几列就看不见了
-        lv_obj_t* scrim = lv_obj_create(card);
-        lv_obj_set_size(scrim, W, 30);
-        lv_obj_set_pos(scrim, 0, H - 30);
-        lv_obj_set_style_bg_color(scrim, lv_color_hex(0x101410), LV_PART_MAIN);
-        lv_obj_set_style_bg_opa(scrim, LV_OPA_70, LV_PART_MAIN);
-        lv_obj_set_style_radius(scrim, 0, LV_PART_MAIN);
-        lv_obj_set_style_border_width(scrim, 0, LV_PART_MAIN);
-        lv_obj_set_style_pad_all(scrim, 0, LV_PART_MAIN);
-        lv_obj_remove_flag(scrim, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_remove_flag(scrim, LV_OBJ_FLAG_CLICKABLE);
-
-        lv_obj_t* nm = lv_label_create(scrim);
-        lv_obj_set_style_text_font(nm, &lv_font_montserrat_16, LV_PART_MAIN);
-        lv_obj_set_style_text_color(nm, lv_color_white(), LV_PART_MAIN);
-        lv_label_set_text(nm, "Palette");
-        lv_obj_align(nm, LV_ALIGN_LEFT_MID, 10, 0);
-    }
-
     void on_enter(lv_obj_t* root) override
     {
         build_colors();

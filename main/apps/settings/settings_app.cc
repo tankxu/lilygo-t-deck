@@ -1,95 +1,97 @@
 // settings_app.cc — 系统设置
 //
-// 目前三块:WiFi(查看 / 扫描 / 切换)、背光、关于。
+// 四层:主菜单 → 关于本机 / WiFi 列表 → 密码输入。
+// 用一个枚举而不是四个 screen,是因为它们共用同一块 root,
+// Back 键在层与层之间退,退到头才交还给 launcher(ADR-006 的语义)。
 //
 // WiFi 密码输入直接用 T-Deck 的物理键盘 —— 它本来就是这台机器最大的优势,
 // 没必要在 320x240 上挤一个软键盘出来。
+//
+// 视觉上和音乐、自检是一套:中文、圆角白卡、左侧彩色图标方块。
+// ⚠️ 界面里【不写快捷键】—— 全部进 shortcuts(),由 launcher 的 s 键统一展示。
 
 #include "app.h"
 #include "net/net.h"
 #include "tdeck_bsp.h"
+#include "ui/fonts.h"
 
+#include <esp_app_desc.h>
 #include <esp_mac.h>
+#include <esp_ota_ops.h>
 #include <esp_system.h>
+#include <esp_timer.h>
 #include <lvgl.h>
 #include <stdio.h>
 #include <string.h>
 
 namespace {
 
-// 卡片配图。tools/gen_card_art.py 生成,CMake EMBED_FILES 以二进制嵌入
-// (143x94 RGB565,26884 字节),不走 C 数组。
-extern "C" const uint8_t card_settings_start[] asm("_binary_card_settings_rgb565_start");
-const lv_image_dsc_t kCardArt = {
-    .header = { .magic = LV_IMAGE_HEADER_MAGIC, .cf = LV_COLOR_FORMAT_RGB565,
-                .flags = 0, .w = 143, .h = 94, .stride = 143 * 2, .reserved_2 = 0 },
-    .data_size = 143 * 94 * 2,
-    .data      = card_settings_start,
-};
-
 constexpr uint32_t C_ACCENT = 0x55853A;
 constexpr uint32_t C_TEXT   = 0x1b2117;
-constexpr uint32_t C_MUTE   = 0x6a7360;
-constexpr uint32_t C_LINE   = 0xd6dbcd;
-constexpr uint32_t C_CARD   = 0xffffff;
+constexpr uint32_t C_MUTE   = 0x8A9480;
+constexpr uint32_t C_CARD   = 0xFFFFFF;
+constexpr uint32_t C_SEL_BG = 0xEDF3E4;   // 选中行的浅绿底
+constexpr uint32_t C_TRACK  = 0xE2E8D8;   // 亮度条的槽
 
 constexpr int SCR_W = 320, SCR_H = 240;
 constexpr int MAX_AP = 12;
 
-// 界面有三层:主菜单 → WiFi 列表 → 密码输入。
-// 用一个枚举而不是三个 screen,是因为它们共用同一块 root,
-// Back 键在层与层之间退,退到头才交还给 launcher(ADR-006 的语义)。
-enum class View { Menu, WifiList, Password };
+constexpr int SIDE   = 12;
+constexpr int ROW_H  = 54;
+constexpr int ROW_GAP = 8;
+constexpr int ROW_R  = 14;
+constexpr int CHIP   = 34;          // 左侧图标方块
+
+// 字体:能用中文就用中文,建不起来时回落到 Montserrat(只有 ASCII)。
+const lv_font_t* F20() { auto* f = tdeck::font_cjk();       return f ? f : &lv_font_montserrat_20; }
+const lv_font_t* F16() { auto* f = tdeck::font_cjk_small(); return f ? f : &lv_font_montserrat_16; }
+const lv_font_t* FICON() { return &lv_font_montserrat_16; }   // LV_SYMBOL_* 在这套字库里
+
+enum class View { Menu, About, WifiList, Password };
 
 class SettingsApp : public tdeck::App {
 public:
     const char* name() const override   { return "Settings"; }
-    const lv_image_dsc_t* card_art() const override  { return &kCardArt; }
+    uint32_t card_color() const override              { return 0x2F6690; }
     const char* card_title() const override           { return "Settings"; }
     const char* icon() const override   { return LV_SYMBOL_SETTINGS; }
     uint32_t    accent() const override { return 0x4F6B3E; }
     // 密码框里要能打全部字符(ADR-006 的后路)
     bool wants_raw_keys() const override { return view_ == View::Password; }
 
-    // 卡片是【入口】不是挂件:不显示当前网络状态。
-    // 三道同心弧 —— 既像设置里的滑块刻度,又和音乐的直条、色板的色带
-    // 在形状上彻底区分开。三张卡片放一起靠形状就能认,不用读字。
-    void render_card(lv_obj_t* card) override
+    int shortcuts(const tdeck::Shortcut** out) const override
     {
-        const int W = 143, H = 94;
-        lv_obj_set_style_bg_color(card, lv_color_hex(0xEFF3E9), LV_PART_MAIN);
-
-        struct { int r, w, start, len; uint32_t c; } arcs[] = {
-            { 62, 7, 140, 200, 0x55853A },
-            { 48, 6, 170, 150, 0x8FAE60 },
-            { 34, 5, 200, 110, 0xC3D6A8 },
+        static const tdeck::Shortcut menu[] = {
+            { "ball U/D",  "move between rows" },
+            { "ball L/R",  "brightness (on that row)" },
+            { "y / click", "open" },
         };
-        for (auto& a : arcs) {
-            lv_obj_t* arc = lv_arc_create(card);
-            lv_obj_set_size(arc, a.r * 2, a.r * 2);
-            lv_obj_set_pos(arc, W / 2 - a.r, H - 18 - a.r);
-            lv_arc_set_bg_angles(arc, a.start, a.start + a.len);
-            lv_arc_set_value(arc, 100);
-            lv_obj_remove_style(arc, nullptr, LV_PART_KNOB);
-            lv_obj_set_style_arc_width(arc, a.w, LV_PART_MAIN);
-            lv_obj_set_style_arc_width(arc, a.w, LV_PART_INDICATOR);
-            lv_obj_set_style_arc_color(arc, lv_color_hex(a.c), LV_PART_MAIN);
-            lv_obj_set_style_arc_color(arc, lv_color_hex(a.c), LV_PART_INDICATOR);
-            lv_obj_set_style_arc_opa(arc, LV_OPA_COVER, LV_PART_MAIN);
-            lv_obj_remove_flag(arc, LV_OBJ_FLAG_CLICKABLE);
+        static const tdeck::Shortcut list[] = {
+            { "ball U/D",  "pick a network" },
+            { "y / click", "connect" },
+            { "n / b",     "back" },
+        };
+        static const tdeck::Shortcut pass[] = {
+            { "type",      "the password" },
+            { "enter",     "connect" },
+            { "esc",       "back" },
+        };
+        static const tdeck::Shortcut about[] = {
+            { "n / b",     "back" },
+        };
+        switch (view_) {
+        case View::Menu:     *out = menu;  return 3;
+        case View::WifiList: *out = list;  return 3;
+        case View::Password: *out = pass;  return 3;
+        case View::About:    *out = about; return 1;
         }
-
-        lv_obj_t* nm = lv_label_create(card);
-        lv_obj_set_style_text_font(nm, &lv_font_montserrat_16, LV_PART_MAIN);
-        lv_obj_set_style_text_color(nm, lv_color_hex(C_TEXT), LV_PART_MAIN);
-        lv_label_set_text(nm, "Settings");
-        lv_obj_set_pos(nm, 12, 10);
+        return 0;
     }
 
     void on_enter(lv_obj_t* root) override
     {
         root_ = root;
-        lv_obj_set_style_bg_color(root, lv_color_hex(0xF2F5EE), LV_PART_MAIN);
+        lv_obj_set_style_bg_color(root, lv_color_hex(0xF4F6F0), LV_PART_MAIN);
         lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
         show_menu();
     }
@@ -100,6 +102,7 @@ public:
     {
         switch (view_) {
         case View::Menu:     return menu_input(ev);
+        case View::About:    return about_input(ev);
         case View::WifiList: return list_input(ev);
         case View::Password: return pass_input(ev);
         }
@@ -118,29 +121,84 @@ private:
         return l;
     }
 
-    lv_obj_t* row(lv_obj_t* p, int y, int h = 40)
+    // 一块素的圆角面板。所有卡片、方块、进度槽都从它长出来 ——
+    // lv_obj_create 默认带边框、内边距和滚动,每处都重设一遍太啰嗦。
+    static lv_obj_t* panel(lv_obj_t* p, int x, int y, int w, int h, uint32_t bg, int r)
     {
-        lv_obj_t* r = lv_obj_create(p);
-        lv_obj_set_size(r, SCR_W - 24, h);
-        lv_obj_set_pos(r, 12, y);
-        lv_obj_set_style_bg_color(r, lv_color_hex(C_CARD), LV_PART_MAIN);
-        lv_obj_set_style_radius(r, 10, LV_PART_MAIN);
-        lv_obj_set_style_border_width(r, 1, LV_PART_MAIN);
-        lv_obj_set_style_border_color(r, lv_color_hex(C_LINE), LV_PART_MAIN);
-        lv_obj_set_style_pad_all(r, 0, LV_PART_MAIN);
-        lv_obj_remove_flag(r, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_t* o = lv_obj_create(p);
+        lv_obj_set_size(o, w, h);
+        lv_obj_set_pos(o, x, y);
+        lv_obj_set_style_bg_color(o, lv_color_hex(bg), LV_PART_MAIN);
+        lv_obj_set_style_radius(o, r, LV_PART_MAIN);
+        lv_obj_set_style_border_width(o, 0, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(o, 0, LV_PART_MAIN);
+        lv_obj_set_style_shadow_width(o, 0, LV_PART_MAIN);
+        lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE);
+        // ⚠️ lv_obj_create 建出来的对象【默认可点】。这些都是装饰,
+        // 不摘掉就会把点击从父行那儿抢走。
+        lv_obj_remove_flag(o, LV_OBJ_FLAG_CLICKABLE);
+        return o;
+    }
+
+    // 行左边那个彩色图标方块。颜色按功能分,比一排同色图标好认。
+    static void chip(lv_obj_t* r, uint32_t color, const char* sym)
+    {
+        lv_obj_t* c = panel(r, 10, (ROW_H - CHIP) / 2, CHIP, CHIP, color, 10);
+        lv_obj_t* l = mk(c, FICON(), 0xFFFFFF, 0, 0, sym);
+        lv_obj_center(l);
+    }
+
+    // 可点的行。panel() 默认把 CLICKABLE 摘了(那是给装饰子对象用的),
+    // 行要自己加回来 —— 这台机器有触摸屏,列表点不动不像话。
+    // idx 存进 user_data,回调里直接拿,不用为每行建一个 lambda 闭包。
+    lv_obj_t* make_row(int y, int idx, lv_event_cb_t cb, int h = ROW_H)
+    {
+        lv_obj_t* r = panel(root_, SIDE, y, SCR_W - SIDE * 2, h, C_CARD, ROW_R);
+        lv_obj_set_user_data(r, (void*)(intptr_t)idx);
+        lv_obj_add_flag(r, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(r, cb, LV_EVENT_CLICKED, this);
         return r;
     }
 
-    void title(const char* s)
+    // 点菜单行 = 选中它并打开(亮度行没有二级页,只选中)。
+    static void menu_click(lv_event_t* e)
     {
-        mk(root_, &lv_font_montserrat_20, C_TEXT, 14, 10, s);
+        auto* s = static_cast<SettingsApp*>(lv_event_get_user_data(e));
+        int i = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target_obj(e));
+        s->sel_ = i;
+        s->paint_rows();
+        if (i == 0)      s->show_wifi_list();
+        else if (i == 2) s->show_about();
     }
 
-    void hint(const char* s)
+    static void ap_click(lv_event_t* e)
     {
-        lv_obj_t* l = mk(root_, &lv_font_montserrat_14, C_MUTE, 14, SCR_H - 22, s);
-        (void)l;
+        auto* s = static_cast<SettingsApp*>(lv_event_get_user_data(e));
+        s->sel_ = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target_obj(e));
+        s->paint_ap();
+        s->show_password();
+    }
+
+    void header(const char* s)
+    {
+        mk(root_, F20(), C_TEXT, SIDE + 2, 8, s);
+    }
+
+    // 选中态:浅绿底 + 2px accent 描边。
+    //
+    // ⚠️ 边框宽度【一直是 2】,切换的是透明度。
+    // LVGL 里子对象的坐标是相对【内容区】算的,而内容区 = 外框 - 边框宽 - 内边距。
+    // 所以 0 → 2 的边框变化会把整行的图标和文字一起往右下推,
+    // 选中时肉眼可见地跳一下(实测图标方块 x 从 14 变成 15)。
+    // 透明度不参与内容区计算,改它就不会动布局。
+    // 音乐列表那圈选中环踩的是同一个坑,那边是另建一个同心对象解决的;
+    // 这里整行本来就要换底色,恒宽 + 调透明度更省一个对象。
+    static void mark(lv_obj_t* o, bool on)
+    {
+        lv_obj_set_style_bg_color(o, lv_color_hex(on ? C_SEL_BG : C_CARD), LV_PART_MAIN);
+        lv_obj_set_style_border_width(o, 2, LV_PART_MAIN);
+        lv_obj_set_style_border_color(o, lv_color_hex(C_ACCENT), LV_PART_MAIN);
+        lv_obj_set_style_border_opa(o, on ? LV_OPA_COVER : LV_OPA_TRANSP, LV_PART_MAIN);
     }
 
     // ── 主菜单 ──
@@ -148,45 +206,57 @@ private:
     {
         view_ = View::Menu;
         lv_obj_clean(root_);
-        title("Settings");
+        bl_bar_ = bl_val_ = nullptr;
+        header("设置");
 
         auto st = tdeck::net_status();
         char buf[64];
+        int y = 44;
 
-        lv_obj_t* r0 = row(root_, 44);
-        mk(r0, &lv_font_montserrat_16, C_TEXT, 12, 5, LV_SYMBOL_WIFI "  Wi-Fi");
-        snprintf(buf, sizeof(buf), "%s", st.online ? st.ssid : "not connected");
-        lv_obj_t* v0 = mk(r0, &lv_font_montserrat_14, C_MUTE, 12, 23, buf);
+        // 无线网络
+        lv_obj_t* r0 = make_row(y, 0, menu_click);
+        chip(r0, 0x3B82C4, LV_SYMBOL_WIFI);
+        mk(r0, F16(), C_TEXT, 56, 8, "无线网络");
+        snprintf(buf, sizeof(buf), "%s", st.online ? st.ssid : "未连接");
+        lv_obj_t* v0 = mk(r0, F16(), C_MUTE, 56, 29, buf);
         lv_label_set_long_mode(v0, LV_LABEL_LONG_DOT);
-        lv_obj_set_width(v0, 270);
+        lv_obj_set_width(v0, SCR_W - SIDE * 2 - 56 - 28);
+        mk(r0, FICON(), C_MUTE, SCR_W - SIDE * 2 - 22, ROW_H / 2 - 9, LV_SYMBOL_RIGHT);
+        y += ROW_H + ROW_GAP;
 
-        lv_obj_t* r1 = row(root_, 90);
-        mk(r1, &lv_font_montserrat_16, C_TEXT, 12, 5, LV_SYMBOL_EYE_OPEN "  Backlight");
-        snprintf(buf, sizeof(buf), "%d%%   (left/right to adjust)", tdeck_backlight_get());
-        bl_val_ = mk(r1, &lv_font_montserrat_14, C_MUTE, 12, 23, buf);
+        // 屏幕亮度 —— 直接给一条进度槽。百分比数字也留着,
+        // 因为槽只能看出"大概多亮",调到底/调到顶时数字才说得清。
+        lv_obj_t* r1 = make_row(y, 1, menu_click);
+        chip(r1, 0xD79A32, LV_SYMBOL_EYE_OPEN);
+        mk(r1, F16(), C_TEXT, 56, 8, "屏幕亮度");
+        int bl = (int)tdeck_backlight_get();
+        snprintf(buf, sizeof(buf), "%d%%", bl);
+        bl_val_ = mk(r1, F16(), C_MUTE, SCR_W - SIDE * 2 - 48, 8, buf);
+        const int TRK_X = 56, TRK_W = SCR_W - SIDE * 2 - TRK_X - 14;
+        panel(r1, TRK_X, 34, TRK_W, 6, C_TRACK, 3);
+        bl_bar_ = panel(r1, TRK_X, 34, TRK_W * bl / 100, 6, C_ACCENT, 3);
+        bl_trk_w_ = TRK_W;
+        y += ROW_H + ROW_GAP;
 
-        lv_obj_t* r2 = row(root_, 136, 56);
-        mk(r2, &lv_font_montserrat_16, C_TEXT, 12, 5, LV_SYMBOL_LIST "  About");
-        uint8_t mac[6]; esp_read_mac(mac, ESP_MAC_WIFI_STA);
-        snprintf(buf, sizeof(buf), "T-Deck OS   %02X:%02X:%02X:%02X:%02X:%02X",
-                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-        mk(r2, &lv_font_montserrat_14, C_MUTE, 12, 23, buf);
-        snprintf(buf, sizeof(buf), "free %u KB", (unsigned)(esp_get_free_heap_size() / 1024));
-        mk(r2, &lv_font_montserrat_14, C_MUTE, 12, 38, buf);
+        // 关于本机 —— 详情挪进二级页。首页塞 MAC 和堆大小,
+        // 又长又没人天天看,把这一行撑得比别的行都高。
+        lv_obj_t* r2 = make_row(y, 2, menu_click);
+        chip(r2, 0x7A8471, LV_SYMBOL_LIST);
+        mk(r2, F16(), C_TEXT, 56, 8, "关于本机");
+        const esp_app_desc_t* app = esp_app_get_description();
+        snprintf(buf, sizeof(buf), "T-Deck OS %s", app->version);
+        mk(r2, F16(), C_MUTE, 56, 29, buf);
+        mk(r2, FICON(), C_MUTE, SCR_W - SIDE * 2 - 22, ROW_H / 2 - 9, LV_SYMBOL_RIGHT);
 
         rows_[0] = r0; rows_[1] = r1; rows_[2] = r2;
         n_rows_ = 3;
+        if (sel_ >= n_rows_) sel_ = 0;
         paint_rows();
-        hint("y: open   n/b: back   q: quit");
     }
 
     void paint_rows()
     {
-        for (int i = 0; i < n_rows_; i++) {
-            bool on = (i == sel_);
-            lv_obj_set_style_border_color(rows_[i], lv_color_hex(on ? C_ACCENT : C_LINE), LV_PART_MAIN);
-            lv_obj_set_style_border_width(rows_[i], on ? 2 : 1, LV_PART_MAIN);
-        }
+        for (int i = 0; i < n_rows_; i++) mark(rows_[i], i == sel_);
     }
 
     bool menu_input(const tdeck::InputEvent& ev)
@@ -196,22 +266,69 @@ private:
         case tdeck::Key::Down:  if (sel_ < n_rows_ - 1) { sel_++; paint_rows(); } return true;
         case tdeck::Key::Left:
         case tdeck::Key::Right:
-            if (sel_ == 1) {   // 背光行:左右直接调,不用进二级页
+            if (sel_ == 1) {   // 亮度行:左右直接调,不用进二级页
                 int d = (ev.key == tdeck::Key::Right) ? 5 : -5;
                 int v = (int)tdeck_backlight_get() + d;
                 if (v < 5)   v = 5;
                 if (v > 100) v = 100;
                 tdeck_backlight_set((uint8_t)v);
-                char b[64]; snprintf(b, sizeof(b), "%d%%   (left/right to adjust)", v);
+                char b[16]; snprintf(b, sizeof(b), "%d%%", v);
                 lv_label_set_text(bl_val_, b);
+                lv_obj_set_width(bl_bar_, bl_trk_w_ * v / 100);
                 return true;
             }
             return false;   // 其它行让 launcher 翻页
         case tdeck::Key::Enter:
-            if (sel_ == 0) { show_wifi_list(); }
+            if (sel_ == 0)      show_wifi_list();
+            else if (sel_ == 2) show_about();
             return true;
         default: return false;
         }
+    }
+
+    // ── 关于本机 ──
+    void show_about()
+    {
+        view_ = View::About;
+        lv_obj_clean(root_);
+        header("关于本机");
+
+        const esp_app_desc_t* app = esp_app_get_description();
+        const esp_partition_t* run = esp_ota_get_running_partition();
+        uint8_t mac[6]; esp_read_mac(mac, ESP_MAC_WIFI_STA);
+        int64_t up = esp_timer_get_time() / 1000000;
+
+        char v[6][64];
+        snprintf(v[0], 64, "%s", app->version);
+        snprintf(v[1], 64, "%s", app->idf_ver);
+        snprintf(v[2], 64, "%02X:%02X:%02X:%02X:%02X:%02X",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        snprintf(v[3], 64, "%s", run ? run->label : "?");
+        snprintf(v[4], 64, "%u KB", (unsigned)(esp_get_free_heap_size() / 1024));
+        if (up >= 3600)   snprintf(v[5], 64, "%d 小时 %d 分", (int)(up / 3600), (int)(up % 3600 / 60));
+        else if (up >= 60) snprintf(v[5], 64, "%d 分 %d 秒", (int)(up / 60), (int)(up % 60));
+        else               snprintf(v[5], 64, "%d 秒", (int)up);
+        static const char* K[6] = { "系统版本", "ESP-IDF", "MAC 地址",
+                                    "固件分区", "可用内存", "运行时长" };
+
+        // 六行挤一块白卡里。分隔线用极淡的灰,比给每行一张卡片安静得多 ——
+        // 这是只读信息,不需要每条都长得像个可点的按钮。
+        const int RH = 28, PAD = 10;
+        lv_obj_t* card = panel(root_, SIDE, 42, SCR_W - SIDE * 2, PAD * 2 + RH * 6, C_CARD, ROW_R);
+        for (int i = 0; i < 6; i++) {
+            int ry = PAD + i * RH;
+            mk(card, F16(), C_MUTE, 14, ry + 4, K[i]);
+            lv_obj_t* l = mk(card, F16(), C_TEXT, 110, ry + 4, v[i]);
+            lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+            lv_obj_set_width(l, SCR_W - SIDE * 2 - 110 - 14);
+            if (i) panel(card, 14, ry - 1, SCR_W - SIDE * 2 - 28, 1, 0xEFF2EA, 0);
+        }
+    }
+
+    bool about_input(const tdeck::InputEvent& ev)
+    {
+        if (ev.key == tdeck::Key::Back) { sel_ = 2; show_menu(); return true; }
+        return false;
     }
 
     // ── WiFi 列表 ──
@@ -219,59 +336,57 @@ private:
     {
         view_ = View::WifiList;
         lv_obj_clean(root_);
-        title("Wi-Fi");
-        mk(root_, &lv_font_montserrat_14, C_MUTE, 14, 36, "scanning...");
+        header("无线网络");
+        mk(root_, F16(), C_MUTE, SIDE + 2, 46, "正在扫描…");
         lv_refr_now(nullptr);   // 扫描是阻塞的,先把"扫描中"刷出去
 
         n_ap_ = tdeck::net_scan(aps_, MAX_AP);
         sel_ = 0;
 
         lv_obj_clean(root_);
-        title("Wi-Fi");
+        header("无线网络");
         if (n_ap_ == 0) {
-            mk(root_, &lv_font_montserrat_16, C_MUTE, 14, 40, "no networks found");
-            hint("n/b: back");
+            mk(root_, F16(), C_MUTE, SIDE + 2, 46, "没有找到网络");
             return;
         }
         list_ = lv_obj_create(root_);
-        lv_obj_set_size(list_, SCR_W - 24, 176);
-        lv_obj_set_pos(list_, 12, 38);
+        lv_obj_set_size(list_, SCR_W, SCR_H - 42);
+        lv_obj_set_pos(list_, 0, 42);
         lv_obj_set_style_bg_opa(list_, LV_OPA_TRANSP, LV_PART_MAIN);
         lv_obj_set_style_border_width(list_, 0, LV_PART_MAIN);
         lv_obj_set_style_pad_all(list_, 0, LV_PART_MAIN);
         lv_obj_set_scroll_dir(list_, LV_DIR_VER);
         lv_obj_set_scrollbar_mode(list_, LV_SCROLLBAR_MODE_OFF);
 
+        const int AH = 40, AG = 6;
         for (int i = 0; i < n_ap_; i++) {
-            lv_obj_t* r = lv_obj_create(list_);
-            lv_obj_set_size(r, SCR_W - 28, 30);
-            lv_obj_set_pos(r, 0, i * 34);
-            lv_obj_set_style_bg_color(r, lv_color_hex(C_CARD), LV_PART_MAIN);
-            lv_obj_set_style_radius(r, 8, LV_PART_MAIN);
-            lv_obj_set_style_border_width(r, 1, LV_PART_MAIN);
-            lv_obj_set_style_pad_all(r, 0, LV_PART_MAIN);
-            lv_obj_remove_flag(r, LV_OBJ_FLAG_SCROLLABLE);
-
+            lv_obj_t* r = panel(list_, SIDE, i * (AH + AG), SCR_W - SIDE * 2, AH, C_CARD, 12);
+            lv_obj_set_user_data(r, (void*)(intptr_t)i);
+            lv_obj_add_flag(r, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_flag(r, LV_OBJ_FLAG_EVENT_BUBBLE);   // 竖滑手势要能穿过去
+            lv_obj_add_event_cb(r, ap_click, LV_EVENT_CLICKED, this);
             char b[64];
-            snprintf(b, sizeof(b), "%s%s", aps_[i].ssid, aps_[i].secure ? "  " LV_SYMBOL_CLOSE : "");
-            lv_obj_t* l = mk(r, &lv_font_montserrat_16, C_TEXT, 10, 4, b);
+            snprintf(b, sizeof(b), "%s", aps_[i].ssid);
+            lv_obj_t* l = mk(r, F16(), C_TEXT, 12, (AH - 20) / 2, b);
             lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
-            lv_obj_set_width(l, 210);
+            lv_obj_set_width(l, 190);
+
+            // 开放网络明着标出来。原来是给【加密】的网络打一个 LV_SYMBOL_CLOSE
+            // (其实是个叉),既不像锁,也让"有标记"读起来像"连不上"。
+            // 值得提醒的本来就是开放网络。
+            if (!aps_[i].secure)
+                mk(r, F16(), 0xC2410C, 214, (AH - 20) / 2, "开放");
+
             snprintf(b, sizeof(b), "%d", aps_[i].rssi);
-            mk(r, &lv_font_montserrat_14, C_MUTE, SCR_W - 70, 6, b);
+            mk(r, F16(), C_MUTE, SCR_W - SIDE * 2 - 46, (AH - 20) / 2, b);
             ap_rows_[i] = r;
         }
         paint_ap();
-        hint("y: connect   n/b: back");
     }
 
     void paint_ap()
     {
-        for (int i = 0; i < n_ap_; i++) {
-            bool on = (i == sel_);
-            lv_obj_set_style_border_color(ap_rows_[i], lv_color_hex(on ? C_ACCENT : C_LINE), LV_PART_MAIN);
-            lv_obj_set_style_border_width(ap_rows_[i], on ? 2 : 1, LV_PART_MAIN);
-        }
+        for (int i = 0; i < n_ap_; i++) mark(ap_rows_[i], i == sel_);
         if (n_ap_ > 0) lv_obj_scroll_to_view(ap_rows_[sel_], LV_ANIM_ON);
     }
 
@@ -283,7 +398,7 @@ private:
         case tdeck::Key::Enter:
             if (n_ap_ > 0) show_password();
             return true;
-        case tdeck::Key::Back: show_menu(); return true;   // 退回上一层,不交给 launcher
+        case tdeck::Key::Back: sel_ = 0; show_menu(); return true;   // 退回上一层
         default: return false;
         }
     }
@@ -294,15 +409,13 @@ private:
         view_ = View::Password;
         pass_len_ = 0; pass_[0] = 0;
         lv_obj_clean(root_);
-        title("Password");
-        mk(root_, &lv_font_montserrat_16, C_MUTE, 14, 42, aps_[sel_].ssid);
+        header("输入密码");
+        mk(root_, F16(), C_MUTE, SIDE + 2, 42, aps_[sel_].ssid);
 
-        lv_obj_t* box = row(root_, 76, 44);
-        pass_lbl_ = mk(box, &lv_font_montserrat_20, C_TEXT, 12, 10, "");
-
-        mk(root_, &lv_font_montserrat_14, C_MUTE, 14, 132,
-           "type on the keyboard, then press Enter");
-        hint("Enter: connect   ESC: back");
+        lv_obj_t* box = panel(root_, SIDE, 70, SCR_W - SIDE * 2, 48, C_CARD, ROW_R);
+        lv_obj_set_style_border_width(box, 2, LV_PART_MAIN);
+        lv_obj_set_style_border_color(box, lv_color_hex(C_ACCENT), LV_PART_MAIN);
+        pass_lbl_ = mk(box, F20(), C_TEXT, 14, 12, "");
     }
 
     bool pass_input(const tdeck::InputEvent& ev)
@@ -311,12 +424,12 @@ private:
         if (ev.key == tdeck::Key::Enter) {
             tdeck::net_set_credentials(aps_[sel_].ssid, pass_);
             lv_obj_clean(root_);
-            title("Wi-Fi");
-            mk(root_, &lv_font_montserrat_16, C_TEXT, 14, 50, "connecting...");
-            mk(root_, &lv_font_montserrat_14, C_MUTE, 14, 78, aps_[sel_].ssid);
-            hint("n/b: back");
+            header("无线网络");
+            mk(root_, F16(), C_TEXT, SIDE + 2, 50, "正在连接…");
+            mk(root_, F16(), C_MUTE, SIDE + 2, 76, aps_[sel_].ssid);
             view_ = View::Menu;   // 连接是异步的,回到菜单,状态自己会更新
             sel_ = 0;
+            n_rows_ = 0;          // 这一屏不是菜单的那三行,别让方向键去动它们
             return true;
         }
         if (ev.key == tdeck::Key::Char) {
@@ -341,7 +454,8 @@ private:
     lv_obj_t*  root_ = nullptr;
     lv_obj_t*  rows_[4] = {};
     lv_obj_t*  ap_rows_[MAX_AP] = {};
-    lv_obj_t*  list_ = nullptr, *bl_val_ = nullptr, *pass_lbl_ = nullptr;
+    lv_obj_t*  list_ = nullptr, *bl_val_ = nullptr, *bl_bar_ = nullptr, *pass_lbl_ = nullptr;
+    int        bl_trk_w_ = 1;
     tdeck::ApInfo aps_[MAX_AP];
     char       pass_[65] = {};
     int        pass_len_ = 0;

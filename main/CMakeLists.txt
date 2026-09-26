@@ -15,6 +15,8 @@ idf_component_register(
         "apps/music/music_app.cc"
         "apps/xiaozhi/xiaozhi_app.cc"
         "apps/selftest/selftest_app.cc"
+        "apps/bilibili/bili_app.cc"
+        "apps/bilibili/bili_client.cc"
     INCLUDE_DIRS
         "." "app_framework"
     REQUIRES
@@ -28,7 +30,6 @@ idf_component_register(
     # 注册表里空空如也,而且不报任何错。
     EMBED_FILES "assets/wallpaper.rgb565" "assets/font_puhui_common_20_4.bin"
                "assets/font_puhui_common_16_4.bin"
-               "assets/card_music.rgb565" "assets/card_settings.rgb565"
-               "assets/card_palette.rgb565" "assets/card_selftest.rgb565"
+               "assets/font_noto_qwen_14_1.bin"
     WHOLE_ARCHIVE
 )

@@ -30,16 +30,6 @@
 
 namespace {
 
-// 卡片配图。tools/gen_card_art.py 生成,CMake EMBED_FILES 以二进制嵌入
-// (143x94 RGB565,26884 字节),不走 C 数组。
-extern "C" const uint8_t card_music_start[] asm("_binary_card_music_rgb565_start");
-const lv_image_dsc_t kCardArt = {
-    .header = { .magic = LV_IMAGE_HEADER_MAGIC, .cf = LV_COLOR_FORMAT_RGB565,
-                .flags = 0, .w = 143, .h = 94, .stride = 143 * 2, .reserved_2 = 0 },
-    .data_size = 143 * 94 * 2,
-    .data      = card_music_start,
-};
-
 const char* TAG = "music";
 // 中文字体没加载成功就回落到 Montserrat —— 宁可显示方框,不要空指针崩溃
 // ⚠️ 中文字库只有【一个】字号:20px,line_height = 26。
@@ -72,6 +62,7 @@ constexpr int SEC_N       = 3;
 constexpr int SEC_CAP     = 8;    // 每排 8 首:再多就是内部堆里的对象数在涨
 constexpr int COVER_PX    = 120;   // 播放页大图
 constexpr int THUMB_PX    = 88;    // 封面墙上的方形封面
+constexpr int SEL_W       = 3;     // 选中环线宽
 constexpr int COVER_R     = 8;     // 封面圆角。占位块、图片、选中框共用一个值,
                                    // 三者半径不一致的话选中框会和图错开一圈
 constexpr int SAMPLE_RATE = 24000;
@@ -369,12 +360,17 @@ void play_task(void* arg)
     esp_http_client_cleanup(cli);
 
     g_state.playing = false;
+    // ⚠️ uxTaskGetStackHighWaterMark 在 ESP-IDF 里返回的是【字节】,不是字。
+    // 报出来才好按数据调栈 —— 这个项目已经被栈溢出坑过三回了。
+    ESP_LOGW(TAG, "play_task 栈余量 %u/16384 字节",
+             (unsigned)uxTaskGetStackHighWaterMark(nullptr));
     g_play_task = nullptr;
     ESP_LOGI(TAG, "播放结束:%s", g_state.title);
     vTaskDelete(nullptr);
 }
 
-bool fetch_cover(const char* key);   // 定义在下面的封面小节
+bool fetch_cover(const char* cover, const char* key);   // 定义在下面的封面小节
+void stop_playback();                                  // 定义在 start_play 下面
 
 // URL 编码。键盘只能打 ASCII,所以不用管多字节 —— 但空格和 & 必须转,
 // 否则查询串会被截断。
@@ -393,19 +389,31 @@ void urlencode(const char* in, char* out, size_t n)
     out[o] = 0;
 }
 
-void start_play(const char* url, const char* title, const char* artist, int dur, const char* cover_key)
+void start_play(const char* url, const char* title, const char* artist, int dur,
+                const char* cover_url, const char* cover_key)
 {
-    if (cover_key && cover_key[0]) fetch_cover(cover_key);
+    // ⚠️ 停上一首这件事必须在【这里】做,不能指望调用方。
+    // 之前只有列表那条路(stop_and_play)记得先停,搜索是直接调 start_play 的 ——
+    // 于是两个 music_play 任务同时往喇叭里灌,听上去就是两首歌叠在一起;
+    // 更糟的是 g_play_task 被后来者覆盖,前一个再也停不下来,
+    // 只能等它自己放完。所有入口都收敛到这儿就不会再漏。
+    stop_playback();
+
+    // 封面每首都要重取。取不到就清掉 —— 留着上一首的图不是"没更新",
+    // 是明确的错图,比空着更糟。
+    fetch_cover(cover_url, cover_key);
     strncpy(g_play_url, url, sizeof(g_play_url) - 1);
     strncpy(g_state.title,  title  ? title  : "", sizeof(g_state.title) - 1);
     strncpy(g_state.artist, artist ? artist : "", sizeof(g_state.artist) - 1);
     g_state.dur_s = dur;
     g_stop_req = false;
-    // 栈给 20K:Opus 解码器在栈上开大数组,8K 会溢出;但也不能给太大 ——
+    // 栈 16K。Opus 解码器在栈上开大数组,8K 会溢出;但也不能给太大 ——
     // FreeRTOS 的任务栈必须在【内部 RAM】,而这块板子内部 RAM 只剩百来 KB,
     // 32K 会直接创建失败。失败时 xTaskCreate 返回非 pdPASS,不检查的话
     // 现象是"点了播放什么都没发生、日志也没有",极难查。
-    BaseType_t ok = xTaskCreate(play_task, "music_play", 20480, nullptr, 5, &g_play_task);
+    // 16K 是量出来的:任务退出时报的 high-water 说峰值只用到 8.9K
+    // (20480 里剩 11556),留 7.5K 余量够换别的解码器折腾。
+    BaseType_t ok = xTaskCreate(play_task, "music_play", 16384, nullptr, 5, &g_play_task);
     if (ok != pdPASS) {
         g_play_task = nullptr;
         ESP_LOGE(TAG, "播放任务创建失败(内部 RAM 剩 %u 字节)",
@@ -417,8 +425,20 @@ void stop_playback()
 {
     if (!g_play_task) return;
     g_stop_req = true;
-    for (int i = 0; i < 50 && g_play_task; i++) vTaskDelay(pdMS_TO_TICKS(20));
+    // 等它自己退。5 秒是照最坏情况给的:任务可能正卡在一次 socket 读上,
+    // 要等这次读返回才轮得到检查 g_stop_req。原来只等 1 秒,超时后照样往下
+    // 走 —— 那就是"两个 music_play 并存"最后一条漏网的路。
+    int i = 0;
+    for (; i < 250 && g_play_task; i++) vTaskDelay(pdMS_TO_TICKS(20));
+    if (g_play_task) ESP_LOGE(TAG, "上一首停不下来(等了 5 秒),内部 RAM 要吃紧");
     g_stop_req = false;
+
+    // ⚠️ 还得再让一步:vTaskDelete 只是【标记】,那 20KB 栈是 idle 任务
+    // 回收的。play_task 是先清 g_play_task 再 vTaskDelete,所以上面的循环
+    // 一看标志清了就返回,这时栈还没还回去 —— 紧接着又申请 20KB,两份并存。
+    // (实测这一条不是 heap_min 低的主因 —— 加了之后最低点一个字节没动。
+    //  留着是因为它本身是对的,成本只有 60ms。)
+    vTaskDelay(pdMS_TO_TICKS(60));
 }
 
 // 搜索走 /stream_pcm —— 服务端一次完成"四路搜索 + 标题门槛 + 打分选版 +
@@ -440,11 +460,15 @@ bool search_and_play(const char* query)
     cJSON* au = cJSON_GetObjectItem(root, "audio_url");
     cJSON* ti = cJSON_GetObjectItem(root, "title");
     cJSON* ar = cJSON_GetObjectItem(root, "artist");
+    // 服务端连封面地址一起给了(cover_url),以前没接,于是搜出来的歌
+    // 播放页和悬浮框都是空的。它是绝对 URL,fetch_jpeg_url 认这个。
+    cJSON* cv = cJSON_GetObjectItem(root, "cover_url");
     bool ok = cJSON_IsString(au) && au->valuestring[0];
     if (ok) {
         start_play(au->valuestring,
                    cJSON_IsString(ti) ? ti->valuestring : query,
-                   cJSON_IsString(ar) ? ar->valuestring : "", 0, nullptr);
+                   cJSON_IsString(ar) ? ar->valuestring : "", 0,
+                   cJSON_IsString(cv) ? cv->valuestring : nullptr, nullptr);
     }
     cJSON_Delete(root);
 
@@ -459,6 +483,10 @@ bool search_and_play(const char* query)
 // LVGL 的解码器链会自己认出是 JPEG。比自己调 tjpgd 再转 RGB565 省事得多。
 uint8_t*       g_cover_buf = nullptr;
 lv_image_dsc_t g_cover_dsc;
+// 单独一个"这张图还作数吗"的标记,不拿 g_cover_buf 非空当条件。
+// 因为换歌失败时旧缓冲还得留着(界面可能正在画它),不能一 free 了之 ——
+// 但它已经不代表当前这首歌了,不该再显示。
+bool           g_cover_ok  = false;
 
 // 下载一张封面 JPEG。px 是服务端裁好的边长。
 // 成功返回 PSRAM 上的缓冲(调用方 free),*out_len 是长度。
@@ -592,14 +620,25 @@ void fill_dsc(lv_image_dsc_t* d, uint8_t* buf, int len, int px)
 }
 
 // 播放页那张大图
-bool fetch_cover(const char* key)
+bool fetch_cover(const char* cover, const char* key)
 {
+    g_cover_ok = false;                       // 先失效:界面立刻退回占位图
+    bool has_src = (cover && cover[0]) || (key && key[0]);
+    if (!has_src) return false;
+
     int len = 0;
-    uint8_t* buf = fetch_jpeg_url(nullptr, key, COVER_PX, &len);
-    if (!buf) return false;
+    uint8_t* buf = fetch_jpeg_url(cover, key, COVER_PX, &len);
+    if (!buf) { ESP_LOGW(TAG, "封面拉不到,用占位图"); return false; }
+
+    // 释放旧图要在 LVGL 锁里:界面可能正指着 g_cover_dsc 在画。
+    // 这把锁是递归的,从 LVGL 任务里调也不会自己卡死。
+    lvgl_port_lock(0);
     if (g_cover_buf) free(g_cover_buf);
     g_cover_buf = buf;
     fill_dsc(&g_cover_dsc, g_cover_buf, len, COVER_PX);
+    g_cover_ok = true;
+    lvgl_port_unlock();
+
     ESP_LOGI(TAG, "封面 %d 字节", len);
     return true;
 }
@@ -634,17 +673,6 @@ volatile uint32_t g_ui_gen = 0;
 
 // 实现见文件末尾(要用到 MusicApp::apply_thumb)
 
-// ── UI ────────────────────────────────────────────────────
-lv_obj_t* mk(lv_obj_t* p, const lv_font_t* f, uint32_t c, int x, int y, const char* s)
-{
-    lv_obj_t* l = lv_label_create(p);
-    lv_obj_set_style_text_font(l, f, LV_PART_MAIN);
-    lv_obj_set_style_text_color(l, lv_color_hex(c), LV_PART_MAIN);
-    lv_label_set_text(l, s);
-    lv_obj_set_pos(l, x, y);
-    return l;
-}
-
 // 三个界面。默认进曲库;一旦开始播放就切到正在播放页 ——
 // 音乐 app 的主界面本来就该是"现在在放什么",列表是去找歌时才用的。
 enum class View { Library, NowPlaying, Search, Queue };
@@ -652,7 +680,7 @@ enum class View { Library, NowPlaying, Search, Queue };
 class MusicApp : public tdeck::App {
 public:
     const char* name() const override   { return "Music"; }
-    const lv_image_dsc_t* card_art() const override  { return &kCardArt; }
+    uint32_t card_color() const override              { return 0x6B3FA0; }
     const char* card_title() const override           { return "Music"; }
     const char* icon() const override   { return LV_SYMBOL_AUDIO; }
     uint32_t    accent() const override { return 0x55853A; }
@@ -689,32 +717,6 @@ public:
     }
 
     // 卡片是入口不是挂件:一排静态均衡器条,靠形状认出这是音乐
-    void render_card(lv_obj_t* card) override
-    {
-        const int W = 143, H = 94;
-        lv_obj_set_style_bg_color(card, lv_color_hex(0x1E2A16), LV_PART_MAIN);
-        static const int hs[] = { 18, 34, 26, 46, 30, 54, 22, 40, 28, 16 };
-        const int n = 10, bw = 8, gap = 5;
-        int x0 = (W - (n * bw + (n - 1) * gap)) / 2;
-        for (int i = 0; i < n; i++) {
-            lv_obj_t* b = lv_obj_create(card);
-            lv_obj_set_size(b, bw, hs[i]);
-            lv_obj_set_pos(b, x0 + i * (bw + gap), 20 + (56 - hs[i]) / 2);
-            lv_obj_set_style_radius(b, bw / 2, LV_PART_MAIN);
-            lv_obj_set_style_bg_color(b, lv_color_hex((i >= 3 && i <= 6) ? 0x55853A : 0x6E8B4F),
-                                      LV_PART_MAIN);
-            lv_obj_set_style_border_width(b, 0, LV_PART_MAIN);
-            lv_obj_set_style_pad_all(b, 0, LV_PART_MAIN);
-            lv_obj_remove_flag(b, LV_OBJ_FLAG_SCROLLABLE);
-            lv_obj_remove_flag(b, LV_OBJ_FLAG_CLICKABLE);
-        }
-        lv_obj_t* nm = lv_label_create(card);
-        lv_obj_set_style_text_font(nm, &lv_font_montserrat_16, LV_PART_MAIN);
-        lv_obj_set_style_text_color(nm, lv_color_hex(0x1B2117), LV_PART_MAIN);
-        lv_label_set_text(nm, "Music");
-        lv_obj_set_pos(nm, 12, H - 26);
-    }
-
     void on_enter(lv_obj_t* root) override
     {
         root_ = root;
@@ -776,6 +778,7 @@ private:
         for (auto& m : play_mark_) m = nullptr;
         for (auto& x : row_img_) x = nullptr;
         for (auto& x : row_ph_)  x = nullptr;
+        for (auto& x : sel_ring_) x = nullptr;
         for (auto& x : shelf_)   x = nullptr;
         mini_ = nullptr;
     }
@@ -807,7 +810,7 @@ private:
         // 封面。没拉到就画一块占位,不要留个空洞
         cover_ = lv_image_create(root_);
         lv_obj_set_pos(cover_, 16, 44);
-        if (g_cover_buf) {
+        if (g_cover_ok) {
             lv_image_set_src(cover_, &g_cover_dsc);
         } else {
             lv_obj_delete(cover_);
@@ -1037,7 +1040,8 @@ private:
         if (i < 0 || i >= g_state.n_songs) return;
         char u[400];
         snprintf(u, sizeof(u), MUSIC_BASE_URL "/audio?f=%s.opus&key=" MUSIC_TOKEN, g_songs[i].key);
-        start_play(u, g_songs[i].title, g_songs[i].artist, g_songs[i].dur, g_songs[i].key);
+        start_play(u, g_songs[i].title, g_songs[i].artist, g_songs[i].dur,
+                   g_songs[i].cover, g_songs[i].key);
         playing_idx_ = i;
     }
 
@@ -1070,7 +1074,7 @@ private:
     // 格子四周都比封面大出 TILE_PAD:选中时的 outline 画在封面【外侧】,
     // 格子要是正好贴着封面,这一圈就被父容器裁掉。
     // ⚠️ 上边也要留 —— 只留左右的话,封面【上方】那一段边框照样没了。
-    static constexpr int TILE_PAD  = 3;   // 刚好容下 3px 的选中框
+    static constexpr int TILE_PAD  = SEL_W;   // 刚好容下选中环
     static constexpr int TILE_W    = COVER + TILE_PAD * 2;
     int tile_h() const { return TILE_PAD + COVER + 4 + SMALL_LH() * 2; }
     int section_h() const { return SEC_TTL_H + tile_h() + SEC_GAP; }
@@ -1155,6 +1159,10 @@ private:
         lv_obj_set_style_border_color(ring, lv_color_hex(C_ACCENT), LV_PART_MAIN);
         lv_obj_set_style_pad_all(ring, 0, LV_PART_MAIN);
         lv_obj_remove_flag(ring, LV_OBJ_FLAG_SCROLLABLE);
+        // ⚠️ lv_obj_create 建出来的对象【默认可点】。放大镜的圆圈盖在按钮
+        // 正中央,不摘这个标志的话它会把点击吞掉 —— 点按钮正中什么都不发生,
+        // 只有点到边角那一圈才管用。纯装饰的子对象一律要摘。
+        lv_obj_remove_flag(ring, LV_OBJ_FLAG_CLICKABLE);
 
         static const lv_point_precise_t handle[] = { {0, 0}, {5, 5} };
         lv_obj_t* ln = lv_line_create(search_row_);
@@ -1222,15 +1230,38 @@ private:
         lv_obj_set_style_border_width(ph, 0, LV_PART_MAIN);
         lv_obj_set_style_pad_all(ph, 0, LV_PART_MAIN);
         lv_obj_remove_flag(ph, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_remove_flag(ph, LV_OBJ_FLAG_CLICKABLE);   // 同上:否则没封面的歌点不动
         lv_obj_t* nt = lbl(ph, FICON(), 0xB6C2A6, 0, 0, LV_SYMBOL_AUDIO);
         lv_obj_center(nt);
         row_ph_[i] = ph;
 
+        // 选中环:单独一个圆角描边框,【不用 outline】。
+        // outline 的圆角是 LVGL 自己按 radius+pad+width 算的,和我们烘进图里的
+        // COVER_R 对不上 —— 放大看是绿环的弧比图的弧大一圈,中间露出楔形缺口。
+        // 自己画就能把半径钉死成 COVER_R + SEL_W,与图的圆角严格同心。
+        // 它是独立对象,不参与图片布局,所以也不会把封面挤位移。
+        lv_obj_t* ring = lv_obj_create(c);
+        lv_obj_set_size(ring, COVER + SEL_W * 2, COVER + SEL_W * 2);
+        lv_obj_set_pos(ring, TILE_PAD - SEL_W, TILE_PAD - SEL_W);
+        lv_obj_set_style_bg_opa(ring, LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_set_style_radius(ring, COVER_R + SEL_W, LV_PART_MAIN);
+        lv_obj_set_style_border_width(ring, SEL_W, LV_PART_MAIN);
+        lv_obj_set_style_border_color(ring, lv_color_hex(C_ACCENT), LV_PART_MAIN);
+        lv_obj_set_style_pad_all(ring, 0, LV_PART_MAIN);
+        lv_obj_remove_flag(ring, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_remove_flag(ring, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(ring, LV_OBJ_FLAG_HIDDEN);
+        sel_ring_[i] = ring;
+        // ⚠️ 环必须【盖在封面上面】。封面是不透明的 RGB565,它烘出来的白色
+        // 圆角会把环的弧涂掉 —— 量像素看得很清楚:角上有一道纯白楔形卡在
+        // 环和图之间,直边处却严丝合缝。所以不是半径不一致,是 z 序不对。
+        // 建完图之后再提到最前面(见下面 move_foreground)。
+
         lv_obj_t* im = lv_image_create(c);
         lv_obj_set_pos(im, TILE_PAD, TILE_PAD);
         lv_obj_add_flag(im, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_set_style_radius(im, COVER_R, LV_PART_MAIN);   // outline 跟着这个半径走
         row_img_[i] = im;
+        lv_obj_move_foreground(ring);          // 环压在图之上,见上面的说明
 
         // 正在播的那首:封面右下角压一个小三角
         play_mark_[i] = lbl(c, FICON(), 0xFFFFFF, TILE_PAD + COVER - 18, TILE_PAD + COVER - 20, LV_SYMBOL_PLAY);
@@ -1278,7 +1309,7 @@ private:
         int mini_px = THUMB_PX;
         if (playing_idx_ >= 0 && playing_idx_ < MAX_SONGS && g_thumbs[playing_idx_].ready) {
             mini_src = g_thumbs[playing_idx_].rgb;
-        } else if (g_cover_buf) {
+        } else if (g_cover_ok) {
             mini_src = &g_cover_dsc;
             mini_px  = COVER_PX;
         }
@@ -1294,6 +1325,20 @@ private:
             lv_obj_set_pos(im, 5, (MINI_H - 8 - MP) / 2);
             lv_obj_set_style_radius(im, 5, LV_PART_MAIN);
             lv_obj_set_style_clip_corner(im, true, LV_PART_MAIN);
+        } else {
+            // 没封面也得占住这块位置:标题是按 x=42 排的,图一缺
+            // 左边就是个 30x30 的洞。和列表格子用同一套占位样式。
+            lv_obj_t* ph = lv_obj_create(m);
+            lv_obj_set_size(ph, MP, MP);
+            lv_obj_set_pos(ph, 5, (MINI_H - 8 - MP) / 2);
+            lv_obj_set_style_bg_color(ph, lv_color_hex(0xE8EEE0), LV_PART_MAIN);
+            lv_obj_set_style_radius(ph, 5, LV_PART_MAIN);
+            lv_obj_set_style_border_width(ph, 0, LV_PART_MAIN);
+            lv_obj_set_style_pad_all(ph, 0, LV_PART_MAIN);
+            lv_obj_remove_flag(ph, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_remove_flag(ph, LV_OBJ_FLAG_CLICKABLE);   // 别挡住"点悬浮框进播放页"
+            lv_obj_t* n = lbl(ph, FICON(), 0xB6C2A6, 0, 0, LV_SYMBOL_AUDIO);
+            lv_obj_center(n);
         }
 
         char line[160];
@@ -1364,10 +1409,16 @@ private:
                         // 20K 的播放任务同时活着 —— 内部 RAM 实测被压到只剩
                         // 6.5KB,一崩一个准。
                         // lv_async_call 把活儿排到 LVGL 任务上,那边本来就有 16K。
+                        // ⚠️ lv_async_call 不是线程安全的(LV_OS_NONE,LVGL 内部无锁)。
+                        // 后台任务挂节点、LVGL 任务同时遍历,链表会被撕坏。
+                        // B站 那边先撞上了,coredump 指向 lv_async_timer_cb —— 这里
+                        // 是同一个写法,只是每张封面之间隔着一次 HTTP,概率低而已。
+                        lvgl_port_lock(0);
                         lv_async_call([](void* arg) {
                             int idx = (int)(intptr_t)arg;
                             decode_thumb(idx);
                         }, (void*)(intptr_t)i);
+                        lvgl_port_unlock();
                     }
                 }
                 // 回贴到界面上。代数对不上说明界面已经重建过(或者 app
@@ -1485,18 +1536,12 @@ private:
             if (lv_obj_t* ln = lv_obj_get_child(search_row_, 1))
                 lv_obj_set_style_line_color(ln, lv_color_hex(fg), LV_PART_MAIN);
         }
-        // 选中态用 【outline】 而不是 border。
-        // border 是画在对象【内部】的,一加上去内容就被挤进来、封面整个位移,
-        // 选中/取消之间图会跳一下,很难看。outline 画在对象外侧,
-        // 不参与布局也不影响内容,只是外面多一圈。
+        // 选中只是显示/隐藏那个独立的圆环(见 build_tile),
+        // 不动封面本身的任何样式 —— 封面不会因为选中而位移或重绘。
         for (int i = 0; i < g_state.n_songs; i++) {
-            bool on = (i == sel_);
-            for (lv_obj_t* o : { row_ph_[i], row_img_[i] }) {
-                if (!o) continue;
-                lv_obj_set_style_outline_width(o, on ? 3 : 0, LV_PART_MAIN);
-                lv_obj_set_style_outline_pad(o, 0, LV_PART_MAIN);  // 贴着封面,不留缝
-                lv_obj_set_style_outline_color(o, lv_color_hex(C_ACCENT), LV_PART_MAIN);
-            }
+            if (!sel_ring_[i]) continue;
+            if (i == sel_) lv_obj_remove_flag(sel_ring_[i], LV_OBJ_FLAG_HIDDEN);
+            else           lv_obj_add_flag(sel_ring_[i], LV_OBJ_FLAG_HIDDEN);
         }
         // ⚠️ 必须用 recursive 版本。lv_obj_scroll_to_view 只滚对象的【直接父容器】,
         // 而这里是两层:格子在横向的"排"里,排又在竖向的列表里。只滚一层的话
@@ -1608,12 +1653,18 @@ private:
                 bool ok = search_and_play(qcopy);
                 lvgl_port_lock(0);
                 if (self_ && self_->root_) {
+                    // 搜出来的这首不在歌曲池里。不清掉的话,悬浮框会拿
+                    // playing_idx_ 去取【上一首】的缩略图,列表里也还高亮着它。
+                    if (ok) self_->playing_idx_ = -1;
                     if (ok) self_->show_now();
                     else if (self_->sr_) lv_label_set_text(self_->sr_, "not found");
                 }
                 lvgl_port_unlock();
+                // 6144 是量出来的:8192 时峰值余量 3192,即只用到 5K。
+                ESP_LOGW(TAG, "music_search 栈余量 %u/6144 字节",
+                         (unsigned)uxTaskGetStackHighWaterMark(nullptr));
                 vTaskDelete(nullptr);
-            }, "music_search", 8192, nullptr, 4, nullptr);
+            }, "music_search", 6144, nullptr, 4, nullptr);
             return true;
         }
         if (ev.key == tdeck::Key::Char) {
@@ -1634,6 +1685,7 @@ private:
     lv_obj_t* rows_[MAX_SONGS] = {};
     lv_obj_t* row_img_[MAX_SONGS] = {};
     lv_obj_t* row_ph_[MAX_SONGS]  = {};
+    lv_obj_t* sel_ring_[MAX_SONGS] = {};
     lv_obj_t* shelf_[SEC_N] = {};
     lv_obj_t* mini_ = nullptr;
     lv_obj_t* play_mark_[MAX_SONGS] = {};
