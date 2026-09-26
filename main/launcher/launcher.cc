@@ -346,7 +346,14 @@ private:
         lv_obj_set_style_pad_all(sb, 0, LV_PART_MAIN);
         lv_obj_set_style_pad_column(sb, 5, LV_PART_MAIN);
         lv_obj_set_flex_flow(sb, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(sb, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        // ⚠️ 主轴必须 START,【不能】用 END。
+        // END 要靠一个已知宽度把内容往右推,而这里宽度是 LV_SIZE_CONTENT ——
+        // 从内容反推出来的。两者凑一起的结果是:内容宽只算到最后一个子元素
+        // (实测 sb w=15,只够装闪电),前面的 wifi 和电池拿到负坐标
+        // (x=-52 / x=-29),落在父对象外面被裁掉,屏幕上只剩一个闪电。
+        // "贴着右缘"这件事由 sb 自己的 TOP_RIGHT 对齐负责,不该让 flex 管;
+        // 隐藏的子元素自动退出排版这一点不受影响。
+        lv_obj_set_flex_align(sb, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_remove_flag(sb, LV_OBJ_FLAG_SCROLLABLE);
 
         wifi_ = mk_label(sb, &lv_font_montserrat_14, C_STATUS, LV_SYMBOL_WIFI);
@@ -778,6 +785,7 @@ private:
     lv_obj_t*   clock_ = nullptr, *date_ = nullptr, *wx_ = nullptr, *wx_desc_ = nullptr;
     lv_obj_t*   wx_icon_ = nullptr, *bat_ = nullptr, *bat_body_ = nullptr;
     lv_obj_t*   bat_fill_ = nullptr, *wifi_ = nullptr, *bat_bolt_ = nullptr;
+
     lv_timer_t* status_t_ = nullptr;
     Avatar      avatar_;
     static constexpr uint32_t MOVE_COOLDOWN_MS = 120;
