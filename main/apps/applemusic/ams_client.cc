@@ -210,30 +210,64 @@ int on_cccd_remote(uint16_t, const ble_gatt_error* err, ble_gatt_attr*, void*)
     return 0;
 }
 
-int on_dsc(uint16_t, const ble_gatt_error* err, uint16_t chr_val_handle,
-           const ble_gatt_dsc* dsc, void*)
+// ── 找 CCCD ───────────────────────────────────────────────
+//
+// ⚠️ ble_gattc_disc_all_dscs 的 start_handle 必须是【某个特征的值句柄】,
+// 不是服务起点;而且回调里那个 chr_val_handle 只是把你传进去的值原样回给你,
+// 【不是】"这个描述符属于哪个特征"。
+//
+// 一开始按后者理解,传了服务起点(45),于是回调里 chr_val_handle 恒等于 45,
+// 跟哪个特征都对不上,CCCD 一个都认不出来 —— 报"Entity Update 没有 CCCD",
+// 而前面配对、加密、服务发现全是好的,很容易往"iOS 不给权限"的方向查。
+//
+// 现在对两个特征各发一趟,各取【第一个】0x2902:特征自己的 CCCD 紧跟在它
+// 后面,所以先遇到的一定是它的,和服务里特征的排列顺序无关。
+enum DscTarget { DSC_REMOTE, DSC_UPDATE };
+void disc_dscs(DscTarget which);
+
+int on_dsc(uint16_t, const ble_gatt_error* err, uint16_t,
+           const ble_gatt_dsc* dsc, void* arg)
 {
-    if (err->status == 0 && dsc && ble_uuid_u16(&dsc->uuid.u) == BLE_GATT_DSC_CLT_CFG_UUID16) {
-        if (chr_val_handle == s_h_remote) s_h_remote_cccd = dsc->handle;
-        if (chr_val_handle == s_h_update) s_h_update_cccd = dsc->handle;
+    const DscTarget which = (DscTarget)(intptr_t)arg;
+
+    if (err->status == 0) {
+        if (dsc && ble_uuid_u16(&dsc->uuid.u) == BLE_GATT_DSC_CLT_CFG_UUID16) {
+            if (which == DSC_REMOTE && !s_h_remote_cccd) s_h_remote_cccd = dsc->handle;
+            if (which == DSC_UPDATE && !s_h_update_cccd) s_h_update_cccd = dsc->handle;
+        }
+        return 0;
     }
 
-    if (err->status == BLE_HS_EDONE) {
-        if (!s_h_update_cccd) {
-            ESP_LOGE(TAG, "Entity Update 没有 CCCD,订阅不了");
-            set_link(Link::NoService);
-            return 0;
-        }
-        uint16_t on = 1;
-        if (s_h_remote_cccd) {
-            ble_gattc_write_flat(s_conn, s_h_remote_cccd, &on, sizeof(on),
-                                 on_cccd_remote, nullptr);
-        } else {
-            ble_gattc_write_flat(s_conn, s_h_update_cccd, &on, sizeof(on),
-                                 on_cccd_update, nullptr);
-        }
+    // status 非 0 = 这一趟结束(EDONE,或者这个特征根本没有描述符)
+    if (which == DSC_REMOTE) { disc_dscs(DSC_UPDATE); return 0; }
+
+    ESP_LOGI(TAG, "CCCD: remote=%u update=%u", s_h_remote_cccd, s_h_update_cccd);
+    if (!s_h_update_cccd) {
+        ESP_LOGE(TAG, "Entity Update 没有 CCCD,订阅不了");
+        set_link(Link::NoService);
+        return 0;
+    }
+
+    uint16_t on = 1;
+    if (s_h_remote_cccd) {
+        ble_gattc_write_flat(s_conn, s_h_remote_cccd, &on, sizeof(on),
+                             on_cccd_remote, nullptr);
+    } else {
+        ble_gattc_write_flat(s_conn, s_h_update_cccd, &on, sizeof(on),
+                             on_cccd_update, nullptr);
     }
     return 0;
+}
+
+void disc_dscs(DscTarget which)
+{
+    const uint16_t h = (which == DSC_REMOTE) ? s_h_remote : s_h_update;
+    int rc = ble_gattc_disc_all_dscs(s_conn, h, s_svc_end, on_dsc,
+                                     (void*)(intptr_t)which);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "找描述符失败 rc=%d(特征句柄 %u)", rc, h);
+        set_link(Link::NoService);
+    }
 }
 
 int on_chr(uint16_t, const ble_gatt_error* err, const ble_gatt_chr* chr, void*)
@@ -250,8 +284,9 @@ int on_chr(uint16_t, const ble_gatt_error* err, const ble_gatt_chr* chr, void*)
             set_link(Link::NoService);
             return 0;
         }
-        // 描述符按句柄区间一次性全找出来,两个特征的 CCCD 在同一趟里收
-        ble_gattc_disc_all_dscs(s_conn, s_svc_start, s_svc_end, on_dsc, nullptr);
+        ESP_LOGI(TAG, "AMS 特征:remote=%u update=%u attr=%u",
+                 s_h_remote, s_h_update, s_h_attr);
+        disc_dscs(DSC_REMOTE);
     }
     return 0;
 }

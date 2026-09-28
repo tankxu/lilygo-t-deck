@@ -255,7 +255,12 @@ private:
         // 底部这行在"还没连上"的时候是【该怎么办】,连上了才变成状态信息 ——
         // 第一次用的人最需要知道的是去哪儿配对,不是内部堆还剩多少
         if (s.link == ams::Link::Advertising) {
-            lv_label_set_text(foot_, "iPhone 的 设置 → 蓝牙 里选 T-Deck");
+            // ⚠️ 不能写"去 设置→蓝牙 里找" —— iOS 的蓝牙设置【只列】系统认识的
+            // 配置文件(HID、音频那类),普通 BLE 外设不管广播多标准都不会出现。
+            // (Mac 上扫得到,CoreBluetooth 还能把征求的 UUID 解析成 "Apple Media",
+            //  所以确实是 iOS 设置的取舍,不是广播有问题。)
+            // 等 HID 服务加上之后这里才能改回"设置→蓝牙"。
+            lv_label_set_text(foot_, "用 LightBlue 之类的 BLE 工具连 T-Deck");
         } else if (s.link == ams::Link::NoService) {
             lv_label_set_text(foot_, "把 iPhone 解锁,或者先放一首歌");
         } else if (s.player[0]) {
