@@ -1,47 +1,66 @@
 // applemusic_app.cc — Apple Music 车载控制器
 //
-// 现在这一版只做到「把 BLE 协议栈起起来」。AMS 客户端(配对 + GATT 发现 +
-// Remote Command / Entity Update)还没接。
+// 屏幕上是"正在播放"+ 三个走带键,数据和命令都走 AMS(见 ams_client.h)。
+// 不需要伴侣 App,不需要开发者账号 —— AMS 是 iOS 自带的。
+// 封面、歌单、搜索拿不到,那些要等伴侣 App 那一半。
 //
-// ── 内存账(全是这块板子上量的)────────────────────────────
+// ── 内存(板子上量的)────────────────────────────────────
+// 车载变体开机内部堆 79,491,起完 BLE 还剩 ~30,000,WiFi 全程在线。
+// 所以这个 app 【不断 WiFi】—— 断了调试服务也跟着没,截图/OTA/看内存全断。
+// (“BLE 和 WiFi 装不下”只在日常固件上成立,那是被小智/B站/音乐占掉的。)
 //
-// 一开始以为 BLE 和 WiFi 装不下,得进 app 先断网。那个结论是在【日常固件】
-// 上量的,不成立于这里:
-//
-//   日常固件 + BT      开机空闲 19,267   → 起 BLE 失败
-//   车载固件 + BT      开机空闲 79,491   → 起 BLE 成功,之后还剩 30,483
-//
-// 差别不在蓝牙,在【被砍掉的那几个 app】:车载变体不编小智/B站/音乐,
-// .dram0.bss 从 0xe570 掉到 0x7fd8(省 26KB),再加上 esp-sr 那套不再常驻。
-// 也就是说 "BLE 挤掉 WiFi" 是日常固件的现象,不是芯片的限制。
-//
-// 所以这个 app 【不断 WiFi】。好处不只是简单:断网会把调试服务一起收掉,
-// 截图/OTA/看内存全没了 —— 开发期基本等于闭着眼睛写。
-//
-// ⚠️ 留了一条后路:如果接上 AMS 之后 30KB 不够用(GATT 发现 + 界面还要吃),
-// net_suspend() / net_resume() 是现成的,一次能再腾出 69KB。
-// 但那要等真的不够再说,别提前付这个代价。
+// ⚠️ 走带键上的符号必须显式用 Montserrat。
+// root 上挂的是中文字体,而 LV_SYMBOL_* 是私有区码点,中文字库里没有 ——
+// 直接画出来是豆腐块。这个坑在音乐 app 的播放键上踩过一次。
 
 #include "app.h"
 #include "ui/fonts.h"
-#include "net/net.h"
-#include "debug/ble_probe.h"
+#include "ams_client.h"
 
 #include <esp_heap_caps.h>
-#include <esp_log.h>
 #include <lvgl.h>
 #include <stdio.h>
 
 namespace {
 
-const char* TAG = "applemusic";
+namespace ams = tdeck::ams;
 
-constexpr uint32_t C_BG   = 0xf6f8fa;
-constexpr uint32_t C_CARD = 0xffffff;
-constexpr uint32_t C_TEXT = 0x1f2328;
-constexpr uint32_t C_MUTE = 0x57606a;
-constexpr uint32_t C_OK   = 0x1A7F37;
-constexpr uint32_t C_WARN = 0xB35900;
+constexpr uint32_t C_BG    = 0xf6f8fa;
+constexpr uint32_t C_CARD  = 0xffffff;
+constexpr uint32_t C_TEXT  = 0x1f2328;
+constexpr uint32_t C_MUTE  = 0x57606a;
+constexpr uint32_t C_OK    = 0x1A7F37;
+constexpr uint32_t C_BUSY  = 0x1F6FEB;
+constexpr uint32_t C_WARN  = 0xB35900;
+constexpr uint32_t C_TRACK = 0xd8dee4;
+
+const char* link_text(ams::Link l)
+{
+    switch (l) {
+    case ams::Link::Off:         return "蓝牙未启用";
+    case ams::Link::Starting:    return "蓝牙启动中…";
+    case ams::Link::Advertising: return "等待 iPhone 连接";
+    case ams::Link::Connecting:  return "已连接,正在配对…";
+    case ams::Link::Discovering: return "正在查找 Apple Media Service…";
+    case ams::Link::NoService:   return "蓝牙异常 / 对面没有 AMS";
+    case ams::Link::Ready:       return "已就绪";
+    default:                     return "未知状态";
+    }
+}
+
+uint32_t link_color(ams::Link l)
+{
+    if (l == ams::Link::Ready) return C_OK;
+    if (l == ams::Link::NoService || l == ams::Link::Off) return C_WARN;
+    return C_BUSY;
+}
+
+void mmss(char* out, size_t n, float sec)
+{
+    if (sec < 0) sec = 0;
+    int t = (int)sec;
+    snprintf(out, n, "%d:%02d", t / 60, t % 60);
+}
 
 class AppleMusicApp : public tdeck::App {
 public:
@@ -50,107 +69,222 @@ public:
     uint32_t    card_color() const override  { return 0x9F1239; }
     const char* card_title() const override  { return "Apple Music"; }
 
+    int shortcuts(const tdeck::Shortcut** out) const override
+    {
+        static const tdeck::Shortcut sc[] = {
+            {"ball L/R", "上一首 / 下一首"},
+            {"ball 中键", "播放 / 暂停"},
+            {"ball U/D", "音量 +/-"},
+        };
+        *out = sc;
+        return sizeof(sc) / sizeof(sc[0]);
+    }
+
     void on_enter(lv_obj_t* root) override
     {
         lv_obj_set_style_bg_color(root, lv_color_hex(C_BG), LV_PART_MAIN);
         lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
 
-        // ⚠️ 字体要在 root 上设一次 —— LVGL 的文本样式会向下继承。
-        // 不设的话 lv_label_create 用的是 LVGL 默认的 Montserrat(只有 ASCII),
-        // 中文全变豆腐块,而且不报任何错。
-        const lv_font_t* f = tdeck::font_cjk_small();
-        if (f) lv_obj_set_style_text_font(root, f, LV_PART_MAIN);
+        // 中文字体在 root 上设一次,文本样式向下继承。
+        // 不设的话 lv_label_create 用 LVGL 默认的 Montserrat,中文全是豆腐块。
+        const lv_font_t* f16 = tdeck::font_cjk_small();
+        const lv_font_t* f20 = tdeck::font_cjk();
+        if (f16) lv_obj_set_style_text_font(root, f16, LV_PART_MAIN);
 
-        lv_obj_t* t = lv_label_create(root);
-        lv_label_set_text(t, "Apple Music");
-        lv_obj_set_style_text_color(t, lv_color_hex(C_TEXT), LV_PART_MAIN);
-        lv_obj_set_pos(t, 16, 12);
+        status_ = lv_label_create(root);
+        lv_label_set_long_mode(status_, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(status_, 288);
+        lv_obj_set_pos(status_, 16, 10);
 
-        state_ = lv_label_create(root);
-        lv_obj_set_pos(state_, 16, 44);
-
+        // ── 正在播放 ──
         card_ = lv_obj_create(root);
-        lv_obj_set_size(card_, 288, 74);
-        lv_obj_set_pos(card_, 16, 76);
-        lv_obj_set_style_radius(card_, 8, LV_PART_MAIN);
+        lv_obj_set_size(card_, 288, 110);
+        lv_obj_set_pos(card_, 16, 34);
+        lv_obj_set_style_radius(card_, 10, LV_PART_MAIN);
         lv_obj_set_style_border_width(card_, 0, LV_PART_MAIN);
         lv_obj_set_style_bg_color(card_, lv_color_hex(C_CARD), LV_PART_MAIN);
-        lv_obj_set_style_pad_all(card_, 10, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(card_, 12, LV_PART_MAIN);
         lv_obj_remove_flag(card_, LV_OBJ_FLAG_SCROLLABLE);
-        // lv_obj_create 建出来的对象【默认可点】,装饰性容器必须摘掉,
-        // 否则它会把落在自己身上的点击吃掉(music/settings/bilibili 各踩过一次)
+        // lv_obj_create 默认可点,装饰性容器要摘掉,否则会吃掉落在它身上的点击
         lv_obj_remove_flag(card_, LV_OBJ_FLAG_CLICKABLE);
 
-        track_ = lv_label_create(card_);
-        lv_label_set_text(track_, "—");
-        lv_obj_set_style_text_color(track_, lv_color_hex(C_TEXT), LV_PART_MAIN);
-        lv_obj_set_pos(track_, 0, 0);
+        title_ = lv_label_create(card_);
+        lv_label_set_long_mode(title_, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(title_, 264);
+        if (f20) lv_obj_set_style_text_font(title_, f20, LV_PART_MAIN);
+        lv_obj_set_style_text_color(title_, lv_color_hex(C_TEXT), LV_PART_MAIN);
+        lv_obj_set_pos(title_, 0, 0);
 
         artist_ = lv_label_create(card_);
-        lv_label_set_text(artist_, "还没连上 iPhone");
+        lv_label_set_long_mode(artist_, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(artist_, 264);
         lv_obj_set_style_text_color(artist_, lv_color_hex(C_MUTE), LV_PART_MAIN);
-        lv_obj_set_pos(artist_, 0, 26);
+        lv_obj_set_pos(artist_, 0, 30);
 
-        heap_ = lv_label_create(root);
-        lv_obj_set_style_text_color(heap_, lv_color_hex(C_MUTE), LV_PART_MAIN);
-        lv_obj_set_pos(heap_, 16, 166);
+        // ── 进度 ──
+        bar_ = lv_bar_create(card_);
+        lv_obj_set_size(bar_, 264, 4);
+        lv_obj_set_pos(bar_, 0, 56);
+        lv_bar_set_range(bar_, 0, 1000);
+        lv_obj_set_style_bg_color(bar_, lv_color_hex(C_TRACK), LV_PART_MAIN);
+        lv_obj_set_style_bg_color(bar_, lv_color_hex(0x9F1239), LV_PART_INDICATOR);
+        lv_obj_set_style_radius(bar_, 2, LV_PART_MAIN);
+        lv_obj_set_style_radius(bar_, 2, LV_PART_INDICATOR);
 
-        note_ = lv_label_create(root);
-        lv_label_set_long_mode(note_, LV_LABEL_LONG_WRAP);
-        lv_obj_set_width(note_, 288);
-        lv_obj_set_style_text_color(note_, lv_color_hex(C_MUTE), LV_PART_MAIN);
-        lv_obj_set_pos(note_, 16, 192);
-        lv_label_set_text(note_, "AMS 客户端还没接上 —— 现在只把蓝牙协议栈起起来。");
+        t_now_ = lv_label_create(card_);
+        lv_obj_set_style_text_color(t_now_, lv_color_hex(C_MUTE), LV_PART_MAIN);
+        lv_obj_set_pos(t_now_, 0, 64);
 
-        // 起 BLE。nimble_port_init() 是同步的而且很快(几毫秒),
-        // 不值得为它开任务 —— 开了反而要处理"界面已经建好但状态还没回来"。
-        up_ = tdeck::ble_probe_up();
-        if (!up_) ESP_LOGE(TAG, "BLE 起不来,内部堆 %u",
-                           (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        t_end_ = lv_label_create(card_);
+        lv_obj_set_style_text_color(t_end_, lv_color_hex(C_MUTE), LV_PART_MAIN);
+        lv_obj_align(t_end_, LV_ALIGN_TOP_RIGHT, 0, 64);
 
+        // ── 走带键 ──
+        btn_prev_ = key(root, 40,  158, LV_SYMBOL_PREV,  ams::Cmd::PrevTrack);
+        btn_play_ = key(root, 122, 154, LV_SYMBOL_PLAY,  ams::Cmd::TogglePlay, true);
+        btn_next_ = key(root, 220, 158, LV_SYMBOL_NEXT,  ams::Cmd::NextTrack);
+
+        foot_ = lv_label_create(root);
+        lv_obj_set_style_text_color(foot_, lv_color_hex(C_MUTE), LV_PART_MAIN);
+        lv_obj_set_pos(foot_, 16, 218);
+
+        ams::start();
+
+        // 250ms:进度是本地按速率外推的,再快也没有新信息,
+        // 再慢秒数跳字看得出来。
         tick_ = lv_timer_create([](lv_timer_t* t) {
             static_cast<AppleMusicApp*>(lv_timer_get_user_data(t))->refresh();
-        }, 1000, this);
+        }, 250, this);
         refresh();
     }
 
     void on_exit() override
     {
         if (tick_) { lv_timer_delete(tick_); tick_ = nullptr; }
-        // BLE 是全局资源,借了必须还 —— 留着不关,别的 app 就白少 57KB
-        tdeck::ble_probe_down();
-        up_ = false;
-        state_ = card_ = track_ = artist_ = heap_ = note_ = nullptr;
+        // BLE 是全局资源,借了必须还 —— 不关的话别的 app 白少 57KB 内部 RAM
+        ams::stop();
+        status_ = card_ = title_ = artist_ = bar_ = t_now_ = t_end_ = nullptr;
+        btn_prev_ = btn_play_ = btn_next_ = foot_ = nullptr;
     }
 
     bool on_input(const tdeck::InputEvent& ev) override
     {
-        (void)ev;
-        return false;   // Back 交给 launcher,永远能退出去
+        switch (ev.key) {
+        case tdeck::Key::Left:  ams::send(ams::Cmd::PrevTrack);  return true;
+        case tdeck::Key::Right: ams::send(ams::Cmd::NextTrack);  return true;
+        case tdeck::Key::Enter: ams::send(ams::Cmd::TogglePlay); return true;
+        case tdeck::Key::Up:    ams::send(ams::Cmd::VolumeUp);   return true;
+        case tdeck::Key::Down:  ams::send(ams::Cmd::VolumeDown); return true;
+        default: return false;    // Back 交给 launcher,永远退得出去
+        }
     }
 
 private:
-    void refresh()
+    struct KeyCtx { ams::Cmd cmd; };
+
+    lv_obj_t* key(lv_obj_t* root, int x, int y, const char* sym, ams::Cmd cmd,
+                  bool big = false)
     {
-        if (!state_) return;
-        lv_label_set_text(state_, up_ ? "蓝牙已启用 · 等待 iPhone 连接"
-                                      : "蓝牙启动失败");
-        lv_obj_set_style_text_color(state_, lv_color_hex(up_ ? C_OK : C_WARN),
-                                    LV_PART_MAIN);
-        lv_label_set_text_fmt(heap_, "内部堆 %u  最大块 %u  WiFi %s",
-                              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
-                              tdeck::net_suspended() ? "已挂起" : "在线");
+        const int d = big ? 56 : 48;
+        lv_obj_t* b = lv_obj_create(root);
+        lv_obj_set_size(b, d, d);
+        lv_obj_set_pos(b, x, y);
+        lv_obj_set_style_radius(b, d / 2, LV_PART_MAIN);
+        lv_obj_set_style_border_width(b, 0, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(b, lv_color_hex(big ? 0x9F1239 : C_CARD), LV_PART_MAIN);
+        lv_obj_set_style_pad_all(b, 0, LV_PART_MAIN);
+        lv_obj_remove_flag(b, LV_OBJ_FLAG_SCROLLABLE);
+
+        auto* ctx = new KeyCtx{cmd};
+        lv_obj_add_event_cb(b, [](lv_event_t* e) {
+            auto* c = (KeyCtx*)lv_event_get_user_data(e);
+            ams::send(c->cmd);
+        }, LV_EVENT_CLICKED, ctx);
+        // 控件树由 launcher 连同 screen 一起销毁,ctx 要跟着走,不然每进一次漏一个
+        lv_obj_add_event_cb(b, [](lv_event_t* e) {
+            delete (KeyCtx*)lv_event_get_user_data(e);
+        }, LV_EVENT_DELETE, ctx);
+
+        lv_obj_t* l = lv_label_create(b);
+        // ⚠️ 必须显式指定 Montserrat:LV_SYMBOL_* 是私有区码点,
+        // root 上继承下来的中文字库里没有,会画成豆腐块
+        lv_obj_set_style_text_font(l, big ? &lv_font_montserrat_28
+                                          : &lv_font_montserrat_20, LV_PART_MAIN);
+        lv_obj_set_style_text_color(l, lv_color_hex(big ? 0xFFFFFF : C_TEXT), LV_PART_MAIN);
+        lv_label_set_text(l, sym);
+        lv_obj_center(l);
+        if (big) play_sym_ = l;
+        return b;
     }
 
-    bool        up_ = false;
+    void refresh()
+    {
+        if (!status_) return;
+
+        ams::Snapshot s;
+        ams::snapshot(&s);
+
+        lv_label_set_text(status_, link_text(s.link));
+        lv_obj_set_style_text_color(status_, lv_color_hex(link_color(s.link)), LV_PART_MAIN);
+
+        const bool has = s.title[0] || s.artist[0];
+        lv_label_set_text(title_,  has ? s.title  : "—");
+        // 专辑名基本没地方放,和艺人并在一行,没有就只显示艺人
+        if (has && s.album[0]) {
+            lv_label_set_text_fmt(artist_, "%s · %s", s.artist, s.album);
+        } else {
+            lv_label_set_text(artist_, has ? s.artist : "还没有曲目信息");
+        }
+
+        float el = ams::elapsed_now(s);
+        char a[16], b[16];
+        mmss(a, sizeof(a), el);
+        mmss(b, sizeof(b), s.duration_s);
+        lv_label_set_text(t_now_, a);
+        lv_label_set_text(t_end_, b);
+        lv_bar_set_value(bar_, s.duration_s > 0 ? (int)(el / s.duration_s * 1000) : 0,
+                         LV_ANIM_OFF);
+
+        const bool playing = (s.state == ams::PLAY_PLAYING);
+        lv_label_set_text(play_sym_, playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+
+        dim(btn_prev_, !ams::supports(s, ams::Cmd::PrevTrack));
+        dim(btn_next_, !ams::supports(s, ams::Cmd::NextTrack));
+        dim(btn_play_, !ams::supports(s, ams::Cmd::TogglePlay));
+
+        // 底部这行在"还没连上"的时候是【该怎么办】,连上了才变成状态信息 ——
+        // 第一次用的人最需要知道的是去哪儿配对,不是内部堆还剩多少
+        if (s.link == ams::Link::Advertising) {
+            lv_label_set_text(foot_, "iPhone 的 设置 → 蓝牙 里选 T-Deck");
+        } else if (s.link == ams::Link::NoService) {
+            lv_label_set_text(foot_, "把 iPhone 解锁,或者先放一首歌");
+        } else if (s.player[0]) {
+            lv_label_set_text_fmt(foot_, "%s   内部堆 %u", s.player,
+                                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        } else {
+            lv_label_set_text_fmt(foot_, "内部堆 %u",
+                                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        }
+    }
+
+    static void dim(lv_obj_t* o, bool off)
+    {
+        if (o) lv_obj_set_style_opa(o, off ? LV_OPA_40 : LV_OPA_COVER, LV_PART_MAIN);
+    }
+
     lv_timer_t* tick_ = nullptr;
-    lv_obj_t*   state_  = nullptr;
-    lv_obj_t*   card_   = nullptr;
-    lv_obj_t*   track_  = nullptr;
-    lv_obj_t*   artist_ = nullptr;
-    lv_obj_t*   heap_   = nullptr;
-    lv_obj_t*   note_   = nullptr;
+    lv_obj_t* status_ = nullptr;
+    lv_obj_t* card_   = nullptr;
+    lv_obj_t* title_  = nullptr;
+    lv_obj_t* artist_ = nullptr;
+    lv_obj_t* bar_    = nullptr;
+    lv_obj_t* t_now_  = nullptr;
+    lv_obj_t* t_end_  = nullptr;
+    lv_obj_t* btn_prev_ = nullptr;
+    lv_obj_t* btn_play_ = nullptr;
+    lv_obj_t* btn_next_ = nullptr;
+    lv_obj_t* play_sym_ = nullptr;
+    lv_obj_t* foot_   = nullptr;
 };
 
 }  // namespace

@@ -13,7 +13,7 @@
 // BT 没编进来时给三个空壳 —— 探针是可选的,不能因为它让固件编不过。
 namespace tdeck {
 bool ble_probe_is_up() { return false; }
-bool ble_probe_up()    { return false; }
+bool ble_probe_up(void (*)()) { return false; }
 void ble_probe_down()  {}
 }  // namespace tdeck
 #else
@@ -38,7 +38,7 @@ void host_task(void*)
 
 bool ble_probe_is_up() { return s_up; }
 
-bool ble_probe_up()
+bool ble_probe_up(void (*configure)())
 {
     if (s_up) return true;
     uint32_t before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
@@ -50,6 +50,9 @@ bool ble_probe_up()
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         return false;
     }
+    // ble_hs_cfg 要在这里设 —— 见头文件的说明
+    if (configure) configure();
+
     nimble_port_freertos_init(host_task);
     s_up = true;
 
