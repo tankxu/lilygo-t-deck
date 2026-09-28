@@ -15,6 +15,7 @@
 #include <string.h>
 #include "avatar.h"
 #include "sys/volume.h"
+#include "ui/fonts.h"
 #include "wx_icon.h"
 #include "tdeck_bsp.h"
 
@@ -456,7 +457,12 @@ private:
                 lv_obj_set_style_text_align(ic, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
                 lv_obj_align(ic, LV_ALIGN_RIGHT_MID, -6, -6);
 
-                lv_obj_t* nm = mk_label(c, &lv_font_montserrat_16, 0xFFFFFF,
+                // ⚠️ 卡片标题【不能】写死 Montserrat —— 它只有 ASCII。
+                // card_title() 是给人看的名字,中文是常态(第一个中文标题
+                // 出现的时候整个标题变成了三个豆腐块,而且不报任何错)。
+                // font_cjk_small 里 ASCII 也是全的,英文标题照样正常。
+                const lv_font_t* tf = tdeck::font_cjk_small();
+                lv_obj_t* nm = mk_label(c, tf ? tf : &lv_font_montserrat_16, 0xFFFFFF,
                                         a->card_title());
                 lv_obj_set_pos(nm, 10, CH - 26);
 
