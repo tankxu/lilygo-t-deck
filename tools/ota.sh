@@ -28,6 +28,27 @@ case "$VARIANT" in
 esac
 [ -f "$BIN" ] || { echo "没有 $BIN,先 tools/build.sh $VARIANT"; exit 1; }
 
+# ── 防覆盖 ──────────────────────────────────────────────
+# 推送永远写"当前没在跑的那个槽"。两个槽各装一个变体的时候,这意味着:
+# 只有设备正跑着【另一个】变体时,推送才是安全的;
+# 跑着 X 又推 X,写的就是另一个变体所在的槽,把它覆盖掉。
+#
+# 这不是假想 —— 实际踩过一次:切换那一步没生效就直接推了,
+# 结果两个槽都变成车载,日常固件没了,而且当时毫无提示。
+RUNNING=$(curl -s --max-time 5 "http://$IP/info" | sed -n 's/.*"variant":"\([^"]*\)".*/\1/p')
+case "$RUNNING" in
+    tdeck-os-car) RUNNING_V=car ;;
+    tdeck-os)     RUNNING_V=daily ;;
+    *)            RUNNING_V="" ;;
+esac
+if [ -n "$RUNNING_V" ] && [ "$RUNNING_V" = "$VARIANT" ] && [ "${FORCE:-}" != "1" ]; then
+    OTHER=$([ "$VARIANT" = car ] && echo daily || echo car)
+    echo "拒绝推送:板子正跑着 $VARIANT,推 $VARIANT 会写到【$OTHER 所在的槽】,把它覆盖掉。"
+    echo "  先在板子上切到 $OTHER(应用页的「固件变体」),再推。"
+    echo "  确实要覆盖就 FORCE=1 tools/ota.sh $VARIANT"
+    exit 1
+fi
+
 SZ=$(stat -f%z "$BIN")
 # 镜像里 esp_app_desc 的 app_elf_sha256 字段:24 字节镜像头 + 8 字节段头 = 0x20,
 # 再跳过 magic/secure_ver/reserv/version/project/time/date/idf_ver 共 144 字节 -> 0xB0。
