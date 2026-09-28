@@ -1,22 +1,39 @@
 #!/bin/bash
-# 通过 WiFi 把 build/tdeck-os.bin 推到板子上。
+# 通过 WiFi 把某个变体的固件推到板子上。
 #
-#   tools/ota.sh              # 用 $TDECK_IP 或默认 IP
-#   tools/ota.sh 192.168.1.42
+#   tools/ota.sh                  # 推 daily
+#   tools/ota.sh car              # 推 car
+#   tools/ota.sh car 192.168.1.42
+#   tools/ota.sh 192.168.1.42     # 省略变体时第一个参数也可以直接写 IP
 #
 # 写的是另一个 OTA 槽,正在跑的那个不动 —— 推挂了最坏就是白推一次。
 # 新固件起来后要自己声明可用(见 debug_server.cc),否则 bootloader 自动回滚。
+#
+# ⚠️ 两个槽现在各装一个【变体】(见 main/sys/variant.h)。推送永远写
+# "当前没在跑的那个槽",也就是另一个变体所在的槽 —— 所以要更新日常固件,
+# 得先切到车载模式再推,反之亦然。推之前脚本会告诉你现在跑的是哪个。
 set -e
+
+VARIANT=daily
+case "${1:-}" in
+    daily|car) VARIANT=$1; shift ;;
+esac
+
 IP=${1:-${TDECK_IP:-192.168.1.136}}
-BIN=$(cd "$(dirname "$0")/.." && pwd)/build/tdeck-os.bin
-[ -f "$BIN" ] || { echo "没有 $BIN,先 idf.py build"; exit 1; }
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+
+case "$VARIANT" in
+    daily) BIN="$ROOT/build/tdeck-os.bin" ;;
+    car)   BIN="$ROOT/build.car/tdeck-os-car.bin" ;;
+esac
+[ -f "$BIN" ] || { echo "没有 $BIN,先 tools/build.sh $VARIANT"; exit 1; }
 
 SZ=$(stat -f%z "$BIN")
 # 镜像里 esp_app_desc 的 app_elf_sha256 字段:24 字节镜像头 + 8 字节段头 = 0x20,
 # 再跳过 magic/secure_ver/reserv/version/project/time/date/idf_ver 共 144 字节 -> 0xB0。
 # 拿它和板子 /info 报的 sha 对一下,就能确认"跑着的确实是我刚推的那份"。
 WANT=$(xxd -p -s 176 -l 16 "$BIN")
-echo "推 $(( SZ / 1024 )) KB 到 $IP  (sha $WANT)"
+echo "推 $VARIANT($(( SZ / 1024 )) KB)到 $IP  (sha $WANT)"
 echo "  推之前:$(curl -s --max-time 5 "http://$IP/info" || true)"
 
 curl -f --max-time 300 --progress-bar \

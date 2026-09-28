@@ -19,7 +19,10 @@
 // ⚠️ 这是开发期工具,没有任何鉴权。发布前用 Kconfig 关掉。
 
 #include "sys/volume.h"
+#include "sys/variant.h"
 #include "debug_server.h"
+#include "net/net.h"
+#include "ble_probe.h"
 #include "tdeck_bsp.h"
 #include "tdeck_pins.h"
 
@@ -28,6 +31,7 @@
 #include <esp_ota_ops.h>
 #include <esp_system.h>
 #include <esp_lvgl_port.h>
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
@@ -40,6 +44,8 @@ namespace tdeck {
 namespace {
 
 const char* TAG = "debug";
+
+httpd_handle_t s_srv = nullptr;   // 非空 = 服务在跑(debug_server_stop 要用)
 
 // ── 虚拟指针 ──────────────────────────────────────────────
 volatile int32_t s_vx = 0, s_vy = 0;
@@ -232,18 +238,18 @@ esp_err_t h_info(httpd_req_t* req)
     const esp_partition_t* run = esp_ota_get_running_partition();
     char sha[17] = {};
     esp_app_get_elf_sha256(sha, sizeof(sha));
-    char buf[420];
+    char buf[480];
     snprintf(buf, sizeof(buf),
              "{\"uptime_s\":%lld,"
              "\"heap_internal\":%u,\"heap_psram\":%u,\"heap_min\":%u,"
              "\"battery_mv\":%d,\"volume\":%d,"
-             "\"part\":\"%s\",\"sha\":\"%s\"}\n",
+             "\"part\":\"%s\",\"sha\":\"%s\",\"variant\":\"%s\"}\n",
              esp_timer_get_time() / 1000000,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
              (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
              tdeck_battery_mv(), tdeck::volume::get(),
-             run ? run->label : "?", sha);
+             run ? run->label : "?", sha, variant_name());
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, buf);
     return ESP_OK;
@@ -325,8 +331,134 @@ esp_err_t h_ota(httpd_req_t* req)
 
 }  // namespace
 
+namespace {
+
+// ── 内存探针 ──────────────────────────────────────────────
+//
+// 要回答的问题只有一个:把 WiFi 整个拆掉能还回来多少内部 DRAM,
+// 够不够装下 BLE 协议栈。光看 /info 的空闲值答不了 —— 得真拆一次再量。
+//
+// 为什么要一个后台任务而不是在 handler 里直接做:handler 一返回响应才发出去,
+// 而拆 WiFi 会把 httpd 一起收掉。所以 handler 立刻返回,测量放到任务里,
+// 结果存下来等下一次 /mem 取。
+//
+// ⚠️ 失败要能自己爬回来:WiFi 恢复不了的话板子就从网上消失了,只能插 USB 救。
+// 所以恢复超时直接 esp_restart() —— 重启一定会回到联网状态。
+struct MemProbe {
+    volatile bool running = false, done = false, restored_ok = false;
+    int      mode = 0;                 // 1 = 只拆 WiFi;2 = 拆 WiFi 再把 BLE 装上
+    uint32_t base_free = 0, base_big = 0;   // 什么都没动
+    uint32_t off_free = 0,  off_big = 0;    // WiFi 拆掉之后
+    uint32_t ble_free = 0,  ble_big = 0;    // BLE 起来之后
+    bool     ble_ok = false;
+    uint32_t back_free = 0;                 // WiFi 恢复之后
+} s_probe;
+
+void mem_probe_task(void*)
+{
+    // 等 handler 的响应真的发出去
+    vTaskDelay(pdMS_TO_TICKS(1200));
+
+    s_probe.base_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    s_probe.base_big  = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+
+    net_suspend();
+    vTaskDelay(pdMS_TO_TICKS(1500));   // 让释放走完
+    s_probe.off_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    s_probe.off_big  = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    ESP_LOGW(TAG, "探针:WiFi 关掉后内部堆 %u(原 %u),最大块 %u(原 %u)",
+             (unsigned)s_probe.off_free, (unsigned)s_probe.base_free,
+             (unsigned)s_probe.off_big,  (unsigned)s_probe.base_big);
+
+    if (s_probe.mode == 2) {
+        // 这才是真正要回答的问题:WiFi 让出来的地方,够不够 BLE 站进去
+        s_probe.ble_ok = ble_probe_up();
+        vTaskDelay(pdMS_TO_TICKS(1500));
+        s_probe.ble_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        s_probe.ble_big  = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+        ESP_LOGW(TAG, "探针:BLE %s,内部堆 %u,最大块 %u",
+                 s_probe.ble_ok ? "起来了" : "没起来",
+                 (unsigned)s_probe.ble_free, (unsigned)s_probe.ble_big);
+        ble_probe_down();
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    net_resume();
+    for (int i = 0; i < 300 && !net_status().online; i++) vTaskDelay(pdMS_TO_TICKS(100));
+    s_probe.restored_ok = net_status().online;
+    s_probe.back_free   = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    s_probe.done    = true;
+    s_probe.running = false;
+
+    if (!s_probe.restored_ok) {
+        ESP_LOGE(TAG, "WiFi 没能恢复,重启把自己救回来");
+        vTaskDelay(pdMS_TO_TICKS(500));
+        esp_restart();
+    }
+    vTaskDelete(nullptr);
+}
+
+esp_err_t h_mem(httpd_req_t* req)
+{
+    char q[48] = {};
+    httpd_req_get_url_query_str(req, q, sizeof(q));
+    int mode = 0;
+    if (strstr(q, "test=1")) mode = 1;
+    if (strstr(q, "test=2")) mode = 2;
+
+    // BLE 单独起停 —— 不动 WiFi,用来看两个协议栈能不能同时活着
+    if (strstr(q, "ble=1")) ble_probe_up();
+    if (strstr(q, "ble=0")) ble_probe_down();
+
+    if (mode && !s_probe.running) {
+        s_probe = MemProbe{};
+        s_probe.mode    = mode;
+        s_probe.running = true;
+        xTaskCreate(mem_probe_task, "memprobe", 4096, nullptr, 5, nullptr);
+    }
+
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+             "{\"now_free\":%u,\"now_big\":%u,\"psram_free\":%u,"
+             "\"wifi_suspended\":%d,\"ble_up\":%d,\"probe_running\":%d,\"probe_done\":%d,"
+             "\"base_free\":%u,\"base_big\":%u,"
+             "\"off_free\":%u,\"off_big\":%u,\"wifi_gain\":%d,"
+             "\"ble_ok\":%d,\"ble_free\":%u,\"ble_big\":%u,\"ble_cost\":%d,"
+             "\"back_free\":%u,\"restored\":%d}\n",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+             (int)net_suspended(), (int)ble_probe_is_up(),
+             (int)s_probe.running, (int)s_probe.done,
+             (unsigned)s_probe.base_free, (unsigned)s_probe.base_big,
+             (unsigned)s_probe.off_free,  (unsigned)s_probe.off_big,
+             (int)s_probe.off_free - (int)s_probe.base_free,
+             (int)s_probe.ble_ok,
+             (unsigned)s_probe.ble_free, (unsigned)s_probe.ble_big,
+             (int)s_probe.off_free - (int)s_probe.ble_free,
+             (unsigned)s_probe.back_free, (int)s_probe.restored_ok);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, buf);
+    return ESP_OK;
+}
+
+}  // namespace
+
+void debug_server_stop()
+{
+    if (!s_srv) return;
+    httpd_stop(s_srv);
+    s_srv = nullptr;
+    ESP_LOGW(TAG, "调试服务已停");
+}
+
 void debug_server_start()
 {
+    // ⚠️ 幂等判断必须在【最前面】。net_task 每秒调一次这个函数(挂起恢复后
+    // 靠它自己把服务拉回来),判断放在建 indev 之后的话,每秒漏一个 lv_indev
+    // —— 实测 337 字节/秒,十分钟吃掉 200KB,现象是内部堆莫名其妙一直往下掉。
+    if (s_srv) return;
+
     // 虚拟指针:和触摸并存,两个 indev 互不干扰
     lvgl_port_lock(0);
     s_vindev = lv_indev_create();
@@ -351,13 +483,14 @@ void debug_server_start()
         { "/shot",  HTTP_GET,  h_shot  }, { "/tap",  HTTP_GET, h_tap  },
         { "/swipe", HTTP_GET,  h_swipe }, { "/key",  HTTP_GET, h_key  },
         { "/ball",  HTTP_GET,  h_ball  }, { "/info", HTTP_GET, h_info },
-        { "/ota",   HTTP_POST, h_ota   },
+        { "/ota",   HTTP_POST, h_ota   }, { "/mem",  HTTP_GET, h_mem  },
     };
     for (auto& r : routes) {
         httpd_uri_t u = {};
         u.uri = r.uri; u.method = r.m; u.handler = r.fn;
         httpd_register_uri_handler(srv, &u);
     }
+    s_srv = srv;
 
     // 走到这里说明:WiFi 通了、HTTP 服务起来了 —— 也就是【还能再推一版】。
     // 这正是"这个固件可用"的判据,所以在这里销掉回滚。

@@ -1,0 +1,52 @@
+# 车载变体(Apple Music 控制器)在 sdkconfig.defaults 之上的追加项。
+# 只有 tools/build.sh car 会带上它。
+#
+# 实测的内存账(ESP32-S3,干净开机,内部 DRAM 空闲):
+#
+#   日常固件,无 BT              73,275
+#   日常固件 + BT               19,267   → 起 BLE【失败】
+#   车载固件 + BT               79,491   → 起 BLE 成功,之后还剩 30,483
+#
+# ⚠️ "BLE 和 WiFi 装不下" 是【日常固件】的现象,不是芯片的限制。
+# 一开始在日常固件上量到 19KB,以为必须进 app 先断网;换到车载固件上
+# 两者共存得很稳(WiFi 照常响应 HTTP,15 秒内数字不漂)。
+# 差别不在蓝牙,在被砍掉的那几个 app —— 不编小智/B站/音乐之后
+# .dram0.bss 从 0xe570 掉到 0x7fd8,省下的比 BT 加进来的多。
+#
+# 所以分变体的理由是【日常固件养不起 BT】(开着 BT 进音乐 app,
+# 内部堆最低点掉到 23 字节,专辑封面全部加载失败),
+# 而不是 "BLE 和 WiFi 必须二选一"。
+#
+# net_suspend() 还留着(一次能再腾 69KB),但现在不需要在进 app 时调它。
+
+# ── NimBLE,不用 Bluedroid ──────────────────────────────────
+# Bluedroid 的内部 DRAM 占用差不多是它的两倍,而我们只要:
+# 一条连接 + Peripheral 广播 + GATT Client(去读 iPhone 的 AMS)。
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+
+# ── 只服务一台已配对的 iPhone ──────────────────────────────
+# 默认值是按"通用设备"给的,全是富余。
+# ⚠️ 实测这一组【只省 3.6KB】—— 大头在控制器,不在 host 的这些 buffer。
+#    留着是因为不要钱,别指望靠调它们把 BLE 塞进 WiFi 旁边。
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+CONFIG_BT_NIMBLE_MAX_BONDS=2
+CONFIG_BT_NIMBLE_ACL_BUF_COUNT=12
+CONFIG_BT_NIMBLE_MSYS1_BLOCK_COUNT=8
+CONFIG_BT_NIMBLE_HCI_EVT_HI_BUF_COUNT=10
+CONFIG_BT_CTRL_BLE_MAX_ACT=2
+
+# 我们从不主动扫描(是 iPhone 连过来),广播上报的流控缓冲没必要留 100 条
+CONFIG_BT_CTRL_BLE_ADV_REPORT_FLOW_CTRL_NUM=20
+
+# 不做非连接广播(BROADCASTER)、也不扫描(OBSERVER)
+# CONFIG_BT_NIMBLE_ROLE_BROADCASTER is not set
+# CONFIG_BT_NIMBLE_ROLE_OBSERVER is not set
+#
+# ⚠️ CONFIG_BT_NIMBLE_ROLE_CENTRAL【不能关】。
+# BT_NIMBLE_GATT_CLIENT 依赖它,而 AMS 的本质正是
+# "我作为 GATT Client 去读 iPhone 暴露的服务" —— 关掉就没有 ble_gattc_*。
+# 这是个反直觉的地方:设备在 GAP 上是 Peripheral,在 GATT 上是 Client。
+
+# 绑定要存下来,不然每次上车都要重新配对
+CONFIG_BT_NIMBLE_NVS_PERSIST=y

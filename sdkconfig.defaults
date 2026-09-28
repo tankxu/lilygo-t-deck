@@ -151,3 +151,33 @@ CONFIG_LV_DRAW_SW_DRAW_UNIT_CNT=1
 # 放到 16ms 才能看出实际能跑多少。这个值同时也是输入设备的轮询周期,
 # 调小手感也更跟手。
 CONFIG_LV_DEF_REFR_PERIOD=16
+
+# ⚠️ 不要开 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP —— 实测是【负收益】。
+# 想法本来是"把 WiFi/LWIP 缓冲挪去 PSRAM,给 BLE 腾内部 DRAM",
+# 结果内部空闲从 73,275 掉到 47,583,倒亏 25.7KB。
+# 原因:ESP_WIFI_CACHE_TX_BUFFER_NUM 这个选项【只在开了它之后才存在】,
+# 默认 32 个静态内部 TX 缓冲 —— WiFi MAC 不能从 PSRAM 直接 DMA,
+# 每个上行包都要先拷进内部缓冲。搬走的没有新增的多。
+
+# ── BLE:【先别开】,实测数字记在这里 ──────────────────────
+#
+#   CONFIG_BT_ENABLED=y
+#   CONFIG_BT_NIMBLE_ENABLED=y          # 不用 Bluedroid
+#
+# 开了之后实测(ESP32-S3,干净开机,内部 DRAM 空闲):
+#   无 BT                    73,275
+#   BT 编进去但【不启动】      19,267   ← 静态代价 54,008,关不掉
+#   再拆掉 WiFi               84,911   ← WiFi 能让出 69,028
+#   再 nimble_port_init()     28,083   ← BLE 运行时吃 56,828
+#
+# 结论:
+#  1. BLE 和 WiFi【不能同时开】—— WiFi 开着只剩 19KB,nimble_port_init 直接失败。
+#  2. "进 app 关 WiFi"这条路走得通:拆 WiFi 腾 69KB,BLE 吃 57KB,还剩 28KB,
+#     而且能恢复(net_suspend/net_resume 实测 restored:1)。
+#  3. 但 54KB 静态代价是【所有 app 都要分摊】的。开着 BT 进音乐 app,
+#     内部堆最低点掉到【23 字节】,专辑封面全部加载失败(歌单文字正常)。
+#  4. 裁 NimBLE 配置几乎没用:MAX_CONNECTIONS 3→1、CTRL_BLE_MAX_ACT 6→2、
+#     关掉 BROADCASTER/OBSERVER、ACL/MSYS buffer 减半,合计只省 3.6KB ——
+#     大头在【控制器】,不在 host 的那些 buffer。
+#  ⚠️ BT_NIMBLE_GATT_CLIENT 依赖 BT_NIMBLE_ROLE_CENTRAL,不能关 ——
+#     AMS 正是"我作为 GATT Client 去读 iPhone 暴露的服务"。

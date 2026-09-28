@@ -15,6 +15,7 @@
 #include <esp_crt_bundle.h>
 #include <esp_event.h>
 #include <esp_http_client.h>
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_lvgl_port.h>
 #include <esp_netif.h>
@@ -45,12 +46,20 @@ char s_ssid[33], s_pass[65];
 EventGroupHandle_t s_events;
 int s_retry = 0;
 
+// 挂起相关。s_suspended 在断连回调里被读 —— 挂起过程中必然会收到一次
+// STA_DISCONNECTED,不拦住的话它会立刻 esp_wifi_connect() 把刚关的东西拉回来。
+volatile bool s_suspended = false;
+esp_netif_t* s_netif = nullptr;
+esp_event_handler_instance_t s_h_wifi = nullptr, s_h_ip = nullptr;
+
 void on_wifi_event(void*, esp_event_base_t base, int32_t id, void* data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         xEventGroupClearBits(s_events, BIT_CONNECTED);
+        // 正在挂起:这条断连是我们自己造成的,不要重连
+        if (s_suspended) return;
         lvgl_port_lock(0); launcher_set_online(false); lvgl_port_unlock();
         // 一直重连。掌上机会走出路由器范围再走回来,放弃重连没有意义。
         // 退避到 5 秒封顶,避免离线时空转烧电。
@@ -90,20 +99,19 @@ void load_credentials()
     }
 }
 
-void wifi_start()
+// 真正建立 WiFi 栈的那一段 —— net_resume() 要原样再跑一遍,所以单独拆出来。
+// esp_netif_init / esp_event_loop_create_default 只做一次(它们不可重入),
+// 留在 wifi_start() 里。
+void wifi_bring_up()
 {
-    load_credentials();
-    s_events = xEventGroupCreate();
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
+    s_netif = esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                                        &on_wifi_event, nullptr, nullptr));
+                                                        &on_wifi_event, nullptr, &s_h_wifi));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                                                        &on_wifi_event, nullptr, nullptr));
+                                                        &on_wifi_event, nullptr, &s_h_ip));
 
     wifi_config_t wc = {};
     strncpy((char*)wc.sta.ssid, s_ssid, sizeof(wc.sta.ssid) - 1);
@@ -111,6 +119,15 @@ void wifi_start()
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
     ESP_ERROR_CHECK(esp_wifi_start());
+}
+
+void wifi_start()
+{
+    load_credentials();
+    s_events = xEventGroupCreate();
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    wifi_bring_up();
 }
 
 // TLS 握手实测峰值约 10KB(12288 的栈只剩 2.2KB 余量,太紧)。
@@ -238,8 +255,15 @@ void net_task(void*)
             lvgl_port_unlock();
         }
 
+        // 挂起恢复之后,调试服务靠这里自己回来(debug_server_start 是幂等的)。
+        // 放在这个 1 秒循环里而不是 net_resume() 里,是因为恢复那一刻还没拿到 IP,
+        // httpd 绑不上地址。
+        if (!s_suspended && (xEventGroupGetBits(s_events) & BIT_CONNECTED)) {
+            debug_server_start();
+        }
+
         // 天气 15 分钟一次:Open-Meteo 本身也就这个更新粒度,再频繁没意义
-        if (esp_timer_get_time() - last_wx > 15LL * 60 * 1000000) {
+        if (!s_suspended && esp_timer_get_time() - last_wx > 15LL * 60 * 1000000) {
             last_wx = esp_timer_get_time();
             fetch_weather();
         }
@@ -314,6 +338,52 @@ void net_set_credentials(const char* ssid, const char* password)
     esp_wifi_disconnect();
     esp_wifi_set_config(WIFI_IF_STA, &wc);
     esp_wifi_connect();
+}
+
+bool net_suspended() { return s_suspended; }
+
+// 把 WiFi/LWIP 整个拆掉,把内部 DRAM 还回堆里。
+//
+// 为什么不是 esp_wifi_stop():stop 只断链路,esp_wifi_init() 申请的那些
+// 收发缓冲区一个都不还。必须走到 esp_wifi_deinit(),再把 netif 销掉,
+// LWIP 那边的 pbuf 池才跟着走。
+bool net_suspend()
+{
+    if (s_suspended) return true;
+    ESP_LOGW(TAG, "挂起 WiFi(腾内部 RAM)");
+    s_suspended = true;               // 必须在 disconnect 之前置,见 on_wifi_event
+
+    debug_server_stop();              // httpd 抓着 socket,先收掉
+    esp_netif_sntp_deinit();
+
+    esp_wifi_disconnect();
+    esp_wifi_stop();
+    esp_wifi_deinit();
+
+    if (s_h_wifi) { esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, s_h_wifi); s_h_wifi = nullptr; }
+    if (s_h_ip)   { esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, s_h_ip);  s_h_ip = nullptr; }
+
+    if (s_netif) { esp_netif_destroy_default_wifi(s_netif); s_netif = nullptr; }
+
+    xEventGroupClearBits(s_events, BIT_CONNECTED);
+    s_ip[0] = 0;
+    lvgl_port_lock(0); launcher_set_online(false); lvgl_port_unlock();
+
+    ESP_LOGW(TAG, "WiFi 已挂起,内部堆空闲 %u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    return true;
+}
+
+void net_resume()
+{
+    if (!s_suspended) return;
+    ESP_LOGW(TAG, "恢复 WiFi");
+    s_suspended = false;              // 要在 bring_up 之前清,否则 STA_START 的
+                                      // 自动 connect 会被当成挂起期的断连给拦掉
+    s_retry = 0;
+    wifi_bring_up();
+    // SNTP 不重开:时间在 RTC 里,挂起期间照走,没必要再对一次。
+    // 调试服务由 net_task 的 1 秒循环在拿到 IP 后自己拉起来。
 }
 
 void net_start()

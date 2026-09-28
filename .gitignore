@@ -9,3 +9,9 @@ dependencies.lock
 # 本机配置(WiFi 凭据等),不进版本库
 main/secrets.h
 build-xz/
+
+# 车载变体的产物(tools/build.sh car)。和 daily 分开放,
+# 共用一个 build 目录会来回触发全量重编,而且 sdkconfig 里 BT 的
+# 几十个子符号会互相覆盖 —— 关掉父开关也不会跟着撤销,踩过。
+build.car/
+sdkconfig.car
