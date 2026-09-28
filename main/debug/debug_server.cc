@@ -407,6 +407,7 @@ void mem_probe_task(void*)
 //
 // 没有它就只能对着小智说话来触发,验一个公式排版要绕一大圈。
 //   /learn?text=学&guide=xué      汉字/词卡
+//   /learn?text=because&guide=/bɪˈkɒz/&meaning=conj. 因为
 //   /learn?stroke=学              笔顺动画
 //   /learn?page=正文&title=标题    文字页
 //   /learn?formula=<LaTeX>&title=&note=
@@ -440,7 +441,11 @@ esp_err_t h_learn(httpd_req_t* req)
 
     if (get("clear", v, sizeof(v)))        tdeck::learning::clear();
     else if (get("stroke", v, sizeof(v)))  tdeck::learning::show_stroke_order(v);
-    else if (get("text", v, sizeof(v)))    tdeck::learning::show_card(v, g);
+    else if (get("text", v, sizeof(v))) {
+        char mean[192] = {};
+        get("meaning", mean, sizeof(mean));
+        tdeck::learning::show_card(v, g, mean);
+    }
     else if (get("page", v, sizeof(v)))    tdeck::learning::show_page(t, v);
     else if (get("formula", v, sizeof(v))) {
         char note[256] = {};

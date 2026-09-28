@@ -72,6 +72,7 @@ bool     s_is_gif = false;
 char     s_label[64] = {};
 
 char s_text[160] = {}, s_guide[160] = {};        // 简卡兜底用
+char s_meaning[96] = {};                         // 英文词的中文释义(设备自己画)
 char s_title[96] = {}, s_body[1024] = {};        // 文字页
 char s_f_title[96] = {}, s_f_src[512] = {}, s_f_note[192] = {};
 
@@ -305,6 +306,32 @@ void show_media()
     }
     if (!s_content) { ESP_LOGE(TAG, "「%s」建不起显示对象", label); return; }
     lv_obj_center(s_content);
+
+    // 英文词卡补一行中文释义。
+    //
+    // 服务端的卡只排了单词 + IPA + 音节,没有翻译。逐行量过 320x240 的卡:
+    //   两行注音时  y 105-174 空白
+    //   一行注音时  y 119-191 空白
+    // 交集是 y 119-174,所以放在屏幕中心偏下 26px 处,两种排版都不压到东西。
+    // 中文卡不画 —— 拼音已经在卡上了,再加一行反而乱。
+    if (!gif) {
+        char meaning[96];
+        lock(); strncpy(meaning, s_meaning, sizeof(meaning)); unlock();
+        bool ascii = label[0] != 0;
+        for (const unsigned char* q = (const unsigned char*)label; *q; q++)
+            if (*q > 127) { ascii = false; break; }
+        if (ascii && meaning[0]) {
+            lv_obj_t* m = lv_label_create(s_root);
+            lv_obj_set_style_text_font(m, cjk(), 0);
+            lv_obj_set_style_text_color(m, lv_color_hex(C_GREEN), 0);
+            lv_label_set_long_mode(m, LV_LABEL_LONG_DOT);
+            lv_obj_set_width(m, 300);
+            lv_obj_set_style_text_align(m, LV_TEXT_ALIGN_CENTER, 0);
+            lv_label_set_text(m, meaning);
+            lv_obj_align(m, LV_ALIGN_CENTER, 0, 26);
+            lv_obj_move_foreground(s_bar);   // 倒计时条要压在最上面
+        }
+    }
     // GIF:先挂上限,真正的倒计时等播完(LV_EVENT_READY)再开始
     start_countdown(gif ? STROKE_CAP_SEC : CARD_SEC);
     ESP_LOGI(TAG, "显示%s「%s」", gif ? "笔顺" : "卡片", label);
@@ -338,6 +365,20 @@ void show_fallback()
         lv_obj_set_style_text_color(g, lv_color_hex(0xBBBBBB), 0);
         lv_label_set_text(g, guide);
         lv_obj_align(g, LV_ALIGN_CENTER, 0, ascii ? 16 : 14);
+    }
+    {   // 简卡也补释义 —— 生僻词更需要知道意思
+        char meaning[96];
+        lock(); strncpy(meaning, s_meaning, sizeof(meaning)); unlock();
+        if (ascii && meaning[0]) {
+            lv_obj_t* m = lv_label_create(box);
+            lv_obj_set_style_text_font(m, cjk(), 0);
+            lv_obj_set_style_text_color(m, lv_color_hex(C_GREEN), 0);
+            lv_label_set_long_mode(m, LV_LABEL_LONG_DOT);
+            lv_obj_set_width(m, 300);
+            lv_obj_set_style_text_align(m, LV_TEXT_ALIGN_CENTER, 0);
+            lv_label_set_text(m, meaning);
+            lv_obj_align(m, LV_ALIGN_CENTER, 0, 48);
+        }
     }
     s_content = box;
     start_countdown(CARD_SEC);
@@ -518,7 +559,7 @@ void begin()
     ESP_LOGI(TAG, "学习卡片就绪(素材服务 %s)", LEARN_BASE_URL);
 }
 
-void show_card(const char* text, const char* guide)
+void show_card(const char* text, const char* guide, const char* meaning)
 {
     if (!s_mu || !text || !text[0]) return;
     char enc[256], url[320];
@@ -527,6 +568,7 @@ void show_card(const char* text, const char* guide)
     lock();
     strncpy(s_text, text, sizeof(s_text) - 1);
     strncpy(s_guide, guide ? guide : "", sizeof(s_guide) - 1);
+    strncpy(s_meaning, meaning ? meaning : "", sizeof(s_meaning) - 1);
     unlock();
     fetch_async(url, text, false);
 }

@@ -36,7 +36,10 @@ void begin();
 // 顺带占住 tools/list 的前排(那边按字节分页,排后面有被漏掉的风险)。
 void register_mcp();
 
-void show_card(const char* text, const char* guide);          // 汉字/词语/英文单词大卡
+// meaning:中文释义,只对英文词有意义。
+// 服务端渲染的卡【没有翻译】(_render_learning_card 对英文只排 IPA + 音节),
+// 重渲染 5299 张英文卡再重传不划算,所以这一行由设备画在卡片的空白带上。
+void show_card(const char* text, const char* guide, const char* meaning);
 void show_stroke_order(const char* character);                // 单字笔顺 GIF
 void show_page(const char* title, const char* body);          // 任意文字页(古诗/释义/组词)
 void show_formula(const char* title, const char* latex, const char* note);

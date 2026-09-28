@@ -30,15 +30,20 @@ void register_mcp()
         "不能用静态汉字卡代替。"
         "text 必须是用户要学习的原始字或单词,不要翻译、改写或附加解释。guide 对中文填写简短拼音;"
         "对英文必须填写标准 IPA 音标并带斜杠,例如 /bɪˈkɒz/。"
+        "meaning 只在 text 是英文单词时填:一句话的中文释义,越短越好,带词性更好"
+        "(比如 because 填 \"conj. 因为\")。中文的字词【不要】填 —— 卡片上已经有拼音了,"
+        "再加一行反而乱。"
         "调用工具后仍要用语音清楚读出这个字,或先读英文单词再逐字母拼读。",
         PropertyList({Property("text", kPropertyTypeString),
-                      Property("guide", kPropertyTypeString, std::string(""))}),
+                      Property("guide", kPropertyTypeString, std::string("")),
+                      Property("meaning", kPropertyTypeString, std::string(""))}),
         [](const PropertyList& p) -> ReturnValue {
-            const std::string text  = p["text"].value<std::string>();
-            const std::string guide = p["guide"].value<std::string>();
+            const std::string text    = p["text"].value<std::string>();
+            const std::string guide   = p["guide"].value<std::string>();
+            const std::string meaning = p["meaning"].value<std::string>();
             if (text.empty()) return std::string("错误:要显示的字或单词不能为空");
             if (text.size() > 144 || guide.size() > 288) return std::string("错误:要显示的内容太长");
-            show_card(text.c_str(), guide.c_str());
+            show_card(text.c_str(), guide.c_str(), meaning.c_str());
             return std::string("已在屏幕上显示,约 20 秒后自动收起;想再看就再调一次");
         });
 
