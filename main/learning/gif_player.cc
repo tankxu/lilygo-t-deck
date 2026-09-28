@@ -64,6 +64,39 @@ int count_frames(const uint8_t* d, size_t len)
     return n;
 }
 
+
+// 把米字格和引导字提亮。
+//
+// 服务端画的格线是 #242424、底是 #050505(见 xiaozhi-music-mcp 的
+// _stroke_frame_svg),量到屏幕上格线只比背景亮 8/255 —— 3% 的对比度,
+// 在 T-Deck 这块屏上等于没有。这个取值从 otto 那会儿就没变过,
+// 不是回归,是当初就偏暗。
+//
+// 服务端改色要重渲染 6763 个 GIF 再重传(146MB),不划算;
+// 而画布在我们手里,提亮一次就够:
+//   · 只动 [LO, HI] 这一档 —— 格线(~0x1D)和引导字(~0x16)都在里面
+//   · 背景(0x05)在 LO 以下,不动,黑还是黑
+//   · 笔画(0xF5)在 HI 以上,不动,白还是白
+// 只在第一帧(整幅)做一次。后面的增量帧只写自己那一小块笔画,
+// disposal 是 none(笔顺是一笔笔叠上去的),所以提亮过的格线一直留着。
+constexpr uint8_t GRID_LO = 0x0A;
+constexpr uint8_t GRID_HI = 0x40;
+constexpr int     GRID_GAIN = 3;      // 0x1D * 3 ≈ 0x57,够看见又不抢笔画
+
+void brighten_guides(uint8_t* argb, uint32_t px)
+{
+    for (uint32_t i = 0; i < px; i++) {
+        uint8_t* p = argb + i * 4;
+        // 灰的才动 —— 黄色当前笔(#f6c445)三通道差很大,别碰
+        if (p[0] != p[1] || p[1] != p[2]) continue;
+        const uint8_t v = p[1];
+        if (v < GRID_LO || v > GRID_HI) continue;
+        const int n = v * GRID_GAIN;
+        const uint8_t out = (uint8_t)(n > 255 ? 255 : n);
+        p[0] = p[1] = p[2] = out;
+    }
+}
+
 void destroy_cb(lv_event_t* e)
 {
     auto* p = (Player*)lv_event_get_user_data(e);
@@ -112,7 +145,8 @@ void tick(lv_timer_t* t)
     lv_image_cache_drop(&p->dsc);
 
     if (p->first) {
-        // 第一帧整幅都是新的
+        // 第一帧整幅都是新的,也是唯一一帧带完整米字格和引导字的
+        brighten_guides(p->buf, p->gif->width * p->gif->height);
         lv_obj_invalidate(obj);
         p->first = false;
     } else {
