@@ -1,5 +1,6 @@
 #include "learning.h"
 #include "formula.h"
+#include "gif_player.h"
 #include "ui/fonts.h"
 #include "ui/jpeg_size.h"
 #include "secrets.h"
@@ -36,7 +37,13 @@ const char* TAG = "learning";
 // 倒计时:画面出来后顶部那条走完就自动收。
 // 没这条的话页面会一直盖着,孩子看完了还挡着。
 constexpr uint32_t CARD_SEC      = 20;
-constexpr uint32_t STROKE_SEC    = 30;
+// ⚠️ 笔顺不能用固定倒计时。
+// GIF 标称 7.1 秒,实测在板子上要 18 秒(解码 + 重绘跟不上);而且不同字差别很大 ——
+// 8 画的「学」41 帧,15 画的字有 80 多帧,固定 30 秒对后者必然半路消失。
+// 所以:播放期间只挂一个【上限】兜底,等 gif_player 报 LV_EVENT_READY(播完)
+// 之后再走一小段倒计时,让写完的字停一会儿。
+constexpr uint32_t STROKE_CAP_SEC   = 150;   // 兜底上限,正常走不到
+constexpr uint32_t STROKE_LINGER_SEC = 8;    // 播完之后停多久
 constexpr uint32_t PAGE_BASE_SEC = 20;
 constexpr uint32_t PAGE_MAX_SEC  = 90;
 constexpr uint32_t IDLE_MS       = 60 * 1000;    // 一直没出画面(卡在下载)的兜底
@@ -183,6 +190,8 @@ void fetch_async(const char* url, const char* label, bool gif)
 }
 
 // ── 画面 ──────────────────────────────────────────────────
+void start_countdown(uint32_t sec);
+
 void start_countdown(uint32_t sec)
 {
     lock(); s_deadline_us = now_us() + (int64_t)sec * 1000000; unlock();
@@ -273,9 +282,16 @@ void show_media()
     s_dsc.data_size = (uint32_t)len;
 
     if (gif) {
-        s_dsc.header.cf = LV_COLOR_FORMAT_RAW;        // 原始 GIF,lv_gif 自己解
-        s_content = lv_gif_create(s_root);
-        lv_gif_set_src(s_content, &s_dsc);
+        // 自己的播放器:只让变化过的那块失效(见 gif_player.h)。
+        // 用 lv_gif 的话每帧整幅失效,240x240 的 ARGB8888 画布在 PSRAM 上,
+        // 实测一轮 7.1 秒的动画要跑 18 秒,还把音频挤卡。
+        s_content = gif_player_create(s_root, bytes, len);
+        if (s_content) {
+            lv_obj_add_event_cb(s_content, [](lv_event_t*) {
+                // 播完了才开始倒计时 —— 在这之前只有上限兜底
+                start_countdown(STROKE_LINGER_SEC);
+            }, LV_EVENT_READY, nullptr);
+        }
     } else {
         // 和音乐封面同一条路:RAW + 真实宽高,交给 LVGL 的解码器链(TJPGD)。
         // 宽高必须从字节里读,见 ui/jpeg_size.h。
@@ -287,8 +303,10 @@ void show_media()
         s_content = lv_image_create(s_root);
         lv_image_set_src(s_content, &s_dsc);
     }
+    if (!s_content) { ESP_LOGE(TAG, "「%s」建不起显示对象", label); return; }
     lv_obj_center(s_content);
-    start_countdown(gif ? STROKE_SEC : CARD_SEC);
+    // GIF:先挂上限,真正的倒计时等播完(LV_EVENT_READY)再开始
+    start_countdown(gif ? STROKE_CAP_SEC : CARD_SEC);
     ESP_LOGI(TAG, "显示%s「%s」", gif ? "笔顺" : "卡片", label);
 }
 

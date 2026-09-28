@@ -77,6 +77,7 @@ else()
         "learning/learning.cc"
         "learning/learning_mcp.cc"
         "learning/formula.cc"
+        "learning/gif_player.cc"
         "assets/fonts/PuHuiMath28.c"          # 公式正文 28px
         "assets/fonts/IpaSans20.c"            # 英文简卡的 IPA 音标
         "assets/fonts/MontserratSemiBold26.c" # 英文简卡的单词
