@@ -63,6 +63,7 @@ if(TDECK_CAR)
     list(APPEND TDECK_SRCS
         "apps/applemusic/applemusic_app.cc"
         "apps/applemusic/ams_client.cc"
+        "apps/applemusic/hid_service.cc"
     )
     list(APPEND TDECK_REQUIRES bt)
 else()

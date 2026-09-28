@@ -1,5 +1,6 @@
 #include "ams_client.h"
 #include "debug/ble_probe.h"
+#include "hid_service.h"
 
 #include <esp_log.h>
 #include <esp_timer.h>
@@ -114,16 +115,28 @@ void reset_session()
 
 // ── 广播 ──────────────────────────────────────────────────
 //
-// ⚠️ 手工拼 AD 数据,不用 ble_hs_adv_fields。
-// 因为要带【Service Solicitation】(AD type 0x15)—— 意思是"我想用你身上的
-// 这个服务",iOS 靠它知道该把 AMS 暴露给这个配件。NimBLE 的 adv_fields
-// 结构里没有这一项,只能自己拼。
+// ⚠️ 手工拼 AD 数据,不用 ble_hs_adv_fields —— 它没有 Service Solicitation
+// (AD type 0x15)这一项,而那正是"我想用你身上的 AMS"的表达方式。
 //
+// 广播包(31 字节上限,这里正好 29):
 //   02 01 06                     Flags: LE General Disc + BR/EDR 不支持
-//   11 15 <16 字节 UUID(小端)>   128 位服务征求
-//   <n> 09 "T-Deck"              完整本地名
+//   03 19 C0 03                  Appearance = 0x03C0 HID Generic
+//   03 03 12 18                  16 位服务表: 0x1812 HID
+//   11 15 <16 字节 UUID(小端)>   128 位服务征求: AMS
 //
-// 总长 3 + 18 + 8 = 29 字节,31 的上限刚好够。名字再长就要挪到扫描响应里。
+// 扫描响应:
+//   07 09 "T-Deck"               完整本地名
+//
+// 名字为什么挪到扫描响应:加上 HID 和 appearance 之后广播包只剩 2 字节,
+// 放不下名字了。扫描响应是主动扫描时才发的第二包,iOS 会去取。
+//
+// ⚠️ 0x1812(HID)是【让 iPhone 认得这块板子】的关键,不是为了多一种遥控。
+// iOS 的蓝牙设置只列系统认识的配置文件 —— 没有 HID 的时候,
+// 板子广播得再标准,设置里也是一片空白(实测过,Mac 能扫到,iPhone 设置没有)。
+//
+// appearance 用 HID Generic 而不是 Keyboard(0x03C1):我们只报媒体键,
+// 不是键盘,报成键盘可能招来键盘设置助理。
+// 如果实测发现 iOS 不列 HID Generic,再换 0x03C1 试 —— 那是一个值的事。
 const char DEV_NAME[] = "T-Deck";
 
 int start_advertising()
@@ -132,16 +145,23 @@ int start_advertising()
     int n = 0;
 
     buf[n++] = 0x02; buf[n++] = 0x01; buf[n++] = 0x06;
+    buf[n++] = 0x03; buf[n++] = 0x19; buf[n++] = 0xC0; buf[n++] = 0x03;
+    buf[n++] = 0x03; buf[n++] = 0x03; buf[n++] = 0x12; buf[n++] = 0x18;
 
     buf[n++] = 0x11; buf[n++] = 0x15;
     for (int i = 0; i < 16; i++) buf[n++] = UU_AMS[15 - i];   // 小端
 
-    const int name_len = (int)strlen(DEV_NAME);
-    buf[n++] = (uint8_t)(1 + name_len); buf[n++] = 0x09;
-    memcpy(buf + n, DEV_NAME, name_len); n += name_len;
-
     int rc = ble_gap_adv_set_data(buf, n);
-    if (rc != 0) { ESP_LOGE(TAG, "设广播数据失败 rc=%d", rc); set_link(Link::NoService); return rc; }
+    if (rc != 0) { ESP_LOGE(TAG, "设广播数据失败 rc=%d(%d 字节)", rc, n);
+                   set_link(Link::NoService); return rc; }
+
+    uint8_t rsp[31];
+    int m = 0;
+    const int name_len = (int)strlen(DEV_NAME);
+    rsp[m++] = (uint8_t)(1 + name_len); rsp[m++] = 0x09;
+    memcpy(rsp + m, DEV_NAME, name_len); m += name_len;
+    rc = ble_gap_adv_rsp_set_data(rsp, m);
+    if (rc != 0) ESP_LOGW(TAG, "设扫描响应失败 rc=%d(名字就显示不出来了)", rc);
 
     ble_gap_adv_params adv = {};
     adv.conn_mode = BLE_GAP_CONN_MODE_UND;     // 可连接
@@ -151,7 +171,7 @@ int start_advertising()
     if (rc != 0) { ESP_LOGE(TAG, "开广播失败 rc=%d", rc); set_link(Link::NoService); return rc; }
 
     set_link(Link::Advertising);
-    ESP_LOGI(TAG, "开始广播(%s),等 iPhone 连过来", DEV_NAME);
+    ESP_LOGI(TAG, "开始广播(%s,带 HID + AMS 征求),等 iPhone 连过来", DEV_NAME);
     return 0;
 }
 
@@ -404,6 +424,7 @@ int gap_event(ble_gap_event* ev, void* arg)
             break;
         }
         s_conn = ev->connect.conn_handle;
+        hid::set_conn(s_conn);
         set_link(Link::Connecting);
         ESP_LOGI(TAG, "iPhone 连上了(conn=%u),开始配对", s_conn);
         // AMS 的三个特征都要求加密链路,所以主动发起 ——
@@ -413,6 +434,7 @@ int gap_event(ble_gap_event* ev, void* arg)
 
     case BLE_GAP_EVENT_DISCONNECT:
         ESP_LOGW(TAG, "断开(reason=%d)", ev->disconnect.reason);
+        hid::set_conn(BLE_HS_CONN_HANDLE_NONE);
         reset_session();
         if (s_running) start_advertising();
         break;
@@ -449,6 +471,13 @@ int gap_event(ble_gap_event* ev, void* arg)
                 ble_store_util_delete_peer(&d.peer_id_addr);
         }
         return BLE_GAP_REPEAT_PAIRING_RETRY;
+
+    case BLE_GAP_EVENT_SUBSCRIBE:
+        // iOS 订阅我们的 HID report = 它真把这块板子当 HID 在用。
+        // 这条是唯一的信号源,NimBLE 没有"查询订阅状态"的接口。
+        hid::on_gap_subscribe(ev->subscribe.attr_handle,
+                              ev->subscribe.cur_notify != 0);
+        break;
 
     case BLE_GAP_EVENT_MTU:
         ESP_LOGI(TAG, "MTU = %d", ev->mtu.value);
@@ -495,6 +524,11 @@ void configure_host()
     ble_svc_gap_init();
     ble_svc_gatt_init();
     ble_svc_gap_device_name_set(DEV_NAME);
+    ble_svc_gap_device_appearance_set(0x03C0);   // HID Generic,见 start_advertising
+
+    // ⚠️ 必须在 ble_gatts_start() 之前 —— 服务表一旦定型就加不进去了,
+    // 而 NimBLE 是在 sync 之后自动 start 的,所以这里是最后的窗口。
+    hid::register_services();
 
     // 歌名/专辑名很容易超过默认的 23 字节 MTU,超了就会被 AMS 截断。
     // 要大一点,但别贪 —— 每条连接的缓冲都按这个尺寸算,内部 RAM 很紧。
