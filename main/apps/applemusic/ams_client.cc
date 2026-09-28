@@ -136,7 +136,7 @@ void reset_session()
 //
 // appearance 用 HID Generic 而不是 Keyboard(0x03C1):我们只报媒体键,
 // 不是键盘,报成键盘可能招来键盘设置助理。
-// 如果实测发现 iOS 不列 HID Generic,再换 0x03C1 试 —— 那是一个值的事。
+// ✅ 实测 HID Generic 就够:T-Deck 出现在 设置→蓝牙 里,能配对,软键盘不受影响。
 const char DEV_NAME[] = "T-Deck";
 
 int start_advertising()

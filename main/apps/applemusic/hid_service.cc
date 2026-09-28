@@ -23,7 +23,8 @@ bool     s_subscribed = false;
 // ── HID Report Map ────────────────────────────────────────
 //
 // 只有一个 Consumer Control 集合,8 个按键各占 1 位。
-// 【故意不放键盘集合】—— 见头文件:iPhone 认定对面是键盘就会收起软键盘。
+// 【故意不放键盘集合】—— iPhone 认定对面是键盘就会收起软键盘。
+// 实测这样做之后:设置里能看到 T-Deck,软键盘照常弹。别往这里加键盘。
 //
 // Report ID 固定 1,和下面 Report Reference 描述符里的值必须一致,
 // 对不上的话 iOS 会认为这个 report 不存在,按键全部静默丢掉。
@@ -261,8 +262,8 @@ void on_gap_subscribe(uint16_t attr_handle, bool notify_enabled)
     // 所以只能自己记。记不准的后果是 tap() 白发一通,不会崩。
     if (attr_handle == s_h_report) {
         s_subscribed = notify_enabled;
-        ESP_LOGI(TAG, "iOS %s 了 HID report —— 它%s把我们当 HID 在用",
-                 notify_enabled ? "订阅" : "取消订阅",
+        ESP_LOGI(TAG, "iOS %s HID report —— 它%s把我们当 HID 在用",
+                 notify_enabled ? "订阅了" : "取消订阅了",
                  notify_enabled ? "确实" : "不再");
     }
 }

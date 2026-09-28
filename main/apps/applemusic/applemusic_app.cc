@@ -16,6 +16,7 @@
 #include "app.h"
 #include "ui/fonts.h"
 #include "ams_client.h"
+#include "hid_service.h"
 
 #include <esp_heap_caps.h>
 #include <lvgl.h>
@@ -24,6 +25,7 @@
 namespace {
 
 namespace ams = tdeck::ams;
+namespace hid = tdeck::hid;
 
 constexpr uint32_t C_BG    = 0xf6f8fa;
 constexpr uint32_t C_CARD  = 0xffffff;
@@ -60,6 +62,35 @@ void mmss(char* out, size_t n, float sec)
     if (sec < 0) sec = 0;
     int t = (int)sec;
     snprintf(out, n, "%d:%02d", t / 60, t % 60);
+}
+
+
+// 一条命令有两条出路,优先级是有理由的:
+//
+//   AMS  —— 走的是 iOS 的媒体遥控通道,作用在【当前活跃的播放 App】上,
+//           而且能做 HID 没有的事(shuffle/repeat/喜欢)。
+//   HID  —— 系统级媒体键。AMS 拿不到的时候还能用 ——
+//           Apple 明说 AMS 不保证一直在(比如系统这会儿没发布它)。
+//
+// 两条都不通就返回 false,界面据此把按钮灰掉,而不是假装按下去了。
+bool dispatch(ams::Cmd c)
+{
+    ams::Snapshot s;
+    ams::snapshot(&s);
+    if (s.link == ams::Link::Ready && ams::supports(s, c) && ams::send(c)) return true;
+
+    // 映射得到的才走 HID。AMS 独有的命令(喜欢、切 shuffle)没有对应的媒体键,
+    // 映射不了就老实返回 false。
+    switch (c) {
+    case ams::Cmd::TogglePlay: return hid::tap(hid::Key::PlayPause);
+    case ams::Cmd::Play:       return hid::tap(hid::Key::PlayPause);
+    case ams::Cmd::Pause:      return hid::tap(hid::Key::PlayPause);
+    case ams::Cmd::NextTrack:  return hid::tap(hid::Key::Next);
+    case ams::Cmd::PrevTrack:  return hid::tap(hid::Key::Prev);
+    case ams::Cmd::VolumeUp:   return hid::tap(hid::Key::VolumeUp);
+    case ams::Cmd::VolumeDown: return hid::tap(hid::Key::VolumeDown);
+    default:                   return false;
+    }
 }
 
 class AppleMusicApp : public tdeck::App {
@@ -170,11 +201,11 @@ public:
     bool on_input(const tdeck::InputEvent& ev) override
     {
         switch (ev.key) {
-        case tdeck::Key::Left:  ams::send(ams::Cmd::PrevTrack);  return true;
-        case tdeck::Key::Right: ams::send(ams::Cmd::NextTrack);  return true;
-        case tdeck::Key::Enter: ams::send(ams::Cmd::TogglePlay); return true;
-        case tdeck::Key::Up:    ams::send(ams::Cmd::VolumeUp);   return true;
-        case tdeck::Key::Down:  ams::send(ams::Cmd::VolumeDown); return true;
+        case tdeck::Key::Left:  dispatch(ams::Cmd::PrevTrack);  return true;
+        case tdeck::Key::Right: dispatch(ams::Cmd::NextTrack);  return true;
+        case tdeck::Key::Enter: dispatch(ams::Cmd::TogglePlay); return true;
+        case tdeck::Key::Up:    dispatch(ams::Cmd::VolumeUp);   return true;
+        case tdeck::Key::Down:  dispatch(ams::Cmd::VolumeDown); return true;
         default: return false;    // Back 交给 launcher,永远退得出去
         }
     }
@@ -198,7 +229,7 @@ private:
         auto* ctx = new KeyCtx{cmd};
         lv_obj_add_event_cb(b, [](lv_event_t* e) {
             auto* c = (KeyCtx*)lv_event_get_user_data(e);
-            ams::send(c->cmd);
+            dispatch(c->cmd);
         }, LV_EVENT_CLICKED, ctx);
         // 控件树由 launcher 连同 screen 一起销毁,ctx 要跟着走,不然每进一次漏一个
         lv_obj_add_event_cb(b, [](lv_event_t* e) {
@@ -224,8 +255,16 @@ private:
         ams::Snapshot s;
         ams::snapshot(&s);
 
-        lv_label_set_text(status_, link_text(s.link));
-        lv_obj_set_style_text_color(status_, lv_color_hex(link_color(s.link)), LV_PART_MAIN);
+        const bool hid_ok = hid::subscribed();
+        if (s.link != ams::Link::Ready && hid_ok) {
+            // 这是个真实且常见的状态:iPhone 连着、媒体键能用,只是 AMS
+            // 这会儿没发布。说"对面没有 AMS"会让人以为整个坏了。
+            lv_label_set_text(status_, "媒体键可用 · 拿不到曲目信息");
+            lv_obj_set_style_text_color(status_, lv_color_hex(C_BUSY), LV_PART_MAIN);
+        } else {
+            lv_label_set_text(status_, link_text(s.link));
+            lv_obj_set_style_text_color(status_, lv_color_hex(link_color(s.link)), LV_PART_MAIN);
+        }
 
         const bool has = s.title[0] || s.artist[0];
         lv_label_set_text(title_,  has ? s.title  : "—");
@@ -248,19 +287,22 @@ private:
         const bool playing = (s.state == ams::PLAY_PLAYING);
         lv_label_set_text(play_sym_, playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
 
-        dim(btn_prev_, !ams::supports(s, ams::Cmd::PrevTrack));
-        dim(btn_next_, !ams::supports(s, ams::Cmd::NextTrack));
-        dim(btn_play_, !ams::supports(s, ams::Cmd::TogglePlay));
+        // AMS 说不支持,不代表按不了 —— HID 媒体键还在。
+        // 只有两条路都不通才灰掉。
+        auto usable = [&](ams::Cmd c) {
+            return (s.link == ams::Link::Ready && ams::supports(s, c)) || hid_ok;
+        };
+        dim(btn_prev_, !usable(ams::Cmd::PrevTrack));
+        dim(btn_next_, !usable(ams::Cmd::NextTrack));
+        dim(btn_play_, !usable(ams::Cmd::TogglePlay));
 
         // 底部这行在"还没连上"的时候是【该怎么办】,连上了才变成状态信息 ——
         // 第一次用的人最需要知道的是去哪儿配对,不是内部堆还剩多少
         if (s.link == ams::Link::Advertising) {
-            // ⚠️ 不能写"去 设置→蓝牙 里找" —— iOS 的蓝牙设置【只列】系统认识的
-            // 配置文件(HID、音频那类),普通 BLE 外设不管广播多标准都不会出现。
-            // (Mac 上扫得到,CoreBluetooth 还能把征求的 UUID 解析成 "Apple Media",
-            //  所以确实是 iOS 设置的取舍,不是广播有问题。)
-            // 等 HID 服务加上之后这里才能改回"设置→蓝牙"。
-            lv_label_set_text(foot_, "用 LightBlue 之类的 BLE 工具连 T-Deck");
+            // 加了 HID 服务之后 iOS 才会在蓝牙设置里列出它 —— 在那之前
+            // 这句话是错的(普通 BLE 外设不管广播多标准都不出现在设置里),
+            // 只能靠第三方 BLE 工具配对。现在实测能找到了。
+            lv_label_set_text(foot_, "iPhone 的 设置 → 蓝牙 里选 T-Deck");
         } else if (s.link == ams::Link::NoService) {
             lv_label_set_text(foot_, "把 iPhone 解锁,或者先放一首歌");
         } else if (s.player[0]) {
