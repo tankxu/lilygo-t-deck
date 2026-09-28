@@ -12,6 +12,7 @@
 #include "secrets.h"
 #include "tdeck_bsp.h"
 #include "ui/fonts.h"
+#include "ui/jpeg_size.h"
 
 #include <cJSON.h>
 #include <esp_audio_simple_dec.h>
@@ -586,25 +587,8 @@ uint8_t* fetch_jpeg_url(const char* cover, const char* key, int px, int* out_len
 // LVGL 对 RAW 源完全信任这两个值(lv_tjpgd.c 的 decoder_info 直接照抄)。
 // 之前这里写死成请求的边长,而服务端给的是 160 —— LVGL 以为图是 88x88,
 // 于是只画了左上角那一块,看起来就是封面被放大裁掉了边。
-bool jpeg_size(const uint8_t* d, int len, int* w, int* h)
-{
-    int i = 2;                                   // 跳过 SOI
-    while (i + 9 < len) {
-        if (d[i] != 0xFF) { i++; continue; }
-        uint8_t m = d[i + 1];
-        if (m == 0xD8 || m == 0x01 || (m >= 0xD0 && m <= 0xD7)) { i += 2; continue; }
-        int seg = (d[i + 2] << 8) | d[i + 3];
-        // SOFn:C0~CF,但 C4(DHT)/C8/CC 不是
-        if (m >= 0xC0 && m <= 0xCF && m != 0xC4 && m != 0xC8 && m != 0xCC) {
-            *h = (d[i + 5] << 8) | d[i + 6];
-            *w = (d[i + 7] << 8) | d[i + 8];
-            return *w > 0 && *h > 0;
-        }
-        if (seg <= 0) return false;
-        i += 2 + seg;
-    }
-    return false;
-}
+// jpeg_size 抽去了 ui/jpeg_size.h —— 学习卡片也要用,留两份迟早会飘
+using tdeck::jpeg_size;
 
 void fill_dsc(lv_image_dsc_t* d, uint8_t* buf, int len, int px)
 {

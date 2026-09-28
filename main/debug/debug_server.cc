@@ -20,6 +20,9 @@
 
 #include "sys/volume.h"
 #include "sys/variant.h"
+#if TDECK_LEARNING
+#include "learning/learning.h"
+#endif
 #include "debug_server.h"
 #include "net/net.h"
 #include "ble_probe.h"
@@ -398,6 +401,60 @@ void mem_probe_task(void*)
     vTaskDelete(nullptr);
 }
 
+
+#if TDECK_LEARNING
+// ── 学习卡片的调试入口 ─────────────────────────────────────
+//
+// 没有它就只能对着小智说话来触发,验一个公式排版要绕一大圈。
+//   /learn?text=学&guide=xué      汉字/词卡
+//   /learn?stroke=学              笔顺动画
+//   /learn?page=正文&title=标题    文字页
+//   /learn?formula=<LaTeX>&title=&note=
+//   /learn?clear=1
+// 值要 URL 编码(中文和 LaTeX 里的反斜杠都必须转)。
+esp_err_t h_learn(httpd_req_t* req)
+{
+    char q[768] = {};
+    httpd_req_get_url_query_str(req, q, sizeof(q));
+    char v[512], t[256], g[256];
+
+    auto get = [&](const char* k, char* out, size_t n) -> bool {
+        if (httpd_query_key_value(q, k, out, n) != ESP_OK) return false;
+        // httpd 不解百分号编码,自己来 —— 中文和 LaTeX 的反斜杠全靠它
+        size_t o = 0;
+        for (size_t i = 0; out[i]; i++) {
+            if (out[i] == '%' && out[i+1] && out[i+2]) {
+                auto hex = [](char c) { return c <= '9' ? c - '0' : (c | 32) - 'a' + 10; };
+                out[o++] = (char)(hex(out[i+1]) * 16 + hex(out[i+2]));
+                i += 2;
+            } else if (out[i] == '+') out[o++] = ' ';
+            else out[o++] = out[i];
+        }
+        out[o] = 0;
+        return true;
+    };
+
+    t[0] = g[0] = 0;
+    get("title", t, sizeof(t));
+    get("guide", g, sizeof(g));
+
+    if (get("clear", v, sizeof(v)))        tdeck::learning::clear();
+    else if (get("stroke", v, sizeof(v)))  tdeck::learning::show_stroke_order(v);
+    else if (get("text", v, sizeof(v)))    tdeck::learning::show_card(v, g);
+    else if (get("page", v, sizeof(v)))    tdeck::learning::show_page(t, v);
+    else if (get("formula", v, sizeof(v))) {
+        char note[256] = {};
+        get("note", note, sizeof(note));
+        tdeck::learning::show_formula(t, v, note);
+    } else {
+        httpd_resp_sendstr(req, "用法: /learn?text= | stroke= | page= | formula= | clear=1\n");
+        return ESP_OK;
+    }
+    httpd_resp_sendstr(req, "ok\n");
+    return ESP_OK;
+}
+#endif
+
 esp_err_t h_mem(httpd_req_t* req)
 {
     char q[48] = {};
@@ -469,7 +526,7 @@ void debug_server_start()
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = 80;
-    cfg.max_uri_handlers = 12;
+    cfg.max_uri_handlers = 14;
     cfg.stack_size       = 8192;     // 截图那条要在栈上折腾
 
     httpd_handle_t srv = nullptr;
@@ -484,6 +541,9 @@ void debug_server_start()
         { "/swipe", HTTP_GET,  h_swipe }, { "/key",  HTTP_GET, h_key  },
         { "/ball",  HTTP_GET,  h_ball  }, { "/info", HTTP_GET, h_info },
         { "/ota",   HTTP_POST, h_ota   }, { "/mem",  HTTP_GET, h_mem  },
+#if TDECK_LEARNING
+        { "/learn", HTTP_GET, h_learn },
+#endif,
     };
     for (auto& r : routes) {
         httpd_uri_t u = {};

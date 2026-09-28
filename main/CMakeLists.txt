@@ -72,6 +72,14 @@ else()
         "apps/xiaozhi/xiaozhi_app.cc"
         "apps/bilibili/bili_app.cc"
         "apps/bilibili/bili_client.cc"
+        # 学习卡片/笔顺/公式(从 parent-master 的 stackchan 搬)。
+        # 只在 daily:它靠小智的 MCP 驱动,车载变体没有小智。
+        "learning/learning.cc"
+        "learning/learning_mcp.cc"
+        "learning/formula.cc"
+        "assets/fonts/PuHuiMath28.c"          # 公式正文 28px
+        "assets/fonts/IpaSans20.c"            # 英文简卡的 IPA 音标
+        "assets/fonts/MontserratSemiBold26.c" # 英文简卡的单词
     )
     # 小智内核(apps/xiaozhi 通过 xiaozhi_core.h 对接)。
     # 它会连带拉进 esp-sr / opus / 音频编解码,车载变体不要。
@@ -81,7 +89,7 @@ endif()
 idf_component_register(
     SRCS ${TDECK_SRCS}
     INCLUDE_DIRS
-        "." "app_framework"
+        "." "app_framework" "learning"
     REQUIRES ${TDECK_REQUIRES}
     # ⚠️ 必须 WHOLE_ARCHIVE。
     # app 靠文件末尾的 TDECK_REGISTER_APP 静态对象自注册,没有任何代码显式引用它。
@@ -92,3 +100,9 @@ idf_component_register(
                "assets/font_noto_qwen_14_1.bin"
     WHOLE_ARCHIVE
 )
+
+# 学习卡片只在 daily 变体里存在(靠小智的 MCP 驱动),
+# main.cc 和 debug_server 是两个变体共用的,靠这个宏取舍。
+if(NOT TDECK_CAR)
+    target_compile_definitions(${COMPONENT_LIB} PUBLIC TDECK_LEARNING=1)
+endif()

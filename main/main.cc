@@ -4,6 +4,9 @@
 // 等 launcher 到位,这段换成「加载 launcher screen」,其余不用动。
 
 #include "app.h"
+#if TDECK_LEARNING
+#include "learning/learning.h"
+#endif
 #include "net/net.h"
 #include "sys/volume.h"
 #include "ui/fonts.h"
@@ -102,7 +105,17 @@ extern "C" void app_main(void)
     lvgl_port_lock(0);
     tdeck::fonts_init();   // launcher 建 UI 之前要先有字体
     tdeck::launcher_begin();
+#if TDECK_LEARNING
+    // 学习卡片盖在 lv_layer_top 上,和 launcher 无关,但它建的 lv_timer
+    // 必须在持锁时建 —— LVGL 的对象和定时器都不是线程安全的
+    tdeck::learning::begin();
+#endif
     lvgl_port_unlock();
+
+#if TDECK_LEARNING
+    // MCP 工具要在小智 Application 启动【之前】注册(见 learning.h)
+    tdeck::learning::register_mcp();
+#endif
 
     // 白底把背光漏光盖住了,不必为此压低亮度
     tdeck_backlight_set(70);

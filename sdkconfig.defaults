@@ -181,3 +181,7 @@ CONFIG_LV_DEF_REFR_PERIOD=16
 #     大头在【控制器】,不在 host 的那些 buffer。
 #  ⚠️ BT_NIMBLE_GATT_CLIENT 依赖 BT_NIMBLE_ROLE_CENTRAL,不能关 ——
 #     AMS 正是"我作为 GATT Client 去读 iPhone 暴露的服务"。
+
+# 笔顺动画是 GIF(服务端用 Hanzi Writer 预渲染的 240x240),交给 lv_gif 解。
+# LVGL 自带 gifdec,只是默认没开。
+CONFIG_LV_USE_GIF=y
