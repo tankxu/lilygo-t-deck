@@ -51,7 +51,12 @@ extern "C" void app_main(void)
         //
         // 所以维持 40 行双缓冲:实测 25ms/帧、35 FPS、内部 RAM 还剩 ~71K,
         // 是量下来最好的一组。锯齿是这块内存预算下的固有代价。
-        .buffer_size   = TDECK_LCD_H_RES * 40,
+        // ⚠️ 40 行是按【渲染帧率】选的(25ms/帧、35 FPS),但它吃 51,200 字节
+        // 内部 DMA 内存(320*40*2 双缓冲),而小智起来之后内部堆就见底了:
+        // 实测只剩 11KB、最大连续块 7680 —— 激活任务(要 8192 连续)建不起来,
+        // TLS 握手时 esp-aes 也分配不到 DMA 内存,小智根本连不上。
+        // 降到 24 行省出 20,480 字节。代价是滑动时横带接缝更多一点。
+        .buffer_size   = TDECK_LCD_H_RES * 24,
         .double_buffer = true,
         .hres          = TDECK_LCD_H_RES,
         .vres          = TDECK_LCD_V_RES,

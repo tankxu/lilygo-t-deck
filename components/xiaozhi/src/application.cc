@@ -12,6 +12,7 @@
 
 #include <cstring>
 #include <esp_log.h>
+#include <esp_heap_caps.h>
 #include <cJSON.h>
 #include <driver/gpio.h>
 #include <arpa/inet.h>
@@ -276,12 +277,32 @@ void Application::HandleNetworkConnectedEvent() {
             return;
         }
 
-        xTaskCreate([](void* arg) {
+        // ⚠️ 必须检查返回值 —— 原来没检查,而这 8192 字节是【连续内部 DRAM】。
+        //
+        // T-Deck 上实测:小智内核起来之后内部堆只剩 11KB、最大连续块 7680 字节,
+        // 差 512 字节任务就建不起来。于是 ActivationTask 从不运行,状态永远停在
+        // activating,protocol_ 永远是空;按语音键只会看到
+        // "Protocol not initialized",而整个过程【一条日志都没有】,像凭空卡住。
+        //
+        // ⚠️ 别想着把栈挪去 PSRAM 绕开这个问题 —— 试过,会崩:
+        //   assert failed: s_task_stack_is_sane_when_cache_frozen()
+        // 这个任务要跑 TLS,硬件 AES 走 DMA 时会冻结 cache,
+        // 而栈在 PSRAM 的任务在那一刻不能处于运行态。
+        // 真正的出路是【把内部 RAM 腾出来】,不是搬栈。
+        BaseType_t created = xTaskCreate([](void* arg) {
             Application* app = static_cast<Application*>(arg);
             app->ActivationTask();
             app->activation_task_handle_ = nullptr;
             vTaskDelete(NULL);
         }, "activation", 4096 * 2, this, 2, &activation_task_handle_);
+
+        if (created != pdPASS) {
+            activation_task_handle_ = nullptr;
+            ESP_LOGE(TAG, "建激活任务失败 —— 内部堆 %u,最大连续块 %u(要 8192)。"
+                          "协议不会初始化,语音键会一直报 Protocol not initialized",
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        }
     }
 
     // Update the status bar immediately to show the network state
